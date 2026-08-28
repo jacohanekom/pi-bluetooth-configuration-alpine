@@ -11,47 +11,47 @@ API (`org.bluez.GattManager1` / `GattService1` / `GattCharacteristic1` /
 sd-bus/systemd dependency. WiFi itself is driven through `wpa_cli`
 (wpa_supplicant's control interface) and `dhcpcd`.
 
-## Raspberry Pi 3 prerequisite: attach the onboard Bluetooth UART
+## Raspberry Pi 3 prerequisite: dbus and bluetooth must be running
 
 The Pi 3's Bluetooth chip (BCM43438) is wired to the SoC over UART, not
-USB, and Alpine does **not** bring it up as `hci0` automatically. This is
-a one-time platform setup step, independent of this package -- until
-`hci0` exists, this daemon will keep failing to power on the adapter and
-`supervise-daemon` will just keep respawning it every 5s (harmless, just
-check `rc-service pi-bluetooth-configuration status` / the log if it
-never reports advertising).
+USB. On current Alpine `linux-rpi` kernels this needs **no manual
+`hciattach`/`btattach` step** -- the kernel's own `hci_uart_bcm` serdev
+driver binds to it and loads firmware automatically at boot (look for
+`hci_uart_bcm serial0-0: ...` in `dmesg`). Older guides (including a
+previous revision of this section, and the
+[Alpine wiki's Raspberry Pi 3 Bluetooth page](https://wiki.alpinelinux.org/wiki/Raspberry_Pi_3_-_Setting_Up_Bluetooth))
+describe a manual `hciattach`/`btattach` dance against `/dev/ttyAMA0`;
+on the kernel this was verified against, that tty didn't even exist
+under that name (the PL011 enumerated as `ttyAMA1`) and manual attach
+wasn't needed at all, so try without it first.
 
-Verified working on a real Pi 3 running Alpine (disk-mode install, boot
-partition at `/boot`):
+What this daemon (and `bluetoothctl`) actually needs running first is
+`dbus` and `bluetooth`:
 
-1. **Enable the PL011 UART.** On Alpine's Raspberry Pi image, `config.txt`
-   is managed by Alpine's own tooling -- don't edit it directly. It
-   normally already ends with `include usercfg.txt`; check with
-   `grep -n usercfg /boot/config.txt` and add that line yourself if it's
-   missing. Then:
-   ```sh
-   printf 'enable_uart=1\n' >> /boot/usercfg.txt
-   ```
-   Reboot, and confirm the device now exists: `ls -l /dev/ttyAMA0`.
-   Without this step `btattach`/`hciattach` fail with "No such file or
-   directory" -- that error means the UART itself isn't up yet, which is
-   a step *before* anything Bluetooth-specific.
-2. Confirm the Broadcom firmware blob (`BCM43430A1.hcd`) is present in
-   `/lib/firmware/brcm/` -- Alpine's Raspberry Pi firmware packages
-   include this already.
-3. Attach the controller to the UART:
-   ```sh
-   btattach -B /dev/ttyAMA0 -P bcm -S 115200 -N &
-   ```
-   Then confirm BlueZ sees it: `bluetoothctl list` should print a
-   `Controller <mac> ... [default]` line.
+```sh
+rc-update add dbus default
+rc-service dbus start
+rc-update add bluetooth default
+rc-service bluetooth start
 
-That `btattach` invocation only lasts until reboot. To make it persistent,
-Alpine's `/etc/mdev.conf` has a commented-out rule for this exact
-purpose -- uncomment the line for the Pi's onboard Bluetooth UART so mdev
-runs the attach automatically whenever `/dev/ttyAMA0` appears. Full,
-current details: the
-[Alpine wiki's Raspberry Pi 3 Bluetooth page](https://wiki.alpinelinux.org/wiki/Raspberry_Pi_3_-_Setting_Up_Bluetooth).
+bluetoothctl list   # should print "Controller <mac> ... [default]"
+```
+
+If `dbus` isn't running, `bluetoothctl` doesn't just fail cleanly -- it
+aborts with an assertion inside BlueZ's D-Bus wrapper
+(`dbus_connection_get_object_path_data(): assertion "connection != NULL"
+failed`), which looks alarming but just means "no system bus to connect
+to". Starting `dbus` first fixes it.
+
+This is a one-time platform setup step, independent of this package --
+until `hci0` exists and `dbus`/`bluetooth` are both up, this daemon will
+keep failing to power on the adapter and `supervise-daemon` will just
+keep respawning it every 5s (harmless, just check `rc-service
+pi-bluetooth-configuration status` / the log if it never reports
+advertising). If `bluetoothctl list` shows no controller even with both
+services running, then check `dmesg | grep -iE 'uart|pl011|hci'` for
+`hci_uart_bcm` load failures, and fall back to the manual `hciattach`/
+`btattach` steps on the Alpine wiki page linked above.
 
 ## How it verifies
 
