@@ -17,6 +17,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
+#include <iostream>
 #include <mutex>
 #include <sstream>
 #include <string>
@@ -222,7 +223,20 @@ public:
 
         run_command({"wpa_cli", "-i", iface_, "enable_network", std::to_string(id)});
         run_command({"wpa_cli", "-i", iface_, "select_network", std::to_string(id)});
-        run_command({"wpa_cli", "-i", iface_, "save_config"});
+
+        auto save = run_command({"wpa_cli", "-i", iface_, "save_config"});
+        if (save.output.find("OK") == std::string::npos) {
+            // Not fatal to this connection attempt -- association can
+            // still succeed -- but this network will NOT survive a
+            // reboot. wpa_cli returns FAIL for this when update_config=1
+            // is missing from wpa_supplicant.conf, or when the config
+            // file/directory isn't writable by the user running
+            // wpa_supplicant.
+            std::cerr << "[WifiControl] WARNING: wpa_cli save_config did not return OK (" << trim(save.output)
+                      << ") -- this network will not persist across a reboot. Check that "
+                         "update_config=1 is set in wpa_supplicant.conf and that the file is writable.\n";
+        }
+
         current_network_id_ = id;
 
         set_status(WifiStatus{WifiStatus::CONNECTING, ssid, "", ""});
