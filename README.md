@@ -11,6 +11,15 @@ API (`org.bluez.GattManager1` / `GattService1` / `GattCharacteristic1` /
 sd-bus/systemd dependency. WiFi itself is driven through `wpa_cli`
 (wpa_supplicant's control interface) and `dhcpcd`.
 
+The Pi 3's onboard Bluetooth chip shares a single antenna with its WiFi
+radio, so BLE connections routinely drop once WiFi is actively passing
+traffic (a hardware limitation, not a bug -- see "WiFi/Bluetooth
+coexistence" below). BLE is therefore only relied on for the one thing
+it has to do: get credentials across before any network exists. Once
+the Pi has an IP, this daemon also exposes a plain TCP/IP control
+interface on the LAN, and a well-behaved client hands off to that
+instead of continuing to fight the radio for airtime.
+
 ## Raspberry Pi 3 prerequisite: dbus and bluetooth must be running
 
 The Pi 3's Bluetooth chip (BCM43438) is wired to the SoC over UART, not
@@ -92,6 +101,48 @@ locally, a WiFi password containing bytes not valid as text isn't an
 issue -- but SSIDs are always sent as hex too, sidestepping wpa_supplicant's
 control-interface quoting rules entirely.
 
+## WiFi/Bluetooth coexistence and the TCP handoff
+
+The Raspberry Pi 3's Bluetooth chip (BCM43438) shares a single
+antenna/RF front-end with its WiFi radio. This is fine while WiFi is
+idle, but once it's actively associated and passing traffic, it
+routinely starves and drops BLE connections -- this is a well-documented
+hardware limitation of this exact chip, not something specific to
+BlueZ, Alpine, or any particular BLE central/OS.
+
+So: don't fight it. Use BLE only for what it has to do (handing
+credentials to a Pi with no network yet), and once `Status` reports a
+non-empty `ip`, switch to the always-on TCP interface below for
+everything else -- status polling, re-scanning, `forget`. It's the same
+commands, just over IP instead of GATT, and isn't subject to the
+antenna-sharing problem at all. A BLE disconnect right after `Status`
+first reports `connected` is expected, not an error.
+
+## TCP control interface
+
+Listens on `network.port` (default `8567`), all interfaces, from
+startup. One JSON object per line in each direction; the connection
+stays open across multiple commands:
+
+| Request | Reply |
+|---|---|
+| `{"cmd":"status"}` | `{"state":...,"ssid":...,"ip":...,"error":...}` |
+| `{"cmd":"scan"}` | `{"ok":true}` (async, like the BLE Command char) |
+| `{"cmd":"scanresults"}` | `[{"ssid":...,"rssi":...,"security":...}, ...]` |
+| `{"cmd":"connect","ssid":"...","psk":"..."}` | `{"ok":true}` |
+| `{"cmd":"forget"}` | `{"ok":true}` |
+
+```bash
+echo '{"cmd":"status"}' | nc 192.168.1.42 8567
+```
+
+**Unauthenticated**, like this project family's other TCP control ports
+(`mp3-player`, `victron-ve-direct`) -- anyone who can reach this port on
+the LAN can read status or reconfigure WiFi credentials. Reasonable for
+a single-purpose home/lab Pi; not for a shared or untrusted network. BLE
+pairing doesn't extend any protection to this interface -- it's a
+separate channel, gated only by network reachability.
+
 ## GATT service
 
 Custom 128-bit UUIDs (no existing SIG profile fits this):
@@ -118,6 +169,9 @@ can't fetch back a passphrase someone else staged.
    write entirely for an open network), then write `connect` to Command.
 4. Subscribe to Status notifications (or poll by reading it) until
    `state` is `connected` or `failed`.
+5. Once `state` is `connected` and `ip` is non-empty, switch to the TCP
+   control interface at that `ip` for anything further -- see "WiFi/Bluetooth
+   coexistence and the TCP handoff" below.
 
 ### Status JSON
 
@@ -218,6 +272,9 @@ interface        = wlan0
 
 [scan]
 max_results      = 10
+
+[network]
+port             = 8567
 ```
 
 `wpa_supplicant` must already be running against the same interface with
@@ -251,3 +308,5 @@ automatically on failure (5s delay, unlimited retries, via
 - **No LE Secure Connections / MITM protection** (see Security model
   above) -- `NoInputNoOutput` is the only realistic option without adding
   a display or physical button to the Pi.
+- **The TCP control interface is unauthenticated** -- see "TCP control
+  interface" above. BLE pairing doesn't gate it in any way.

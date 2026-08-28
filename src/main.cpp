@@ -21,6 +21,13 @@
  * ("Just Works", since a headless Pi has no display/keyboard to confirm a
  * passkey with).
  *
+ * The Pi 3's onboard Bluetooth shares an antenna with its WiFi radio, so
+ * BLE connections routinely drop once WiFi is actively passing traffic --
+ * a hardware limitation, not a bug here. So BLE is only relied on to get
+ * credentials across before any network exists; see tcp_control.hpp for
+ * the plain TCP/IP interface a client should hand off to once Status
+ * reports a non-empty ip.
+ *
  * Build (Alpine Linux):
  *   make
  * Run:
@@ -43,6 +50,7 @@
 
 #include "config.hpp"
 #include "gatt_server.hpp"
+#include "tcp_control.hpp"
 #include "wifi_control.hpp"
 
 namespace {
@@ -144,12 +152,14 @@ int main(int argc, char** argv) {
     const std::string agent_cap  = cfg.get_str("bluetooth.agent_capability", "NoInputNoOutput");
     const std::string iface      = cfg.get_str("wifi.interface", "wlan0");
     const int max_scan_results   = cfg.get_int("scan.max_results", 10);
+    const int network_port       = cfg.get_int("network.port", 8567);
     const std::string adapter_path = "/org/bluez/" + adapter;
 
     std::cerr << "[Config] adapter  : " << adapter_path << "\n"
               << "[Config] device   : " << dev_name << "\n"
               << "[Config] agent    : " << agent_cap << "\n"
-              << "[Config] wifi if  : " << iface << "\n";
+              << "[Config] wifi if  : " << iface << "\n"
+              << "[Config] tcp port : " << network_port << "\n";
 
     dbus_threads_init_default();
 
@@ -197,20 +207,42 @@ int main(int argc, char** argv) {
         },
         nullptr);
 
+    // Shared by both the BLE Command characteristic and the TCP control
+    // interface below, so "scan"/"connect"/"forget" behave identically
+    // and update the same state no matter which channel triggered them.
+    auto do_scan = [&]() {
+        auto results = wifi.scan(max_scan_results);
+        std::string json;
+        {
+            std::lock_guard<std::mutex> lk(scan_mu);
+            last_scan_json = scan_json(results);
+            json = last_scan_json;
+        }
+        server.notify(scan_char, to_bytes(json));
+    };
+
+    auto do_connect = [&](std::string ssid, std::string psk) {
+        wifi.connect(ssid, psk);
+        server.notify(status_char, to_bytes(status_json(wifi.get_status())));
+    };
+
+    auto do_forget = [&]() {
+        wifi.forget();
+        server.notify(status_char, to_bytes(status_json(wifi.get_status())));
+    };
+
+    auto get_status_json = [&]() -> std::string { return status_json(wifi.get_status()); };
+    auto get_scan_json = [&]() -> std::string {
+        std::lock_guard<std::mutex> lk(scan_mu);
+        return last_scan_json;
+    };
+
     server.add_characteristic(COMMAND_UUID, {"encrypt-write"}, nullptr,
         [&](const std::vector<uint8_t>& v) {
             std::string cmd = trim(std::string(v.begin(), v.end()));
 
             if (cmd == "scan") {
-                std::thread([&, max_scan_results]() {
-                    InflightGuard guard;
-                    auto results = wifi.scan(max_scan_results);
-                    {
-                        std::lock_guard<std::mutex> lk(scan_mu);
-                        last_scan_json = scan_json(results);
-                    }
-                    server.notify(scan_char, to_bytes(last_scan_json));
-                }).detach();
+                std::thread([&]() { InflightGuard guard; do_scan(); }).detach();
 
             } else if (cmd == "connect") {
                 std::string ssid, psk;
@@ -221,15 +253,10 @@ int main(int argc, char** argv) {
                     std::fill(staged_psk.begin(), staged_psk.end(), '\0');
                     staged_psk.clear();
                 }
-                std::thread([&, ssid, psk]() {
-                    InflightGuard guard;
-                    wifi.connect(ssid, psk);
-                    server.notify(status_char, to_bytes(status_json(wifi.get_status())));
-                }).detach();
+                std::thread([&, ssid, psk]() { InflightGuard guard; do_connect(ssid, psk); }).detach();
 
             } else if (cmd == "forget") {
-                wifi.forget();
-                server.notify(status_char, to_bytes(status_json(wifi.get_status())));
+                do_forget();
 
             } else {
                 std::cerr << "[Command] unrecognised command: " << cmd << "\n";
@@ -242,6 +269,19 @@ int main(int argc, char** argv) {
         return 1;
     }
     std::cerr << "[BlueZ] advertising as \"" << dev_name << "\", service " << SERVICE_UUID << "\n";
+
+    // Always-on handoff target: once Status reports a non-empty ip, a
+    // well-behaved client should switch to this instead of continuing to
+    // rely on BLE (see the file header comment for why).
+    tcpctl::TcpControlServer tcp;
+    tcp.on_status = get_status_json;
+    tcp.on_scan_results = get_scan_json;
+    tcp.on_scan = [&]() { std::thread([&]() { InflightGuard guard; do_scan(); }).detach(); };
+    tcp.on_connect = [&](std::string ssid, std::string psk) {
+        std::thread([&, ssid, psk]() { InflightGuard guard; do_connect(ssid, psk); }).detach();
+    };
+    tcp.on_forget = [&]() { do_forget(); };
+    tcp.start(network_port);
 
     std::signal(SIGINT, on_signal);
     std::signal(SIGTERM, on_signal);
