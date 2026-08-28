@@ -14,25 +14,44 @@ sd-bus/systemd dependency. WiFi itself is driven through `wpa_cli`
 ## Raspberry Pi 3 prerequisite: attach the onboard Bluetooth UART
 
 The Pi 3's Bluetooth chip (BCM43438) is wired to the SoC over UART, not
-USB, and Alpine does **not** bring it up as `hci0` automatically. Before
-this daemon (or `bluetoothd`) can do anything, you need to:
+USB, and Alpine does **not** bring it up as `hci0` automatically. This is
+a one-time platform setup step, independent of this package -- until
+`hci0` exists, this daemon will keep failing to power on the adapter and
+`supervise-daemon` will just keep respawning it every 5s (harmless, just
+check `rc-service pi-bluetooth-configuration status` / the log if it
+never reports advertising).
 
-1. Make sure `/dev/ttyAMA0` isn't in use as a serial console (disable it
-   in `/boot/cmdline.txt` / `/boot/config.txt` if it is).
-2. Have the Broadcom firmware blob (`BCM43430A1.hcd`) in
+Verified working on a real Pi 3 running Alpine (disk-mode install, boot
+partition at `/boot`):
+
+1. **Enable the PL011 UART.** On Alpine's Raspberry Pi image, `config.txt`
+   is managed by Alpine's own tooling -- don't edit it directly. It
+   normally already ends with `include usercfg.txt`; check with
+   `grep -n usercfg /boot/config.txt` and add that line yourself if it's
+   missing. Then:
+   ```sh
+   printf 'enable_uart=1\n' >> /boot/usercfg.txt
+   ```
+   Reboot, and confirm the device now exists: `ls -l /dev/ttyAMA0`.
+   Without this step `btattach`/`hciattach` fail with "No such file or
+   directory" -- that error means the UART itself isn't up yet, which is
+   a step *before* anything Bluetooth-specific.
+2. Confirm the Broadcom firmware blob (`BCM43430A1.hcd`) is present in
    `/lib/firmware/brcm/` -- Alpine's Raspberry Pi firmware packages
-   include this.
-3. Attach the controller to the UART, e.g. `hciattach /dev/ttyAMA0 bcm43xx
-   921600 flow -`, and make it persistent (Alpine's `/etc/mdev.conf` has a
-   commented-out rule for this -- uncomment the "rpi bluetooth" line).
+   include this already.
+3. Attach the controller to the UART:
+   ```sh
+   btattach -B /dev/ttyAMA0 -P bcm -S 115200 -N &
+   ```
+   Then confirm BlueZ sees it: `bluetoothctl list` should print a
+   `Controller <mac> ... [default]` line.
 
-Full, current instructions: the
+That `btattach` invocation only lasts until reboot. To make it persistent,
+Alpine's `/etc/mdev.conf` has a commented-out rule for this exact
+purpose -- uncomment the line for the Pi's onboard Bluetooth UART so mdev
+runs the attach automatically whenever `/dev/ttyAMA0` appears. Full,
+current details: the
 [Alpine wiki's Raspberry Pi 3 Bluetooth page](https://wiki.alpinelinux.org/wiki/Raspberry_Pi_3_-_Setting_Up_Bluetooth).
-This is a one-time platform setup step, independent of this package --
-until `hci0` exists, this daemon will keep failing to power on the
-adapter and `supervise-daemon` will just keep respawning it every 5s
-(harmless, just check `rc-service pi-bluetooth-configuration status` /
-the log if it never reports advertising).
 
 ## How it verifies
 
