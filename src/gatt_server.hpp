@@ -199,8 +199,36 @@ inline DBusMessage* call_method(DBusConnection* conn, const std::string& dest, c
         dbus_message_iter_init_append(msg, &it);
         build_args(it);
     }
-    DBusMessage* reply = dbus_connection_send_with_reply_and_block(conn, msg, 10000, err);
+
+    DBusPendingCall* pending = nullptr;
+    if (!dbus_connection_send_with_reply(conn, msg, &pending, 10000) || !pending) {
+        dbus_message_unref(msg);
+        dbus_set_error_const(err, DBUS_ERROR_FAILED, "dbus_connection_send_with_reply failed");
+        return nullptr;
+    }
     dbus_message_unref(msg);
+
+    // Deliberately not a blocking send-and-wait: BlueZ's RegisterApplication
+    // and RegisterAdvertisement both call back into objects *we* export
+    // (GetManagedObjects on the app root, Properties.GetAll on the
+    // advertisement) before they reply. dbus_connection_send_with_reply_and_block
+    // doesn't service incoming requests while it waits, so it would
+    // deadlock against that callback -- BlueZ waiting on us, us waiting on
+    // BlueZ -- until this call's own timeout fires. Pumping
+    // read_write_dispatch here keeps our own registered object paths
+    // (via the vtables from dbus_connection_try_register_object_path)
+    // live while we wait for the pending call to complete.
+    while (!dbus_pending_call_get_completed(pending)) {
+        dbus_connection_read_write_dispatch(conn, 50);
+    }
+
+    DBusMessage* reply = dbus_pending_call_steal_reply(pending);
+    dbus_pending_call_unref(pending);
+
+    if (reply && dbus_message_get_type(reply) == DBUS_MESSAGE_TYPE_ERROR) {
+        dbus_set_error_from_message(err, reply);
+    }
+
     return reply;
 }
 
