@@ -1,0 +1,22 @@
+#!/sbin/openrc-run
+
+name="pi-bluetooth-configuration"
+description="Configure WiFi over Bluetooth LE"
+
+command="/usr/bin/pi-bluetooth-configuration"
+command_args="--config /etc/pi-bluetooth-configuration/config.ini"
+command_user="root"
+
+supervisor=supervise-daemon
+respawn_delay=5
+respawn_max=0
+
+pidfile="/run/${RC_SVCNAME}.pid"
+output_log="/var/log/${RC_SVCNAME}.log"
+error_log="/var/log/${RC_SVCNAME}.log"
+
+depend() {
+    need dbus bluetooth
+    need wpa_supplicant
+    after firewall
+}

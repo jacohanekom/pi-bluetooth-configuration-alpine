@@ -1,0 +1,4 @@
+pi-bluetooth-configuration
+dist/
+pi-bluetooth-configuration-alpine-aarch64/
+*.tar.gz

@@ -1,0 +1,43 @@
+# Maintainer: Jaco Hanekom <jhanekom@gmail.com>
+pkgname=pi-bluetooth-configuration
+pkgver=1.0.0
+pkgrel=0
+pkgdesc="Configure WiFi over Bluetooth LE (Alpine/OpenRC, Raspberry Pi 3)"
+url="https://github.com/jacohanekom/pi-bluetooth-configuration-alpine"
+arch="aarch64"
+license="custom"
+makedepends="dbus-dev openssl-dev pkgconf"
+depends="dbus-libs dbus-openrc libcrypto3 bluez bluez-openrc wpa_supplicant wpa_supplicant-openrc dhcpcd dhcpcd-openrc iproute2"
+options="!check"
+
+source=""
+builddir="$srcdir"
+
+# main.cpp and its headers, config.ini, and the OpenRC init script live
+# one directory up (this repo's root), not in a source= tarball, since
+# they're part of this same repo rather than a separate upstream project.
+# dbus-client and openssl (libcrypto) are both normal Alpine packages --
+# nothing to vendor or build from source here.
+prepare() {
+	default_prepare
+	cp "$startdir"/../src/main.cpp "$srcdir"/main.cpp
+	cp "$startdir"/../src/config.hpp "$srcdir"/config.hpp
+	cp "$startdir"/../src/gatt_server.hpp "$srcdir"/gatt_server.hpp
+	cp "$startdir"/../src/wifi_control.hpp "$srcdir"/wifi_control.hpp
+	cp "$startdir"/../src/subprocess.hpp "$srcdir"/subprocess.hpp
+	cp "$startdir"/../config.ini "$srcdir"/config.ini
+	cp "$startdir"/../openrc/pi-bluetooth-configuration.initd "$srcdir"/pi-bluetooth-configuration.initd
+}
+
+build() {
+	g++ -Wall -Wextra -O2 -std=c++20 -pthread \
+		$(pkg-config --cflags dbus-1 libcrypto) \
+		-o pi-bluetooth-configuration main.cpp \
+		$(pkg-config --libs dbus-1 libcrypto) -pthread
+}
+
+package() {
+	install -Dm755 pi-bluetooth-configuration "$pkgdir"/usr/bin/pi-bluetooth-configuration
+	install -Dm644 config.ini "$pkgdir"/etc/pi-bluetooth-configuration/config.ini
+	install -Dm755 pi-bluetooth-configuration.initd "$pkgdir"/etc/init.d/pi-bluetooth-configuration
+}
