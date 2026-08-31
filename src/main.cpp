@@ -11,9 +11,17 @@
  * GATT service (see README for the exact UUIDs):
  *   SSID        (write)          stage a network name
  *   Password    (write)          stage a passphrase (omit for open networks)
- *   Command     (write)          "scan" | "connect" | "forget"
+ *   EthernetIP  (read + write)   stage/read eth0's static IP (see eth_control.hpp)
+ *   Command     (write)          "scan" | "connect" | "forget" | "set_ethernet" | "clear_ethernet"
  *   Status      (read + notify)  {"state":...,"ssid":...,"ip":...,"error":...}
  *   ScanResults (read + notify)  [{"ssid":...,"rssi":...,"security":...}, ...]
+ *
+ * "set_ethernet"/"clear_ethernet" configure a static IP + a DHCP server
+ * on eth0 for direct-connect local access, independent of WiFi -- see
+ * eth_control.hpp and the README's "Ethernet direct-connect" section.
+ * Unlike WiFi, applying these doesn't reboot: Ethernet doesn't share the
+ * Pi 3's antenna with Bluetooth, so there's no coexistence problem to
+ * route around, and the change is visible immediately.
  *
  * No pairing/bonding: characteristics are plain read/write, not
  * encrypted. An earlier revision required BLE pairing, but bonding on the
@@ -57,6 +65,7 @@
 #include <dbus/dbus.h>
 
 #include "config.hpp"
+#include "eth_control.hpp"
 #include "gatt_server.hpp"
 #include "wifi_control.hpp"
 
@@ -68,6 +77,7 @@ constexpr const char* PSK_UUID      = "7b1e0002-6a45-4d1f-9b0a-3c2f8e4d5a10";
 constexpr const char* COMMAND_UUID  = "7b1e0003-6a45-4d1f-9b0a-3c2f8e4d5a10";
 constexpr const char* STATUS_UUID   = "7b1e0004-6a45-4d1f-9b0a-3c2f8e4d5a10";
 constexpr const char* SCAN_UUID     = "7b1e0005-6a45-4d1f-9b0a-3c2f8e4d5a10";
+constexpr const char* ETH_IP_UUID   = "7b1e0006-6a45-4d1f-9b0a-3c2f8e4d5a10";
 constexpr const char* APP_ROOT      = "/org/bluez/pibtconf";
 constexpr const char* MARKER_FILE   = "/.successfully-initialized";
 constexpr int REBOOT_DELAY_SECS     = 3;
@@ -193,12 +203,14 @@ int main(int argc, char** argv) {
     const std::string serial     = read_pi_serial();
     const std::string dev_name   = serial.empty() ? configured_name : serial;
     const std::string iface      = cfg.get_str("wifi.interface", "wlan0");
+    const std::string eth_iface  = cfg.get_str("ethernet.interface", "eth0");
     const int max_scan_results   = cfg.get_int("scan.max_results", 10);
     const std::string adapter_path = "/org/bluez/" + adapter;
 
     std::cerr << "[Config] adapter  : " << adapter_path << "\n"
               << "[Config] device   : " << dev_name << (serial.empty() ? " (configured)" : " (hardware serial)") << "\n"
-              << "[Config] wifi if  : " << iface << "\n";
+              << "[Config] wifi if  : " << iface << "\n"
+              << "[Config] eth if   : " << eth_iface << "\n";
 
     dbus_threads_init_default();
 
@@ -212,11 +224,12 @@ int main(int argc, char** argv) {
     dbus_connection_set_exit_on_disconnect(conn, 0);
 
     WifiControl wifi(iface);
+    ethctl::EthControl eth(eth_iface);
 
     gattsrv::GattServer server(conn, adapter_path, APP_ROOT, SERVICE_UUID, dev_name);
 
     std::mutex staged_mu;
-    std::string staged_ssid, staged_psk;
+    std::string staged_ssid, staged_psk, staged_eth_ip;
 
     std::mutex scan_mu;
     std::string last_scan_json = "[]";
@@ -231,6 +244,14 @@ int main(int argc, char** argv) {
         [&](const std::vector<uint8_t>& v) {
             std::lock_guard<std::mutex> lk(staged_mu);
             staged_psk.assign(v.begin(), v.end());
+        });
+
+    gattsrv::Characteristic* eth_ip_char = server.add_characteristic(
+        ETH_IP_UUID, {"read", "write"},
+        [&]() -> std::vector<uint8_t> { return to_bytes(eth.get_ip()); },
+        [&](const std::vector<uint8_t>& v) {
+            std::lock_guard<std::mutex> lk(staged_mu);
+            staged_eth_ip.assign(v.begin(), v.end());
         });
 
     gattsrv::Characteristic* status_char = server.add_characteristic(
@@ -277,6 +298,21 @@ int main(int argc, char** argv) {
         reboot_after_delay();
     };
 
+    // Ethernet direct-connect config is independent of WiFi/BLE state --
+    // applied immediately, no reboot needed (see file header comment).
+    auto do_set_ethernet = [&](std::string ip) {
+        std::string ip_err;
+        if (!eth.set_static_ip(ip, ip_err)) {
+            std::cerr << "[Ethernet] failed to set static IP " << ip << ": " << ip_err << "\n";
+        }
+        server.notify(eth_ip_char, to_bytes(eth.get_ip()));
+    };
+
+    auto do_clear_ethernet = [&]() {
+        eth.clear_static_ip();
+        server.notify(eth_ip_char, to_bytes(eth.get_ip()));
+    };
+
     server.add_characteristic(COMMAND_UUID, {"write"}, nullptr,
         [&](const std::vector<uint8_t>& v) {
             std::string cmd = trim(std::string(v.begin(), v.end()));
@@ -297,6 +333,17 @@ int main(int argc, char** argv) {
 
             } else if (cmd == "forget") {
                 do_forget();
+
+            } else if (cmd == "set_ethernet") {
+                std::string ip;
+                {
+                    std::lock_guard<std::mutex> lk(staged_mu);
+                    ip = staged_eth_ip;
+                }
+                std::thread([&, ip]() { InflightGuard guard; do_set_ethernet(ip); }).detach();
+
+            } else if (cmd == "clear_ethernet") {
+                std::thread([&]() { InflightGuard guard; do_clear_ethernet(); }).detach();
 
             } else {
                 std::cerr << "[Command] unrecognised command: " << cmd << "\n";

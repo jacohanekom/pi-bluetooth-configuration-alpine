@@ -133,6 +133,41 @@ OpenRC's normal shutdown sequence. Expect the BLE connection (and this
 daemon along with it) to disappear a few seconds after either action --
 that's expected, not a crash.
 
+## Ethernet direct-connect
+
+Separate from WiFi provisioning: `set_ethernet` (write an IPv4 address
+to `EthernetIP`, then write `set_ethernet` to `Command`) gives `eth0` a
+fixed static IP and starts a DHCP server (`dnsmasq`) scoped strictly to
+`eth0`, so a laptop plugged directly into the Pi's ethernet port gets an
+address automatically -- no router, no manual IP configuration on the
+other end. `clear_ethernet` reverts `eth0` to normal DHCP client
+behaviour and stops the DHCP server. Reading `EthernetIP` at any time
+returns whatever IP is actually live on `eth0` right now (static or
+DHCP-assigned).
+
+This exists because plugging a WiFi-configured Pi into the same LAN over
+Ethernet at the same time as testing WiFi can produce exactly the kind
+of dual-homed routing confusion (asymmetric routing / `rp_filter`
+silently dropping replies) that motivated this feature -- giving `eth0`
+its own dedicated, isolated subnet sidesteps that entirely, and doubles
+as a "plug in directly with a laptop" recovery path if WiFi is ever
+misconfigured.
+
+Unlike WiFi, this doesn't reboot the Pi: Ethernet doesn't share the
+Pi 3's antenna with Bluetooth, so there's no coexistence problem forcing
+a clean restart, and the change (`dhcpcd`/`dnsmasq` restarted directly)
+takes effect within a couple of seconds.
+
+**Safety**: `dnsmasq` is configured with `interface=eth0` and
+`bind-interfaces` specifically so it only ever answers DHCP requests on
+`eth0` -- it must never be allowed to also serve WiFi/upstream LAN
+traffic, which would hand out conflicting addresses on a network this
+daemon doesn't own. If you inspect or hand-edit
+`/etc/dnsmasq.conf`/`/etc/dhcpcd.conf`, the daemon's own config lives in
+a `# BEGIN pi-bluetooth-configuration eth0 static` / `# END ...`
+delimited block that's rewritten idempotently on every `set_ethernet`/
+`clear_ethernet` -- anything outside that block is left untouched.
+
 ## GATT service
 
 Custom 128-bit UUIDs (no existing SIG profile fits this):
@@ -142,9 +177,10 @@ Custom 128-bit UUIDs (no existing SIG profile fits this):
 | Service | `7b1e0000-6a45-4d1f-9b0a-3c2f8e4d5a10` | -- | -- |
 | SSID | `7b1e0001-6a45-4d1f-9b0a-3c2f8e4d5a10` | write | UTF-8 network name |
 | Password | `7b1e0002-6a45-4d1f-9b0a-3c2f8e4d5a10` | write | UTF-8 passphrase (omit/empty for open networks) |
-| Command | `7b1e0003-6a45-4d1f-9b0a-3c2f8e4d5a10` | write | ASCII: `scan` \| `connect` \| `forget` |
+| Command | `7b1e0003-6a45-4d1f-9b0a-3c2f8e4d5a10` | write | ASCII: `scan` \| `connect` \| `forget` \| `set_ethernet` \| `clear_ethernet` |
 | Status | `7b1e0004-6a45-4d1f-9b0a-3c2f8e4d5a10` | read + notify | JSON, see below |
 | ScanResults | `7b1e0005-6a45-4d1f-9b0a-3c2f8e4d5a10` | read + notify | JSON array, see below |
+| EthernetIP | `7b1e0006-6a45-4d1f-9b0a-3c2f8e4d5a10` | read + write | ASCII dotted-quad IPv4 address, see "Ethernet direct-connect" |
 
 No pairing/encryption gates any of these -- see Security model above.
 SSID/Password are still write-only (no read) purely so a second BLE
@@ -208,8 +244,10 @@ comfortably within that limit even with longer SSIDs.
 Every push builds `pi-bluetooth-configuration-aarch64.apk` (GitHub
 Actions artifact; tagged `v*` pushes also attach it to a GitHub Release),
 built via `abuild` from [`alpine/APKBUILD`](alpine/APKBUILD). It installs
-cleanly with `apk`, pulling in `dbus`, `bluez`, `wpa_supplicant`, and
-`dhcpcd` (plus their OpenRC services) automatically.
+cleanly with `apk`, pulling in `dbus`, `bluez`, `wpa_supplicant`,
+`dhcpcd`, and `dnsmasq` (plus their OpenRC services) automatically.
+`dnsmasq` is only started when `set_ethernet` is actually used -- no
+need to enable it manually.
 
 It's signed with a throwaway key generated fresh in CI each run (there's
 no distributed repo to establish trust for), so install with
@@ -238,7 +276,7 @@ Every push builds `pi-bluetooth-configuration-alpine-aarch64.tar.gz`
 Release).
 
 ```sh
-apk add dbus dbus-openrc bluez bluez-openrc wpa_supplicant wpa_supplicant-openrc dhcpcd dhcpcd-openrc iproute2
+apk add dbus dbus-openrc bluez bluez-openrc wpa_supplicant wpa_supplicant-openrc dhcpcd dhcpcd-openrc iproute2 dnsmasq dnsmasq-openrc
 
 tar xzf pi-bluetooth-configuration-alpine-aarch64.tar.gz
 cd pi-bluetooth-configuration-alpine-aarch64
@@ -271,6 +309,9 @@ device_name      = pi-bluetooth-configuration
 
 [wifi]
 interface        = wlan0
+
+[ethernet]
+interface        = eth0
 
 [scan]
 max_results      = 10
