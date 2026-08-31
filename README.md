@@ -288,8 +288,16 @@ automatically on failure (5s delay, unlimited retries, via
 
 ## Known limitations (v1)
 
-- **Single active network.** `connect` replaces whatever network this
-  daemon previously configured -- it's not a saved-network list manager.
+- **Single active network.** `connect`/`forget` clear *every* network
+  wpa_supplicant currently knows about (queried live via
+  `wpa_cli list_networks`, not tracked in-process) before acting --
+  this isn't a saved-network list manager. Querying live rather than
+  remembering "the last id this process added" matters specifically
+  because the daemon reboots the Pi after every successful connect/forget
+  (see above), which restarts wpa_supplicant too; an in-process id would
+  only ever know about networks added since the current process started,
+  silently leaking a stale network into wpa_supplicant.conf on every
+  cycle instead of replacing it.
 - **Scan is a fixed 4s sleep-then-fetch**, not an event-driven wait for
   `CTRL-EVENT-SCAN-RESULTS`. Simple and reliable, if not instant.
 - **No authentication or encryption at all** -- see Security model

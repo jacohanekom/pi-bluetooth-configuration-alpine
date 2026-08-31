@@ -181,16 +181,13 @@ public:
         return out;
     }
 
-    // Blocking; run this on a worker thread. Replaces any network this
-    // daemon previously configured (single active-network model) and
-    // updates get_status() as it progresses.
+    // Blocking; run this on a worker thread. Replaces every network
+    // wpa_supplicant currently knows about (single active-network model)
+    // and updates get_status() as it progresses.
     bool connect(const std::string& ssid, const std::string& psk) {
         using namespace wifi_detail;
 
-        if (current_network_id_ >= 0) {
-            run_command({"wpa_cli", "-i", iface_, "remove_network", std::to_string(current_network_id_)});
-            current_network_id_ = -1;
-        }
+        remove_all_networks();
 
         auto add = run_command({"wpa_cli", "-i", iface_, "add_network"});
         std::string id_str = trim(add.output);
@@ -237,8 +234,6 @@ public:
                          "update_config=1 is set in wpa_supplicant.conf and that the file is writable.\n";
         }
 
-        current_network_id_ = id;
-
         set_status(WifiStatus{WifiStatus::CONNECTING, ssid, "", ""});
 
         const int poll_attempts = 20; // ~10s
@@ -270,11 +265,8 @@ public:
     }
 
     void forget() {
-        if (current_network_id_ >= 0) {
-            run_command({"wpa_cli", "-i", iface_, "remove_network", std::to_string(current_network_id_)});
-            run_command({"wpa_cli", "-i", iface_, "save_config"});
-            current_network_id_ = -1;
-        }
+        remove_all_networks();
+        run_command({"wpa_cli", "-i", iface_, "save_config"});
         set_status(WifiStatus{});
     }
 
@@ -283,6 +275,26 @@ private:
         std::lock_guard<std::mutex> lk(mu_);
         status_.state = WifiStatus::FAILED;
         status_.error = err;
+    }
+
+    // wpa_supplicant reloads every network saved in wpa_supplicant.conf
+    // on each of its own restarts (which happens on every reboot this
+    // daemon triggers after a successful connect/forget), so an
+    // in-process "last id I added" can't track what's actually
+    // configured -- it only knows about networks added since this
+    // daemon process itself started. Querying the live list instead
+    // means "remove everything" is correct regardless of how
+    // wpa_supplicant got to its current state.
+    void remove_all_networks() {
+        auto list = run_command({"wpa_cli", "-i", iface_, "list_networks"});
+        for (auto& line : wifi_detail::split_lines(list.output)) {
+            auto cols = wifi_detail::split(line, '\t');
+            if (cols.empty()) continue;
+            std::string id_field = wifi_detail::trim(cols[0]);
+            if (!id_field.empty() && id_field.find_first_not_of("0123456789") == std::string::npos) {
+                run_command({"wpa_cli", "-i", iface_, "remove_network", id_field});
+            }
+        }
     }
 
     std::string read_ipv4_address() {
@@ -296,7 +308,6 @@ private:
     }
 
     std::string iface_;
-    int current_network_id_ = -1;
     mutable std::mutex mu_;
     WifiStatus status_;
 };
