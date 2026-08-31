@@ -131,11 +131,27 @@ inline std::string security_from_flags(const std::string& flags) {
 
 class WifiControl {
 public:
-    explicit WifiControl(std::string iface) : iface_(std::move(iface)) {
-        refresh_status();
-    }
+    explicit WifiControl(std::string iface) : iface_(std::move(iface)) {}
 
-    WifiStatus get_status() const {
+    // Lazily re-checks wpa_supplicant's actual live state whenever we
+    // haven't ourselves tracked a definite one yet in this process (i.e.
+    // still at the IDLE default). A one-shot check at startup isn't
+    // enough: wpa_supplicant's own service can be running before it has
+    // actually finished reconnecting, so a single check at the exact
+    // moment this object is constructed can race it and cache a stale
+    // "idle" forever after, well before a BLE client ever gets around to
+    // reading Status. Checking lazily on every read instead means it
+    // keeps re-trying until either wpa_supplicant catches up or this
+    // process performs its own connect()/forget(), which then takes
+    // precedence over -- and stops -- the live re-check entirely, so it
+    // never overwrites an in-progress CONNECTING/FAILED state we set
+    // ourselves.
+    WifiStatus get_status() {
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            if (status_.state != WifiStatus::IDLE) return status_;
+        }
+        refresh_status();
         std::lock_guard<std::mutex> lk(mu_);
         return status_;
     }
@@ -145,12 +161,6 @@ public:
         status_ = std::move(s);
     }
 
-    // Queries wpa_supplicant directly for whatever it's already doing --
-    // called once at startup so a freshly (re)started daemon reports the
-    // real state immediately instead of always starting at "idle", which
-    // otherwise hides an already-successful connection (e.g. right after
-    // a reboot where wpa_supplicant reconnected to a saved network on its
-    // own, well before this daemon or a BLE client even exists).
     void refresh_status() {
         using namespace wifi_detail;
         auto st = run_command({"wpa_cli", "-i", iface_, "status"});
@@ -159,10 +169,8 @@ public:
             std::string ip = status_field(st.output, "ip_address");
             if (!ssid.empty() && !ip.empty()) {
                 set_status(WifiStatus{WifiStatus::CONNECTED, ssid, ip, ""});
-                return;
             }
         }
-        set_status(WifiStatus{});
     }
 
     // Blocking; run this on a worker thread. Triggers a scan and waits a
