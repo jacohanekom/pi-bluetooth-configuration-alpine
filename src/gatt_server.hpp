@@ -2,24 +2,26 @@
 /**
  * gatt_server.hpp -- a minimal BlueZ LE GATT peripheral, built directly on
  * libdbus (no GLib/sd-bus). Exports one GATT service with a handful of
- * characteristics, an LE advertisement, and a pairing agent, using BlueZ's
- * standard D-Bus API:
+ * characteristics and an LE advertisement, using BlueZ's standard D-Bus
+ * API:
  *
  *   org.freedesktop.DBus.ObjectManager   (GetManagedObjects, on the app root)
  *   org.bluez.GattService1 / GattCharacteristic1
  *   org.bluez.LEAdvertisement1 / LEAdvertisingManager1
- *   org.bluez.Agent1 / AgentManager1
  *
  * This mirrors the object model BlueZ's own example-gatt-server.py uses --
  * BlueZ drives everything through method calls on objects *we* export, so
  * ours is a single message handler dispatched by a small "what kind of
  * object is this" tag rather than one class per D-Bus interface.
  *
- * Only what this daemon needs is implemented: read/write/notify on
- * characteristics (with BlueZ's long-read "offset" option honoured), a
- * peripheral advertisement, and an agent that auto-accepts pairing
- * (suitable for a headless "NoInputNoOutput" device -- see the README for
- * what that does and doesn't protect against).
+ * Deliberately no pairing/bonding agent: characteristics use plain
+ * "read"/"write" flags, not "encrypt-read"/"encrypt-write", so BlueZ never
+ * initiates SMP pairing at all. An earlier revision required pairing, but
+ * bonding on the Pi 3's BCM43438 proved unreliable in practice (bond
+ * desync between BlueZ and the central after any reset of either side's
+ * pairing record, manifesting as CoreBluetooth's
+ * peerRemovedPairingInformation and repeated OS-level pairing prompts).
+ * See the README's Security model section for what that trade-off means.
  */
 #include <cstdint>
 #include <cstring>
@@ -42,8 +44,6 @@ constexpr const char* IFACE_GATT_CHAR   = "org.bluez.GattCharacteristic1";
 constexpr const char* IFACE_LE_ADV      = "org.bluez.LEAdvertisement1";
 constexpr const char* IFACE_LE_ADV_MGR  = "org.bluez.LEAdvertisingManager1";
 constexpr const char* IFACE_GATT_MGR    = "org.bluez.GattManager1";
-constexpr const char* IFACE_AGENT       = "org.bluez.Agent1";
-constexpr const char* IFACE_AGENT_MGR   = "org.bluez.AgentManager1";
 constexpr const char* IFACE_ADAPTER     = "org.bluez.Adapter1";
 
 struct PropVal {
@@ -240,8 +240,7 @@ public:
                std::string service_uuid, std::string device_name)
         : conn_(conn), adapter_path_(std::move(adapter_path)), app_root_(std::move(app_root)),
           service_path_(app_root_ + "/service0"), service_uuid_(std::move(service_uuid)),
-          device_name_(std::move(device_name)), adv_path_(app_root_ + "/advertising0"),
-          agent_path_(app_root_ + "/agent0") {}
+          device_name_(std::move(device_name)), adv_path_(app_root_ + "/advertising0") {}
 
     // Path is assigned automatically as <service_path>/charN in add order.
     Characteristic* add_characteristic(const std::string& uuid, std::vector<std::string> flags,
@@ -258,7 +257,7 @@ public:
         return chars_.back().get();
     }
 
-    bool start(const std::string& agent_capability, std::string& err_out) {
+    bool start(std::string& err_out) {
         DBusError err;
         dbus_error_init(&err);
 
@@ -279,31 +278,17 @@ public:
         ctx_adv_ = std::make_unique<ObjCtx>(ObjCtx{ObjKind::Advertisement, this, nullptr});
         dbus_connection_try_register_object_path(conn_, adv_path_.c_str(), &vtable, ctx_adv_.get(), &err);
 
-        ctx_agent_ = std::make_unique<ObjCtx>(ObjCtx{ObjKind::Agent, this, nullptr});
-        dbus_connection_try_register_object_path(conn_, agent_path_.c_str(), &vtable, ctx_agent_.get(), &err);
-
         if (!set_adapter_bool("Powered", true, err_out)) return false;
         if (!set_adapter_string("Alias", device_name_, err_out)) return false;
-        if (!set_adapter_bool("Pairable", true, err_out)) return false;
+        // No pairing agent is registered, so leave the adapter unpairable --
+        // BlueZ never needs to prompt for pairing since nothing here
+        // requires an encrypted link, and this also keeps the Pi from
+        // showing up as something manually "pairable" in a client's
+        // system Bluetooth settings outside of this app's own flow.
+        if (!set_adapter_bool("Pairable", false, err_out)) return false;
         if (!set_adapter_bool("Discoverable", true, err_out)) return false;
 
         DBusMessage* reply;
-
-        reply = detail::call_method(conn_, "org.bluez", "/org/bluez", IFACE_AGENT_MGR, "RegisterAgent",
-            [&](DBusMessageIter& it) {
-                const char* p = agent_path_.c_str();
-                dbus_message_iter_append_basic(&it, DBUS_TYPE_OBJECT_PATH, &p);
-                const char* cap = agent_capability.c_str();
-                dbus_message_iter_append_basic(&it, DBUS_TYPE_STRING, &cap);
-            }, &err);
-        if (!check(reply, err, "RegisterAgent", err_out)) return false;
-
-        reply = detail::call_method(conn_, "org.bluez", "/org/bluez", IFACE_AGENT_MGR, "RequestDefaultAgent",
-            [&](DBusMessageIter& it) {
-                const char* p = agent_path_.c_str();
-                dbus_message_iter_append_basic(&it, DBUS_TYPE_OBJECT_PATH, &p);
-            }, &err);
-        if (!check(reply, err, "RequestDefaultAgent", err_out)) return false;
 
         reply = detail::call_method(conn_, "org.bluez", adapter_path_, IFACE_GATT_MGR, "RegisterApplication",
             [&](DBusMessageIter& it) {
@@ -357,7 +342,7 @@ public:
     }
 
 private:
-    enum class ObjKind { Root, Service, Characteristic, Advertisement, Agent };
+    enum class ObjKind { Root, Service, Characteristic, Advertisement };
     struct ObjCtx {
         ObjKind kind;
         GattServer* self;
@@ -541,25 +526,6 @@ private:
             return DBUS_HANDLER_RESULT_HANDLED;
         }
 
-        // Pairing agent: accept everything (NoInputNoOutput / "Just Works").
-        if (ctx->kind == ObjKind::Agent && ifc == IFACE_AGENT) {
-            if (mem == "RequestPasskey") {
-                DBusMessage* reply = dbus_message_new_method_return(msg);
-                DBusMessageIter it;
-                dbus_message_iter_init_append(reply, &it);
-                dbus_uint32_t passkey = 0;
-                dbus_message_iter_append_basic(&it, DBUS_TYPE_UINT32, &passkey);
-                dbus_connection_send(conn, reply, nullptr);
-                dbus_message_unref(reply);
-            } else {
-                // Release, Cancel, RequestConfirmation, RequestAuthorization,
-                // AuthorizeService, DisplayPasskey, DisplayPinCode: all
-                // accepted/acknowledged with an empty reply.
-                detail::reply_empty(conn, msg);
-            }
-            return DBUS_HANDLER_RESULT_HANDLED;
-        }
-
         detail::reply_error(conn, msg, DBUS_ERROR_UNKNOWN_METHOD, ifc + "." + mem + " not implemented");
         return DBUS_HANDLER_RESULT_HANDLED;
     }
@@ -576,7 +542,6 @@ private:
     std::string service_uuid_;
     std::string device_name_;
     std::string adv_path_;
-    std::string agent_path_;
     std::mutex send_mu_;
 
     std::vector<std::unique_ptr<Characteristic>> chars_;
@@ -584,7 +549,6 @@ private:
     std::unique_ptr<ObjCtx> ctx_service_;
     std::vector<std::unique_ptr<ObjCtx>> char_ctxs_;
     std::unique_ptr<ObjCtx> ctx_adv_;
-    std::unique_ptr<ObjCtx> ctx_agent_;
 };
 
 } // namespace gattsrv

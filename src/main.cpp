@@ -9,17 +9,19 @@
  * wifi_control.hpp).
  *
  * GATT service (see README for the exact UUIDs):
- *   SSID        (write, encrypted)          stage a network name
- *   Password    (write, encrypted)          stage a passphrase (omit for open networks)
- *   Command     (write, encrypted)          "scan" | "connect" | "forget"
- *   Status      (read + notify, encrypted)  {"state":...,"ssid":...,"ip":...,"error":...}
- *   ScanResults (read + notify, encrypted)  [{"ssid":...,"rssi":...,"security":...}, ...]
+ *   SSID        (write)          stage a network name
+ *   Password    (write)          stage a passphrase (omit for open networks)
+ *   Command     (write)          "scan" | "connect" | "forget"
+ *   Status      (read + notify)  {"state":...,"ssid":...,"ip":...,"error":...}
+ *   ScanResults (read + notify)  [{"ssid":...,"rssi":...,"security":...}, ...]
  *
- * Pairing is required before any of the above can be read or written --
- * BlueZ enforces this at the ATT layer via the "encrypt-read"/"encrypt-write"
- * characteristic flags, and this daemon's agent auto-accepts pairing
- * ("Just Works", since a headless Pi has no display/keyboard to confirm a
- * passkey with).
+ * No pairing/bonding: characteristics are plain read/write, not
+ * encrypted. An earlier revision required BLE pairing, but bonding on the
+ * Pi 3's BCM43438 proved unreliable enough in practice (bond desync
+ * between BlueZ and the central, repeated OS-level pairing prompts) that
+ * it wasn't worth what it protected against -- see the README's Security
+ * model section. This means WiFi credentials cross BLE in the clear;
+ * treat this as suitable for a trusted home/lab network, not a public one.
  *
  * The Pi 3's onboard Bluetooth shares an antenna with its WiFi radio, so
  * BLE connections routinely drop once WiFi is actively passing traffic --
@@ -149,7 +151,6 @@ int main(int argc, char** argv) {
     Config cfg(cfg_path);
     const std::string adapter    = cfg.get_str("bluetooth.adapter", "hci0");
     const std::string dev_name   = cfg.get_str("bluetooth.device_name", "pi-bluetooth-configuration");
-    const std::string agent_cap  = cfg.get_str("bluetooth.agent_capability", "NoInputNoOutput");
     const std::string iface      = cfg.get_str("wifi.interface", "wlan0");
     const int max_scan_results   = cfg.get_int("scan.max_results", 10);
     const int network_port       = cfg.get_int("network.port", 8567);
@@ -157,7 +158,6 @@ int main(int argc, char** argv) {
 
     std::cerr << "[Config] adapter  : " << adapter_path << "\n"
               << "[Config] device   : " << dev_name << "\n"
-              << "[Config] agent    : " << agent_cap << "\n"
               << "[Config] wifi if  : " << iface << "\n"
               << "[Config] tcp port : " << network_port << "\n";
 
@@ -182,25 +182,25 @@ int main(int argc, char** argv) {
     std::mutex scan_mu;
     std::string last_scan_json = "[]";
 
-    server.add_characteristic(SSID_UUID, {"encrypt-write"}, nullptr,
+    server.add_characteristic(SSID_UUID, {"write"}, nullptr,
         [&](const std::vector<uint8_t>& v) {
             std::lock_guard<std::mutex> lk(staged_mu);
             staged_ssid.assign(v.begin(), v.end());
         });
 
-    server.add_characteristic(PSK_UUID, {"encrypt-write"}, nullptr,
+    server.add_characteristic(PSK_UUID, {"write"}, nullptr,
         [&](const std::vector<uint8_t>& v) {
             std::lock_guard<std::mutex> lk(staged_mu);
             staged_psk.assign(v.begin(), v.end());
         });
 
     gattsrv::Characteristic* status_char = server.add_characteristic(
-        STATUS_UUID, {"encrypt-read", "notify"},
+        STATUS_UUID, {"read", "notify"},
         [&]() -> std::vector<uint8_t> { return to_bytes(status_json(wifi.get_status())); },
         nullptr);
 
     gattsrv::Characteristic* scan_char = server.add_characteristic(
-        SCAN_UUID, {"encrypt-read", "notify"},
+        SCAN_UUID, {"read", "notify"},
         [&]() -> std::vector<uint8_t> {
             std::lock_guard<std::mutex> lk(scan_mu);
             return to_bytes(last_scan_json);
@@ -237,7 +237,7 @@ int main(int argc, char** argv) {
         return last_scan_json;
     };
 
-    server.add_characteristic(COMMAND_UUID, {"encrypt-write"}, nullptr,
+    server.add_characteristic(COMMAND_UUID, {"write"}, nullptr,
         [&](const std::vector<uint8_t>& v) {
             std::string cmd = trim(std::string(v.begin(), v.end()));
 
@@ -264,7 +264,7 @@ int main(int argc, char** argv) {
         });
 
     std::string start_err;
-    if (!server.start(agent_cap, start_err)) {
+    if (!server.start(start_err)) {
         std::cerr << "[BlueZ] failed to start GATT server: " << start_err << "\n";
         return 1;
     }

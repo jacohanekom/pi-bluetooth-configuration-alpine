@@ -1,15 +1,16 @@
 # pi-bluetooth-configuration-alpine
 
 Configure a Raspberry Pi 3's WiFi over Bluetooth LE -- no SSH, no keyboard,
-no display. A phone or app pairs with the Pi over BLE, writes an SSID and
-passphrase, writes `connect`, and watches a status characteristic for the
-result. For Raspberry Pi 3 running Alpine Linux (aarch64).
+no display. A phone or app connects to the Pi over BLE (no pairing --
+see Security model below), writes an SSID and passphrase, writes
+`connect`, and watches a status characteristic for the result. For
+Raspberry Pi 3 running Alpine Linux (aarch64).
 
 Built directly on [BlueZ](http://www.bluez.org/)'s D-Bus GATT-peripheral
 API (`org.bluez.GattManager1` / `GattService1` / `GattCharacteristic1` /
-`LEAdvertisement1` / `Agent1`) using plain `libdbus` -- no GLib, no
-sd-bus/systemd dependency. WiFi itself is driven through `wpa_cli`
-(wpa_supplicant's control interface) and `dhcpcd`.
+`LEAdvertisement1`) using plain `libdbus` -- no GLib, no sd-bus/systemd
+dependency. WiFi itself is driven through `wpa_cli` (wpa_supplicant's
+control interface) and `dhcpcd`.
 
 The Pi 3's onboard Bluetooth chip shares a single antenna with its WiFi
 radio, so BLE connections routinely drop once WiFi is actively passing
@@ -68,29 +69,36 @@ CI (GitHub Actions) compiles this against Alpine's real `dbus-dev` and
 `openssl-dev` headers on every push, which catches D-Bus API misuse and
 build breakage. It cannot exercise the actual runtime behavior, though --
 there's no Bluetooth radio, no `bluetoothd`, and no WiFi interface in a
-GitHub Actions container. **The BLE pairing/GATT flow and the WiFi join
-itself have only been verified by code review, not on real hardware.**
-Test on an actual Pi 3 before relying on this for unattended provisioning.
+GitHub Actions container. **The BLE GATT flow and the WiFi join itself
+have only been verified by code review and on one physical Pi 3, not
+broadly.** Test on your own hardware before relying on this for
+unattended provisioning.
 
 ## Security model
 
-WiFi credentials cross the air twice: BLE (phone → Pi) and then the WiFi
-radio itself (Pi → AP, already encrypted by WPA2). This daemon protects
-the BLE leg by requiring **pairing** before any characteristic can be
-read or written -- BlueZ enforces this at the ATT layer via the
-`encrypt-read` / `encrypt-write` characteristic flags, refusing access
-and triggering pairing automatically if the link isn't already encrypted.
+**No pairing, no encryption on BLE.** WiFi credentials (SSID and
+passphrase) cross the BLE link in the clear to any device that connects
+during the provisioning window -- there is no authentication or
+encryption gate at all on this GATT service. This is a deliberate
+trade-off, not an oversight: an earlier revision required BLE
+pairing/bonding ("Just Works", since a headless Pi has no display or
+keyboard to confirm a passkey with), but bonding on the Pi 3's BCM43438
+proved unreliable enough in practice -- bond state going out of sync
+between BlueZ and the central after either side's pairing record was
+reset, manifesting as repeated OS-level "Connection Request" prompts and
+CoreBluetooth's `peerRemovedPairingInformation` error -- that it wasn't
+worth what "Just Works" pairing actually protected against in the first
+place (which was already only passive eavesdropping, not an active
+attacker, per the same trade-off most headless BLE-provisioned IoT
+devices make).
 
-Pairing uses the `NoInputNoOutput` I/O capability ("Just Works"), because
-a headless Pi has no display or keyboard to confirm a passkey with. This
-daemon's pairing agent auto-accepts every pairing request. **Just Works
-encrypts the link against passive eavesdropping but provides no
-protection against an active attacker during the initial pairing
-handshake** (no PIN, no numeric comparison) -- the same trade-off most
-headless BLE-provisioned IoT devices make. If that's not acceptable for
-your environment, only pair the Pi in a physically controlled setting, or
-adapt `bluetooth.agent_capability` / the agent's `RequestConfirmation`
-handling in `src/gatt_server.hpp` for a display/PIN-based flow.
+Practical implication: **only use this on a trusted home/lab network,
+during a provisioning window you control.** Anyone with a BLE-capable
+device in range during that window can read the Pi's current WiFi status
+or push new credentials to it. If you need real access control, put the
+Pi somewhere physically private while provisioning, or don't leave
+`pi-bluetooth-configuration` running/advertising outside of the moments
+you're actively using it.
 
 SSID and password bytes never pass through a shell: `wifi_control.hpp`
 hands `wpa_cli` hex-encoded SSIDs and a PSK it derives itself
@@ -137,11 +145,10 @@ echo '{"cmd":"status"}' | nc 192.168.1.42 8567
 ```
 
 **Unauthenticated**, like this project family's other TCP control ports
-(`mp3-player`, `victron-ve-direct`) -- anyone who can reach this port on
-the LAN can read status or reconfigure WiFi credentials. Reasonable for
-a single-purpose home/lab Pi; not for a shared or untrusted network. BLE
-pairing doesn't extend any protection to this interface -- it's a
-separate channel, gated only by network reachability.
+(`mp3-player`, `victron-ve-direct`) and like the BLE service itself --
+anyone who can reach this port on the LAN can read status or reconfigure
+WiFi credentials. Reasonable for a single-purpose home/lab Pi; not for a
+shared or untrusted network.
 
 ## GATT service
 
@@ -150,19 +157,21 @@ Custom 128-bit UUIDs (no existing SIG profile fits this):
 | Characteristic | UUID | Properties | Contents |
 |---|---|---|---|
 | Service | `7b1e0000-6a45-4d1f-9b0a-3c2f8e4d5a10` | -- | -- |
-| SSID | `7b1e0001-6a45-4d1f-9b0a-3c2f8e4d5a10` | write, encrypted | UTF-8 network name |
-| Password | `7b1e0002-6a45-4d1f-9b0a-3c2f8e4d5a10` | write, encrypted | UTF-8 passphrase (omit/empty for open networks) |
-| Command | `7b1e0003-6a45-4d1f-9b0a-3c2f8e4d5a10` | write, encrypted | ASCII: `scan` \| `connect` \| `forget` |
-| Status | `7b1e0004-6a45-4d1f-9b0a-3c2f8e4d5a10` | read + notify, encrypted | JSON, see below |
-| ScanResults | `7b1e0005-6a45-4d1f-9b0a-3c2f8e4d5a10` | read + notify, encrypted | JSON array, see below |
+| SSID | `7b1e0001-6a45-4d1f-9b0a-3c2f8e4d5a10` | write | UTF-8 network name |
+| Password | `7b1e0002-6a45-4d1f-9b0a-3c2f8e4d5a10` | write | UTF-8 passphrase (omit/empty for open networks) |
+| Command | `7b1e0003-6a45-4d1f-9b0a-3c2f8e4d5a10` | write | ASCII: `scan` \| `connect` \| `forget` |
+| Status | `7b1e0004-6a45-4d1f-9b0a-3c2f8e4d5a10` | read + notify | JSON, see below |
+| ScanResults | `7b1e0005-6a45-4d1f-9b0a-3c2f8e4d5a10` | read + notify | JSON array, see below |
 
-SSID/Password are write-only (no read) so a paired-but-different client
-can't fetch back a passphrase someone else staged.
+No pairing/encryption gates any of these -- see Security model above.
+SSID/Password are still write-only (no read) purely so a second BLE
+client can't fetch back a passphrase the first one staged; it's not a
+security boundary against a client that's actually listening in on the
+writes themselves.
 
 ### Protocol
 
-1. Pair with the Pi (BLE pairing, "Just Works" -- your BLE stack/app will
-   prompt to confirm, with no PIN to enter).
+1. Connect to the Pi over BLE (no pairing step -- connecting is enough).
 2. Optionally write `scan` to Command, wait ~5s, then read (or subscribe
    to notifications on) ScanResults for a picklist.
 3. Write the network name to SSID, the passphrase to Password (skip this
@@ -265,7 +274,6 @@ Edit `/etc/pi-bluetooth-configuration/config.ini`:
 [bluetooth]
 adapter          = hci0
 device_name      = pi-bluetooth-configuration
-agent_capability = NoInputNoOutput
 
 [wifi]
 interface        = wlan0
@@ -305,8 +313,6 @@ automatically on failure (5s delay, unlimited retries, via
   daemon previously configured -- it's not a saved-network list manager.
 - **Scan is a fixed 4s sleep-then-fetch**, not an event-driven wait for
   `CTRL-EVENT-SCAN-RESULTS`. Simple and reliable, if not instant.
-- **No LE Secure Connections / MITM protection** (see Security model
-  above) -- `NoInputNoOutput` is the only realistic option without adding
-  a display or physical button to the Pi.
-- **The TCP control interface is unauthenticated** -- see "TCP control
-  interface" above. BLE pairing doesn't gate it in any way.
+- **No authentication or encryption at all, on either interface** -- see
+  Security model above. Both BLE and the TCP control interface are wide
+  open to anyone who can reach them.
