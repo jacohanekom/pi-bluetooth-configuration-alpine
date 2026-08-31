@@ -23,6 +23,10 @@
  * model section. This means WiFi credentials cross BLE in the clear;
  * treat this as suitable for a trusted home/lab network, not a public one.
  *
+ * Advertised as the board's hardware serial (from /proc/cpuinfo), not a
+ * fixed name, so a client's device list distinguishes between multiple
+ * aipicam units instead of showing the same string for all of them.
+ *
  * This is a one-shot provisioning flow, not a managed session: a
  * successful "connect" creates MARKER_FILE and reboots the Pi a few
  * seconds later (enough time for the final Status notification to reach
@@ -138,6 +142,25 @@ std::string scan_json(const std::vector<ScanResult>& results) {
     return o.str();
 }
 
+// The board's hardware serial (from /proc/cpuinfo) rather than a fixed
+// configured name, so a client's "nearby devices" list distinguishes
+// between multiple aipicam units instead of showing the same string for
+// all of them. Falls back to bluetooth.device_name (e.g. when not
+// running on real Pi hardware) if it can't be read.
+std::string read_pi_serial() {
+    std::ifstream f("/proc/cpuinfo");
+    std::string line;
+    while (std::getline(f, line)) {
+        auto pos = line.find("Serial");
+        if (pos == std::string::npos) continue;
+        auto colon = line.find(':', pos);
+        if (colon == std::string::npos) continue;
+        std::string serial = trim(line.substr(colon + 1));
+        if (!serial.empty()) return serial;
+    }
+    return "";
+}
+
 // Waits long enough for the just-sent BLE notification to actually reach
 // the client before the reboot drops the connection, then reboots.
 // Fire-and-forget: once the reboot command is issued, the whole system
@@ -166,13 +189,15 @@ int main(int argc, char** argv) {
 
     Config cfg(cfg_path);
     const std::string adapter    = cfg.get_str("bluetooth.adapter", "hci0");
-    const std::string dev_name   = cfg.get_str("bluetooth.device_name", "pi-bluetooth-configuration");
+    const std::string configured_name = cfg.get_str("bluetooth.device_name", "pi-bluetooth-configuration");
+    const std::string serial     = read_pi_serial();
+    const std::string dev_name   = serial.empty() ? configured_name : serial;
     const std::string iface      = cfg.get_str("wifi.interface", "wlan0");
     const int max_scan_results   = cfg.get_int("scan.max_results", 10);
     const std::string adapter_path = "/org/bluez/" + adapter;
 
     std::cerr << "[Config] adapter  : " << adapter_path << "\n"
-              << "[Config] device   : " << dev_name << "\n"
+              << "[Config] device   : " << dev_name << (serial.empty() ? " (configured)" : " (hardware serial)") << "\n"
               << "[Config] wifi if  : " << iface << "\n";
 
     dbus_threads_init_default();

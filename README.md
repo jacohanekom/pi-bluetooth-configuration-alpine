@@ -276,6 +276,13 @@ interface        = wlan0
 max_results      = 10
 ```
 
+`device_name` is only a fallback. The advertised BLE name is normally
+the board's own hardware serial number (read from `/proc/cpuinfo` at
+startup), not this configured string -- so a client's device list shows
+which physical Pi is which instead of the same name for every unit.
+`device_name` is used as-is only when a serial can't be read (e.g. not
+running on real Pi hardware).
+
 `wpa_supplicant` must already be running against the same interface with
 a control socket (`ctrl_interface=/var/run/wpa_supplicant` and
 `update_config=1` in `/etc/wpa_supplicant/wpa_supplicant.conf`) -- this
