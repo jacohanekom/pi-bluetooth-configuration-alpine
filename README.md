@@ -135,15 +135,25 @@ that's expected, not a crash.
 
 ## Ethernet direct-connect
 
-Separate from WiFi provisioning: `set_ethernet` (write an IPv4 address
-to `EthernetIP`, then write `set_ethernet` to `Command`) gives `eth0` a
-fixed static IP and starts a DHCP server (`dnsmasq`) scoped strictly to
-`eth0`, so a laptop plugged directly into the Pi's ethernet port gets an
-address automatically -- no router, no manual IP configuration on the
-other end. `clear_ethernet` reverts `eth0` to normal DHCP client
-behaviour and stops the DHCP server. Reading `EthernetIP` at any time
+`eth0` is meant to always be a working gateway, not something you have
+to configure before it's useful: on first boot (whenever no static
+config is persisted yet), the daemon gives it a default static IP --
+`192.168.4.1`, overridable via `ethernet.ip` in `config.ini` -- and
+starts a DHCP server (`dnsmasq`) scoped strictly to `eth0`, so a laptop
+plugged directly into the Pi's ethernet port gets an address
+automatically, no router, no manual IP configuration on the other end,
+no app interaction required.
+
+While WiFi isn't configured yet, this is customizable: `set_ethernet`
+(write an IPv4 address to `EthernetIP`, then write `set_ethernet` to
+`Command`) replaces the static IP + DHCP range with a new one, and
+`clear_ethernet` reverts `eth0` to normal DHCP client behaviour and
+stops the DHCP server. **Once WiFi is connected, the daemon rejects
+both commands** (logged, no-op) -- at that point Ethernet's job is done
+being the primary local-access path, so its config is left alone rather
+than staying live for reconfiguration. Reading `EthernetIP` at any time
 returns whatever IP is actually live on `eth0` right now (static or
-DHCP-assigned).
+DHCP-assigned), regardless of which state you're in.
 
 This exists because plugging a WiFi-configured Pi into the same LAN over
 Ethernet at the same time as testing WiFi can produce exactly the kind
@@ -153,10 +163,11 @@ its own dedicated, isolated subnet sidesteps that entirely, and doubles
 as a "plug in directly with a laptop" recovery path if WiFi is ever
 misconfigured.
 
-Unlike WiFi, this doesn't reboot the Pi: Ethernet doesn't share the
-Pi 3's antenna with Bluetooth, so there's no coexistence problem forcing
-a clean restart, and the change (`dhcpcd`/`dnsmasq` restarted directly)
-takes effect within a couple of seconds.
+Unlike WiFi, applying/changing this doesn't reboot the Pi: Ethernet
+doesn't share the Pi 3's antenna with Bluetooth, so there's no
+coexistence problem forcing a clean restart, and the change
+(`dhcpcd`/`dnsmasq` restarted directly) takes effect within a couple of
+seconds.
 
 **Safety**: `dnsmasq` is configured with `interface=eth0` and
 `bind-interfaces` specifically so it only ever answers DHCP requests on
@@ -180,7 +191,7 @@ Custom 128-bit UUIDs (no existing SIG profile fits this):
 | Command | `7b1e0003-6a45-4d1f-9b0a-3c2f8e4d5a10` | write | ASCII: `scan` \| `connect` \| `forget` \| `set_ethernet` \| `clear_ethernet` |
 | Status | `7b1e0004-6a45-4d1f-9b0a-3c2f8e4d5a10` | read + notify | JSON, see below |
 | ScanResults | `7b1e0005-6a45-4d1f-9b0a-3c2f8e4d5a10` | read + notify | JSON array, see below |
-| EthernetIP | `7b1e0006-6a45-4d1f-9b0a-3c2f8e4d5a10` | read + write + notify | ASCII dotted-quad IPv4 address, see "Ethernet direct-connect" |
+| EthernetIP | `7b1e0006-6a45-4d1f-9b0a-3c2f8e4d5a10` | read + write + notify | ASCII dotted-quad IPv4 address, see "Ethernet direct-connect" (write only takes effect while WiFi isn't configured) |
 
 No pairing/encryption gates any of these -- see Security model above.
 SSID/Password are still write-only (no read) purely so a second BLE
@@ -246,8 +257,9 @@ Actions artifact; tagged `v*` pushes also attach it to a GitHub Release),
 built via `abuild` from [`alpine/APKBUILD`](alpine/APKBUILD). It installs
 cleanly with `apk`, pulling in `dbus`, `bluez`, `wpa_supplicant`,
 `dhcpcd`, and `dnsmasq` (plus their OpenRC services) automatically.
-`dnsmasq` is only started when `set_ethernet` is actually used -- no
-need to enable it manually.
+`dnsmasq` is started automatically the first time the daemon applies
+`eth0`'s default gateway IP (see "Ethernet direct-connect") -- no need
+to enable it manually.
 
 It's signed with a throwaway key generated fresh in CI each run (there's
 no distributed repo to establish trust for), so install with

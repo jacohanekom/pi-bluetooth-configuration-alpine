@@ -16,9 +16,13 @@
  *   Status      (read + notify)  {"state":...,"ssid":...,"ip":...,"error":...}
  *   ScanResults (read + notify)  [{"ssid":...,"rssi":...,"security":...}, ...]
  *
- * "set_ethernet"/"clear_ethernet" configure a static IP + a DHCP server
- * on eth0 for direct-connect local access, independent of WiFi -- see
- * eth_control.hpp and the README's "Ethernet direct-connect" section.
+ * eth0 is always a working gateway: a default static IP + DHCP server
+ * is applied at startup if none is persisted yet, so a fresh Pi is
+ * reachable over Ethernet with no app interaction. "set_ethernet"/
+ * "clear_ethernet" let it be customized, but only while WiFi isn't
+ * configured yet -- once WiFi is connected, this daemon rejects further
+ * changes and the app switches to a read-only display instead (see
+ * eth_control.hpp and the README's "Ethernet direct-connect" section).
  * Unlike WiFi, applying these doesn't reboot: Ethernet doesn't share the
  * Pi 3's antenna with Bluetooth, so there's no coexistence problem to
  * route around, and the change is visible immediately.
@@ -204,6 +208,7 @@ int main(int argc, char** argv) {
     const std::string dev_name   = serial.empty() ? configured_name : serial;
     const std::string iface      = cfg.get_str("wifi.interface", "wlan0");
     const std::string eth_iface  = cfg.get_str("ethernet.interface", "eth0");
+    const std::string eth_default_ip = cfg.get_str("ethernet.ip", "192.168.4.1");
     const int max_scan_results   = cfg.get_int("scan.max_results", 10);
     const std::string adapter_path = "/org/bluez/" + adapter;
 
@@ -225,6 +230,20 @@ int main(int argc, char** argv) {
 
     WifiControl wifi(iface);
     ethctl::EthControl eth(eth_iface);
+
+    // eth0 is meant to always be a usable gateway, not something the app
+    // has to configure first -- give it a default static IP + DHCP
+    // server on first boot. Once *any* static config is persisted
+    // (default or user-chosen), later boots leave it alone.
+    if (!eth.has_static_config()) {
+        std::thread([&eth, eth_default_ip]() {
+            InflightGuard guard;
+            std::string ip_err;
+            if (!eth.set_static_ip(eth_default_ip, ip_err)) {
+                std::cerr << "[Ethernet] failed to apply default gateway IP " << eth_default_ip << ": " << ip_err << "\n";
+            }
+        }).detach();
+    }
 
     gattsrv::GattServer server(conn, adapter_path, APP_ROOT, SERVICE_UUID, dev_name);
 
@@ -298,9 +317,16 @@ int main(int argc, char** argv) {
         reboot_after_delay();
     };
 
-    // Ethernet direct-connect config is independent of WiFi/BLE state --
-    // applied immediately, no reboot needed (see file header comment).
+    // Ethernet direct-connect is only reconfigurable while WiFi isn't
+    // set up yet -- once WiFi is connected, eth0's gateway config is
+    // left as-is and the app switches to a read-only display of it.
+    // Applied immediately when allowed, no reboot needed (see file
+    // header comment).
     auto do_set_ethernet = [&](std::string ip) {
+        if (wifi.get_status().state == WifiStatus::CONNECTED) {
+            std::cerr << "[Ethernet] ignoring set_ethernet: WiFi is already configured\n";
+            return;
+        }
         std::string ip_err;
         if (!eth.set_static_ip(ip, ip_err)) {
             std::cerr << "[Ethernet] failed to set static IP " << ip << ": " << ip_err << "\n";
@@ -309,6 +335,10 @@ int main(int argc, char** argv) {
     };
 
     auto do_clear_ethernet = [&]() {
+        if (wifi.get_status().state == WifiStatus::CONNECTED) {
+            std::cerr << "[Ethernet] ignoring clear_ethernet: WiFi is already configured\n";
+            return;
+        }
         eth.clear_static_ip();
         server.notify(eth_ip_char, to_bytes(eth.get_ip()));
     };

@@ -6,6 +6,13 @@
  * in the loop -- a direct-connect path for local access/config that's
  * independent of whatever the Pi's WiFi is doing.
  *
+ * eth0 is meant to always be a working gateway: main.cpp applies a
+ * default static IP here at startup if none is set yet, so a fresh Pi
+ * is reachable over Ethernet immediately, no app interaction required.
+ * Once WiFi is configured, the app switches this from an editable
+ * field to a read-only display -- Ethernet's job at that point is just
+ * a fallback/maintenance path, not something to reconfigure on the fly.
+ *
  * Unlike WiFi, applying this doesn't need a reboot: Ethernet doesn't
  * share the Pi 3's antenna with Bluetooth, so there's no coexistence
  * problem to route around -- the affected services (dhcpcd, dnsmasq)
@@ -97,6 +104,19 @@ public:
         if (a == std::string::npos) return "";
         auto b = ip.find_last_not_of(ws);
         return ip.substr(a, b - a + 1);
+    }
+
+    // True once our marker block exists in dhcpcd.conf -- i.e. eth0
+    // already has *some* static IP configured, default or user-chosen.
+    // Lets startup apply a default gateway address exactly once, without
+    // clobbering a value that was already set on a previous boot.
+    bool has_static_config() const {
+        std::ifstream in(DHCPCD_CONF);
+        std::string line;
+        while (std::getline(in, line)) {
+            if (line == BEGIN_MARKER) return true;
+        }
+        return false;
     }
 
     bool set_static_ip(const std::string& ip, std::string& err) {
