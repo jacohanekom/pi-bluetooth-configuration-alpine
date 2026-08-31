@@ -247,7 +247,7 @@ int main(int argc, char** argv) {
         });
 
     gattsrv::Characteristic* eth_ip_char = server.add_characteristic(
-        ETH_IP_UUID, {"read", "write"},
+        ETH_IP_UUID, {"read", "write", "notify"},
         [&]() -> std::vector<uint8_t> { return to_bytes(eth.get_ip()); },
         [&](const std::vector<uint8_t>& v) {
             std::lock_guard<std::mutex> lk(staged_mu);

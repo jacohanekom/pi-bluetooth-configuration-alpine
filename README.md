@@ -180,7 +180,7 @@ Custom 128-bit UUIDs (no existing SIG profile fits this):
 | Command | `7b1e0003-6a45-4d1f-9b0a-3c2f8e4d5a10` | write | ASCII: `scan` \| `connect` \| `forget` \| `set_ethernet` \| `clear_ethernet` |
 | Status | `7b1e0004-6a45-4d1f-9b0a-3c2f8e4d5a10` | read + notify | JSON, see below |
 | ScanResults | `7b1e0005-6a45-4d1f-9b0a-3c2f8e4d5a10` | read + notify | JSON array, see below |
-| EthernetIP | `7b1e0006-6a45-4d1f-9b0a-3c2f8e4d5a10` | read + write | ASCII dotted-quad IPv4 address, see "Ethernet direct-connect" |
+| EthernetIP | `7b1e0006-6a45-4d1f-9b0a-3c2f8e4d5a10` | read + write + notify | ASCII dotted-quad IPv4 address, see "Ethernet direct-connect" |
 
 No pairing/encryption gates any of these -- see Security model above.
 SSID/Password are still write-only (no read) purely so a second BLE
