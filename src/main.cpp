@@ -16,9 +16,10 @@
  *   Status      (read + notify)  {"state":...,"ssid":...,"ip":...,"error":...}
  *   ScanResults (read + notify)  [{"ssid":...,"rssi":...,"security":...}, ...]
  *
- * eth0 is always a working gateway: a default static IP + DHCP server
- * is applied at startup if none is persisted yet, so a fresh Pi is
- * reachable over Ethernet with no app interaction. "set_ethernet"/
+ * eth0 is always a working gateway: its static IP + DHCP server are
+ * (re)applied directly at every startup -- independent of dhcpcd and
+ * carrier state -- so a Pi is reachable over Ethernet with no app
+ * interaction, cable plugged in or not. "set_ethernet"/
  * "clear_ethernet" let it be customized, but only while WiFi isn't
  * configured yet -- once WiFi is connected, this daemon rejects further
  * changes and the app switches to a read-only display instead (see
@@ -232,18 +233,16 @@ int main(int argc, char** argv) {
     ethctl::EthControl eth(eth_iface);
 
     // eth0 is meant to always be a usable gateway, not something the app
-    // has to configure first -- give it a default static IP + DHCP
-    // server on first boot. Once *any* static config is persisted
-    // (default or user-chosen), later boots leave it alone.
-    if (!eth.has_static_config()) {
-        std::thread([&eth, eth_default_ip]() {
-            InflightGuard guard;
-            std::string ip_err;
-            if (!eth.set_static_ip(eth_default_ip, ip_err)) {
-                std::cerr << "[Ethernet] failed to apply default gateway IP " << eth_default_ip << ": " << ip_err << "\n";
-            }
-        }).detach();
-    }
+    // has to configure first -- reapply its static IP (whatever was
+    // last chosen, or the configured default on a fresh install) on
+    // every startup, since `ip addr add` doesn't survive a reboot.
+    std::thread([&eth, eth_default_ip]() {
+        InflightGuard guard;
+        std::string ip_err;
+        if (!eth.ensure_static_ip(eth_default_ip, ip_err)) {
+            std::cerr << "[Ethernet] failed to apply gateway IP: " << ip_err << "\n";
+        }
+    }).detach();
 
     gattsrv::GattServer server(conn, adapter_path, APP_ROOT, SERVICE_UUID, dev_name);
 

@@ -136,13 +136,25 @@ that's expected, not a crash.
 ## Ethernet direct-connect
 
 `eth0` is meant to always be a working gateway, not something you have
-to configure before it's useful: on first boot (whenever no static
-config is persisted yet), the daemon gives it a default static IP --
-`192.168.4.1`, overridable via `ethernet.ip` in `config.ini` -- and
-starts a DHCP server (`dnsmasq`) scoped strictly to `eth0`, so a laptop
-plugged directly into the Pi's ethernet port gets an address
-automatically, no router, no manual IP configuration on the other end,
-no app interaction required.
+to configure before it's useful: on every boot, the daemon assigns it a
+static IP directly (`ip addr add`) -- whatever was last chosen, or a
+default of `192.168.4.1` (overridable via `ethernet.ip` in
+`config.ini`) if nothing has been chosen yet -- and starts a DHCP
+server (`dnsmasq`) scoped strictly to `eth0`, so a laptop plugged
+directly into the Pi's ethernet port gets an address automatically, no
+router, no manual IP configuration on the other end, no app interaction
+required.
+
+The address is assigned directly rather than through dhcpcd's own
+static-IP config, and deliberately so: dhcpcd only applies its config
+once it detects carrier on the interface, so a Pi sitting with nothing
+plugged into `eth0` would show no address at all (`ip addr show eth0`
+reporting `NO-CARRIER` with no `inet` line) and only pick one up some
+moments after a cable is inserted. A gateway address needs to be there
+*before* anything is plugged in, so a client is served the instant it
+connects -- so this daemon assigns it directly and tells dhcpcd to
+leave `eth0` alone entirely (`denyinterfaces`), removing the carrier
+dependency altogether.
 
 While WiFi isn't configured yet, this is customizable: `set_ethernet`
 (write an IPv4 address to `EthernetIP`, then write `set_ethernet` to
@@ -168,6 +180,13 @@ doesn't share the Pi 3's antenna with Bluetooth, so there's no
 coexistence problem forcing a clean restart, and the change
 (`dhcpcd`/`dnsmasq` restarted directly) takes effect within a couple of
 seconds.
+
+The chosen IP persists in a plain state file
+(`/etc/pi-bluetooth-configuration/eth0-static-ip`) so it survives
+reboots (`ip addr add` on its own doesn't); `denyinterfaces` is
+persisted the same way as the rest of this feature's config, as a
+`# BEGIN pi-bluetooth-configuration eth0 static` / `# END ...`
+delimited block inside `/etc/dhcpcd.conf`.
 
 **Safety**: `dnsmasq` is configured with `interface=eth0` and
 `bind-interfaces` specifically so it only ever answers DHCP requests on
