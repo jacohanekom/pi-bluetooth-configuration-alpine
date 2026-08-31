@@ -23,12 +23,13 @@
  * model section. This means WiFi credentials cross BLE in the clear;
  * treat this as suitable for a trusted home/lab network, not a public one.
  *
- * The Pi 3's onboard Bluetooth shares an antenna with its WiFi radio, so
- * BLE connections routinely drop once WiFi is actively passing traffic --
- * a hardware limitation, not a bug here. So BLE is only relied on to get
- * credentials across before any network exists; see tcp_control.hpp for
- * the plain TCP/IP interface a client should hand off to once Status
- * reports a non-empty ip.
+ * This is a one-shot provisioning flow, not a managed session: a
+ * successful "connect" creates MARKER_FILE and reboots the Pi a few
+ * seconds later (enough time for the final Status notification to reach
+ * the client first); a "forget" removes MARKER_FILE and reboots the same
+ * way. There is deliberately no ongoing management interface beyond BLE
+ * -- once WiFi is set up, the expectation is that the Pi reboots into its
+ * normal role, not that a client keeps talking to this daemon.
  *
  * Build (Alpine Linux):
  *   make
@@ -41,6 +42,7 @@
 #include <csignal>
 #include <cstdint>
 #include <cstdio>
+#include <fstream>
 #include <iostream>
 #include <mutex>
 #include <sstream>
@@ -52,7 +54,6 @@
 
 #include "config.hpp"
 #include "gatt_server.hpp"
-#include "tcp_control.hpp"
 #include "wifi_control.hpp"
 
 namespace {
@@ -64,6 +65,8 @@ constexpr const char* COMMAND_UUID  = "7b1e0003-6a45-4d1f-9b0a-3c2f8e4d5a10";
 constexpr const char* STATUS_UUID   = "7b1e0004-6a45-4d1f-9b0a-3c2f8e4d5a10";
 constexpr const char* SCAN_UUID     = "7b1e0005-6a45-4d1f-9b0a-3c2f8e4d5a10";
 constexpr const char* APP_ROOT      = "/org/bluez/pibtconf";
+constexpr const char* MARKER_FILE   = "/.successfully-initialized";
+constexpr int REBOOT_DELAY_SECS     = 3;
 
 std::atomic<bool> g_running{true};
 std::atomic<int> g_inflight{0};
@@ -135,6 +138,19 @@ std::string scan_json(const std::vector<ScanResult>& results) {
     return o.str();
 }
 
+// Waits long enough for the just-sent BLE notification to actually reach
+// the client before the reboot drops the connection, then reboots.
+// Fire-and-forget: once the reboot command is issued, the whole system
+// (including this process) is going down regardless of what run_command
+// reports back.
+void reboot_after_delay() {
+    std::thread([]() {
+        std::this_thread::sleep_for(std::chrono::seconds(REBOOT_DELAY_SECS));
+        std::cerr << "[Main] rebooting now\n";
+        run_command({"reboot"});
+    }).detach();
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -153,13 +169,11 @@ int main(int argc, char** argv) {
     const std::string dev_name   = cfg.get_str("bluetooth.device_name", "pi-bluetooth-configuration");
     const std::string iface      = cfg.get_str("wifi.interface", "wlan0");
     const int max_scan_results   = cfg.get_int("scan.max_results", 10);
-    const int network_port       = cfg.get_int("network.port", 8567);
     const std::string adapter_path = "/org/bluez/" + adapter;
 
     std::cerr << "[Config] adapter  : " << adapter_path << "\n"
               << "[Config] device   : " << dev_name << "\n"
-              << "[Config] wifi if  : " << iface << "\n"
-              << "[Config] tcp port : " << network_port << "\n";
+              << "[Config] wifi if  : " << iface << "\n";
 
     dbus_threads_init_default();
 
@@ -207,9 +221,6 @@ int main(int argc, char** argv) {
         },
         nullptr);
 
-    // Shared by both the BLE Command characteristic and the TCP control
-    // interface below, so "scan"/"connect"/"forget" behave identically
-    // and update the same state no matter which channel triggered them.
     auto do_scan = [&]() {
         auto results = wifi.scan(max_scan_results);
         std::string json;
@@ -221,20 +232,24 @@ int main(int argc, char** argv) {
         server.notify(scan_char, to_bytes(json));
     };
 
+    // A successful connect is the end of this daemon's job, not the start
+    // of an ongoing session: mark success on disk and reboot into the
+    // Pi's normal role rather than staying up to be managed further.
     auto do_connect = [&](std::string ssid, std::string psk) {
         wifi.connect(ssid, psk);
-        server.notify(status_char, to_bytes(status_json(wifi.get_status())));
+        auto st = wifi.get_status();
+        server.notify(status_char, to_bytes(status_json(st)));
+        if (st.state == WifiStatus::CONNECTED) {
+            std::ofstream(MARKER_FILE).close();
+            reboot_after_delay();
+        }
     };
 
     auto do_forget = [&]() {
         wifi.forget();
         server.notify(status_char, to_bytes(status_json(wifi.get_status())));
-    };
-
-    auto get_status_json = [&]() -> std::string { return status_json(wifi.get_status()); };
-    auto get_scan_json = [&]() -> std::string {
-        std::lock_guard<std::mutex> lk(scan_mu);
-        return last_scan_json;
+        std::remove(MARKER_FILE);
+        reboot_after_delay();
     };
 
     server.add_characteristic(COMMAND_UUID, {"write"}, nullptr,
@@ -269,19 +284,6 @@ int main(int argc, char** argv) {
         return 1;
     }
     std::cerr << "[BlueZ] advertising as \"" << dev_name << "\", service " << SERVICE_UUID << "\n";
-
-    // Always-on handoff target: once Status reports a non-empty ip, a
-    // well-behaved client should switch to this instead of continuing to
-    // rely on BLE (see the file header comment for why).
-    tcpctl::TcpControlServer tcp;
-    tcp.on_status = get_status_json;
-    tcp.on_scan_results = get_scan_json;
-    tcp.on_scan = [&]() { std::thread([&]() { InflightGuard guard; do_scan(); }).detach(); };
-    tcp.on_connect = [&](std::string ssid, std::string psk) {
-        std::thread([&, ssid, psk]() { InflightGuard guard; do_connect(ssid, psk); }).detach();
-    };
-    tcp.on_forget = [&]() { do_forget(); };
-    tcp.start(network_port);
 
     std::signal(SIGINT, on_signal);
     std::signal(SIGTERM, on_signal);

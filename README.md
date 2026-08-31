@@ -12,14 +12,13 @@ API (`org.bluez.GattManager1` / `GattService1` / `GattCharacteristic1` /
 dependency. WiFi itself is driven through `wpa_cli` (wpa_supplicant's
 control interface) and `dhcpcd`.
 
-The Pi 3's onboard Bluetooth chip shares a single antenna with its WiFi
-radio, so BLE connections routinely drop once WiFi is actively passing
-traffic (a hardware limitation, not a bug -- see "WiFi/Bluetooth
-coexistence" below). BLE is therefore only relied on for the one thing
-it has to do: get credentials across before any network exists. Once
-the Pi has an IP, this daemon also exposes a plain TCP/IP control
-interface on the LAN, and a well-behaved client hands off to that
-instead of continuing to fight the radio for airtime.
+This is a one-shot provisioning flow, not a managed session. A
+successful `connect` creates `/.successfully-initialized` and reboots
+the Pi a few seconds later; a `forget` removes that file and reboots the
+same way. There is no ongoing management interface beyond BLE -- once
+WiFi is set up (or torn down), the Pi reboots into its normal role
+rather than staying up to be managed further. See "One-shot
+provisioning and reboot behavior" below.
 
 ## Raspberry Pi 3 prerequisite: dbus and bluetooth must be running
 
@@ -109,46 +108,30 @@ locally, a WiFi password containing bytes not valid as text isn't an
 issue -- but SSIDs are always sent as hex too, sidestepping wpa_supplicant's
 control-interface quoting rules entirely.
 
-## WiFi/Bluetooth coexistence and the TCP handoff
+## One-shot provisioning and reboot behavior
 
-The Raspberry Pi 3's Bluetooth chip (BCM43438) shares a single
-antenna/RF front-end with its WiFi radio. This is fine while WiFi is
-idle, but once it's actively associated and passing traffic, it
-routinely starves and drops BLE connections -- this is a well-documented
-hardware limitation of this exact chip, not something specific to
-BlueZ, Alpine, or any particular BLE central/OS.
+This daemon isn't meant to stay up managing an active WiFi connection --
+its only job is to get the Pi onto a network (or off one) and then get
+out of the way:
 
-So: don't fight it. Use BLE only for what it has to do (handing
-credentials to a Pi with no network yet), and once `Status` reports a
-non-empty `ip`, switch to the always-on TCP interface below for
-everything else -- status polling, re-scanning, `forget`. It's the same
-commands, just over IP instead of GATT, and isn't subject to the
-antenna-sharing problem at all. A BLE disconnect right after `Status`
-first reports `connected` is expected, not an error.
+- **`connect` succeeds** (`Status` reports `state=connected` with a
+  non-empty `ip`): creates `/.successfully-initialized` (an empty marker
+  file at the filesystem root), waits 3 seconds (enough time for that
+  final `Status` notification to actually reach the BLE client before
+  the connection drops), then reboots the Pi.
+- **`forget`**: removes `/.successfully-initialized` if present, then
+  reboots the same way (also after the 3-second delay).
 
-## TCP control interface
+`/.successfully-initialized` is meant for other boot-time scripts/units
+on the Pi to check (`test -f /.successfully-initialized`) to know
+whether WiFi provisioning has ever completed successfully -- this daemon
+itself doesn't read it back.
 
-Listens on `network.port` (default `8567`), all interfaces, from
-startup. One JSON object per line in each direction; the connection
-stays open across multiple commands:
-
-| Request | Reply |
-|---|---|
-| `{"cmd":"status"}` | `{"state":...,"ssid":...,"ip":...,"error":...}` |
-| `{"cmd":"scan"}` | `{"ok":true}` (async, like the BLE Command char) |
-| `{"cmd":"scanresults"}` | `[{"ssid":...,"rssi":...,"security":...}, ...]` |
-| `{"cmd":"connect","ssid":"...","psk":"..."}` | `{"ok":true}` |
-| `{"cmd":"forget"}` | `{"ok":true}` |
-
-```bash
-echo '{"cmd":"status"}' | nc 192.168.1.42 8567
-```
-
-**Unauthenticated**, like this project family's other TCP control ports
-(`mp3-player`, `victron-ve-direct`) and like the BLE service itself --
-anyone who can reach this port on the LAN can read status or reconfigure
-WiFi credentials. Reasonable for a single-purpose home/lab Pi; not for a
-shared or untrusted network.
+The reboot is a plain `reboot` (no shell, via the same argv-array
+`run_command` helper used for `wpa_cli`/`dhcpcd`), which goes through
+OpenRC's normal shutdown sequence. Expect the BLE connection (and this
+daemon along with it) to disappear a few seconds after either action --
+that's expected, not a crash.
 
 ## GATT service
 
@@ -177,10 +160,9 @@ writes themselves.
 3. Write the network name to SSID, the passphrase to Password (skip this
    write entirely for an open network), then write `connect` to Command.
 4. Subscribe to Status notifications (or poll by reading it) until
-   `state` is `connected` or `failed`.
-5. Once `state` is `connected` and `ip` is non-empty, switch to the TCP
-   control interface at that `ip` for anything further -- see "WiFi/Bluetooth
-   coexistence and the TCP handoff" below.
+   `state` is `connected` or `failed`. On success, expect the Pi to
+   reboot (and BLE to disconnect) a few seconds later -- see "One-shot
+   provisioning and reboot behavior" below.
 
 ### Status JSON
 
@@ -280,9 +262,6 @@ interface        = wlan0
 
 [scan]
 max_results      = 10
-
-[network]
-port             = 8567
 ```
 
 `wpa_supplicant` must already be running against the same interface with
@@ -313,6 +292,9 @@ automatically on failure (5s delay, unlimited retries, via
   daemon previously configured -- it's not a saved-network list manager.
 - **Scan is a fixed 4s sleep-then-fetch**, not an event-driven wait for
   `CTRL-EVENT-SCAN-RESULTS`. Simple and reliable, if not instant.
-- **No authentication or encryption at all, on either interface** -- see
-  Security model above. Both BLE and the TCP control interface are wide
-  open to anyone who can reach them.
+- **No authentication or encryption at all** -- see Security model
+  above. The BLE service is wide open to anyone who can reach it.
+- **Reboots unconditionally on success/forget**, with no way to opt out
+  short of editing `src/main.cpp`. If you need the daemon to stay up
+  afterward for some other purpose, remove the `reboot_after_delay()`
+  calls in `do_connect`/`do_forget`.
