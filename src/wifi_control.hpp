@@ -131,7 +131,9 @@ inline std::string security_from_flags(const std::string& flags) {
 
 class WifiControl {
 public:
-    explicit WifiControl(std::string iface) : iface_(std::move(iface)) {}
+    explicit WifiControl(std::string iface) : iface_(std::move(iface)) {
+        refresh_status();
+    }
 
     WifiStatus get_status() const {
         std::lock_guard<std::mutex> lk(mu_);
@@ -141,6 +143,26 @@ public:
     void set_status(WifiStatus s) {
         std::lock_guard<std::mutex> lk(mu_);
         status_ = std::move(s);
+    }
+
+    // Queries wpa_supplicant directly for whatever it's already doing --
+    // called once at startup so a freshly (re)started daemon reports the
+    // real state immediately instead of always starting at "idle", which
+    // otherwise hides an already-successful connection (e.g. right after
+    // a reboot where wpa_supplicant reconnected to a saved network on its
+    // own, well before this daemon or a BLE client even exists).
+    void refresh_status() {
+        using namespace wifi_detail;
+        auto st = run_command({"wpa_cli", "-i", iface_, "status"});
+        if (status_field(st.output, "wpa_state") == "COMPLETED") {
+            std::string ssid = status_field(st.output, "ssid");
+            std::string ip = status_field(st.output, "ip_address");
+            if (!ssid.empty() && !ip.empty()) {
+                set_status(WifiStatus{WifiStatus::CONNECTED, ssid, ip, ""});
+                return;
+            }
+        }
+        set_status(WifiStatus{});
     }
 
     // Blocking; run this on a worker thread. Triggers a scan and waits a

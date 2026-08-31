@@ -172,6 +172,13 @@ writes themselves.
 
 `state` is one of `idle`, `scanning`, `connecting`, `connected`, `failed`.
 
+This reflects wpa_supplicant's actual live state, queried once at daemon
+startup and updated from then on -- so if WiFi was already configured
+successfully in an earlier session (e.g. the Pi just rebooted and
+wpa_supplicant reconnected on its own before this daemon or any BLE
+client existed), `Status` correctly reports `connected` immediately
+rather than starting at `idle` and hiding an already-working connection.
+
 ### ScanResults JSON
 
 ```json
