@@ -9,9 +9,11 @@
  * eth0 is meant to always be a working gateway: main.cpp reapplies the
  * static IP here on every startup, so a fresh (or just-rebooted) Pi is
  * reachable over Ethernet immediately, no app interaction required.
- * Once WiFi is configured, the app switches this from an editable
- * field to a read-only display -- Ethernet's job at that point is just
- * a fallback/maintenance path, not something to reconfigure on the fly.
+ * Once WiFi provisioning is finished, the app switches this from an
+ * editable field to a read-only display and the daemon rejects further
+ * changes (see main.cpp's marker-file gate) -- Ethernet's job at that
+ * point is a fixed fallback/maintenance path, not something to
+ * reconfigure on the fly.
  *
  * The address is assigned directly with `ip addr add`, not through
  * dhcpcd's own static-ip config -- dhcpcd only applies its config once
@@ -26,11 +28,11 @@
  * problem to route around -- the affected services (dhcpcd, dnsmasq)
  * are just restarted directly and the change takes effect immediately.
  *
- * The chosen IP is persisted in a plain state file so it survives
- * reboots (unlike `ip addr add`, which doesn't); the `denyinterfaces`
- * line is persisted as a marker-delimited block inside /etc/dhcpcd.conf
- * so it can be added/removed idempotently without disturbing whatever
- * else is already in that file.
+ * The chosen IP and DHCP range are persisted in a plain state file so
+ * they survive reboots (unlike `ip addr add`, which doesn't); the
+ * `denyinterfaces` line is persisted as a marker-delimited block inside
+ * /etc/dhcpcd.conf so it can be added/removed idempotently without
+ * disturbing whatever else is already in that file.
  *
  * Safety note: dnsmasq is configured with `interface=`/`bind-interfaces`
  * specifically so it only ever answers DHCP requests on eth0 -- getting
@@ -42,6 +44,7 @@
 #include <fstream>
 #include <sstream>
 #include <string>
+#include <vector>
 
 #include "subprocess.hpp"
 
@@ -49,9 +52,22 @@ namespace ethctl {
 
 constexpr const char* DHCPCD_CONF  = "/etc/dhcpcd.conf";
 constexpr const char* DNSMASQ_CONF = "/etc/dnsmasq.conf";
+constexpr const char* LEASES_FILE  = "/var/lib/misc/dnsmasq.leases";
 constexpr const char* STATE_FILE   = "/etc/pi-bluetooth-configuration/eth0-static-ip";
 constexpr const char* BEGIN_MARKER = "# BEGIN pi-bluetooth-configuration eth0 static";
 constexpr const char* END_MARKER   = "# END pi-bluetooth-configuration eth0 static";
+
+struct Config {
+    std::string ip;
+    int range_start = 0;
+    int range_end = 0;
+};
+
+struct Lease {
+    std::string ip;
+    std::string mac;
+    std::string hostname; // "*" from dnsmasq means "unknown"
+};
 
 inline bool is_valid_ipv4(const std::string& ip) {
     std::stringstream ss(ip);
@@ -73,6 +89,11 @@ inline bool is_valid_ipv4(const std::string& ip) {
 // "192.168.4.1" -> "192.168.4" (the /24 network base).
 inline std::string network_prefix24(const std::string& ip) {
     return ip.substr(0, ip.rfind('.'));
+}
+
+// "192.168.4.1" -> 1
+inline int last_octet(const std::string& ip) {
+    try { return std::stoi(ip.substr(ip.rfind('.') + 1)); } catch (...) { return -1; }
 }
 
 // Replaces (or removes entirely, if new_block is empty) our
@@ -119,15 +140,62 @@ public:
         return ip.substr(a, b - a + 1);
     }
 
-    bool set_static_ip(const std::string& ip, std::string& err) {
+    // Whatever was last persisted -- empty ip/zero range if nothing has
+    // been chosen yet (fresh install, before the first ensure_static_ip
+    // call has finished).
+    Config get_config() const {
+        Config c;
+        std::ifstream in(STATE_FILE);
+        std::string line;
+        if (std::getline(in, line)) {
+            std::stringstream ss(line);
+            std::string ip, start, end;
+            std::getline(ss, ip, ',');
+            std::getline(ss, start, ',');
+            std::getline(ss, end, ',');
+            c.ip = ip;
+            try { c.range_start = std::stoi(start); } catch (...) {}
+            try { c.range_end = std::stoi(end); } catch (...) {}
+        }
+        return c;
+    }
+
+    // Currently-allocated DHCP leases handed out to devices plugged
+    // into eth0 -- parsed from dnsmasq's own leases file (one line per
+    // active lease: "<expiry> <mac> <ip> <hostname> <client-id>").
+    std::vector<Lease> get_leases() const {
+        std::vector<Lease> leases;
+        std::ifstream in(LEASES_FILE);
+        std::string line;
+        while (std::getline(in, line)) {
+            std::stringstream ss(line);
+            std::string expiry, mac, ip, hostname;
+            if (!(ss >> expiry >> mac >> ip >> hostname)) continue;
+            leases.push_back({ip, mac, hostname});
+        }
+        return leases;
+    }
+
+    bool set_static_ip(const std::string& ip, int range_start, int range_end, std::string& err) {
         if (!is_valid_ipv4(ip)) {
             err = "invalid IPv4 address";
+            return false;
+        }
+        if (range_start < 1 || range_start > 254 || range_end < 1 || range_end > 254 || range_start > range_end) {
+            err = "invalid DHCP range";
+            return false;
+        }
+        if (last_octet(ip) >= range_start && last_octet(ip) <= range_end) {
+            err = "DHCP range overlaps the gateway's own address";
             return false;
         }
 
         std::string prefix = network_prefix24(ip);
 
-        { std::ofstream out(STATE_FILE, std::ios::trunc); out << ip << "\n"; }
+        {
+            std::ofstream out(STATE_FILE, std::ios::trunc);
+            out << ip << "," << range_start << "," << range_end << "\n";
+        }
 
         // Keep dhcpcd from ever touching eth0 -- it only applies static
         // config once it sees carrier, which is wrong for an address
@@ -152,7 +220,9 @@ public:
                        << "bind-interfaces\n"
                        << "dhcp-authoritative\n"
                        << "port=0\n" // DHCP only -- no DNS service
-                       << "dhcp-range=" << prefix << ".2," << prefix << ".200,255.255.255.0,12h\n";
+                       << "dhcp-leasefile=" << LEASES_FILE << "\n"
+                       << "dhcp-range=" << prefix << "." << range_start << ","
+                       << prefix << "." << range_end << ",255.255.255.0,12h\n";
         replace_marker_block(DNSMASQ_CONF, dnsmasq_block.str());
 
         run_command({"rc-update", "add", "dnsmasq", "default"});
@@ -165,25 +235,16 @@ public:
         return true;
     }
 
-    void clear_static_ip() {
-        std::remove(STATE_FILE);
-        replace_marker_block(DHCPCD_CONF, "");
-        replace_marker_block(DNSMASQ_CONF, "");
-        run_command({"rc-service", "dnsmasq", "stop"});
-        run_command({"rc-update", "del", "dnsmasq", "default"});
-        run_command({"ip", "addr", "flush", "dev", iface_});
-        run_command({"rc-service", "dhcpcd", "restart"}, 20);
-    }
-
-    // Reapplies whichever IP was last chosen (persisted state, or
-    // default_ip if nothing was ever chosen) -- called at every daemon
-    // startup, since `ip addr add` doesn't survive a reboot on its own.
-    bool ensure_static_ip(const std::string& default_ip, std::string& err) {
-        std::ifstream in(STATE_FILE);
-        std::string ip;
-        std::getline(in, ip);
-        if (ip.empty()) ip = default_ip;
-        return set_static_ip(ip, err);
+    // Reapplies whichever IP/range was last chosen (persisted state, or
+    // the config defaults if nothing was ever chosen) -- called at
+    // every daemon startup, since `ip addr add` doesn't survive a
+    // reboot on its own.
+    bool ensure_static_ip(const std::string& default_ip, int default_start, int default_end, std::string& err) {
+        Config c = get_config();
+        std::string ip = c.ip.empty() ? default_ip : c.ip;
+        int start = c.range_start > 0 ? c.range_start : default_start;
+        int end = c.range_end > 0 ? c.range_end : default_end;
+        return set_static_ip(ip, start, end, err);
     }
 
 private:

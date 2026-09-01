@@ -12,13 +12,14 @@ API (`org.bluez.GattManager1` / `GattService1` / `GattCharacteristic1` /
 dependency. WiFi itself is driven through `wpa_cli` (wpa_supplicant's
 control interface) and `dhcpcd`.
 
-This is a one-shot provisioning flow, not a managed session. A
-successful `connect` creates `/.successfully-initialized` and reboots
-the Pi a few seconds later; a `forget` removes that file and reboots the
-same way. There is no ongoing management interface beyond BLE -- once
-WiFi is set up (or torn down), the Pi reboots into its normal role
-rather than staying up to be managed further. See "One-shot
-provisioning and reboot behavior" below.
+This is a one-shot provisioning flow, not a managed session. `connect`
+itself doesn't reboot -- it leaves room for one more step, customizing
+`eth0`'s local network configuration, before a `finish` command creates
+`/.successfully-initialized` and reboots the Pi a few seconds later; a
+`forget` removes that file and reboots the same way. There is no
+ongoing management interface beyond BLE -- once WiFi is set up (or torn
+down), the Pi reboots into its normal role rather than staying up to be
+managed further. See "One-shot provisioning and reboot behavior" below.
 
 ## Raspberry Pi 3 prerequisite: dbus and bluetooth must be running
 
@@ -115,10 +116,15 @@ its only job is to get the Pi onto a network (or off one) and then get
 out of the way:
 
 - **`connect` succeeds** (`Status` reports `state=connected` with a
-  non-empty `ip`): creates `/.successfully-initialized` (an empty marker
-  file at the filesystem root), waits 3 seconds (enough time for that
-  final `Status` notification to actually reach the BLE client before
-  the connection drops), then reboots the Pi.
+  non-empty `ip`): does *not* reboot by itself -- `EthernetIP` stays
+  writable for one more optional step (customizing `eth0`'s local
+  network configuration) before the client sends `finish`.
+- **`finish`**: only takes effect if WiFi is actually connected (a
+  no-op, logged, otherwise). Creates `/.successfully-initialized` (an
+  empty marker file at the filesystem root), waits 3 seconds (enough
+  time for that final `Status` notification to actually reach the BLE
+  client before the connection drops), then reboots the Pi. This is
+  what actually concludes the wizard.
 - **`forget`**: removes `/.successfully-initialized` if present, then
   reboots the same way (also after the 3-second delay).
 
@@ -156,16 +162,17 @@ connects -- so this daemon assigns it directly and tells dhcpcd to
 leave `eth0` alone entirely (`denyinterfaces`), removing the carrier
 dependency altogether.
 
-While WiFi isn't configured yet, this is customizable: `set_ethernet`
-(write an IPv4 address to `EthernetIP`, then write `set_ethernet` to
-`Command`) replaces the static IP + DHCP range with a new one, and
-`clear_ethernet` reverts `eth0` to normal DHCP client behaviour and
-stops the DHCP server. **Once WiFi is connected, the daemon rejects
-both commands** (logged, no-op) -- at that point Ethernet's job is done
-being the primary local-access path, so its config is left alone rather
-than staying live for reconfiguration. Reading `EthernetIP` at any time
-returns whatever IP is actually live on `eth0` right now (static or
-DHCP-assigned), regardless of which state you're in.
+This is customizable for as long as the setup wizard hasn't finished --
+which includes the window right after WiFi connects but before `finish`
+is sent, the wizard's "local network configuration" step: write
+`"<ip>,<rangeStart>,<rangeEnd>"` (e.g. `"192.168.4.1,2,200"`) to
+`EthernetIP`, then write `set_ethernet` to `Command`, to replace the
+gateway IP and DHCP range with new ones. **Once `finish` actually runs,
+the daemon rejects further `set_ethernet` writes** (logged, no-op) --
+at that point Ethernet's job is done being reconfigurable, so its
+config is left alone. Reading `EthernetIP` at any time returns the same
+`"ip,rangeStart,rangeEnd"` format reflecting whatever's actually live
+on `eth0` right now, regardless of which state you're in.
 
 This exists because plugging a WiFi-configured Pi into the same LAN over
 Ethernet at the same time as testing WiFi can produce exactly the kind
@@ -181,12 +188,20 @@ coexistence problem forcing a clean restart, and the change
 (`dhcpcd`/`dnsmasq` restarted directly) takes effect within a couple of
 seconds.
 
-The chosen IP persists in a plain state file
-(`/etc/pi-bluetooth-configuration/eth0-static-ip`) so it survives
-reboots (`ip addr add` on its own doesn't); `denyinterfaces` is
-persisted the same way as the rest of this feature's config, as a
-`# BEGIN pi-bluetooth-configuration eth0 static` / `# END ...`
-delimited block inside `/etc/dhcpcd.conf`.
+The chosen IP and DHCP range persist in a plain state file
+(`/etc/pi-bluetooth-configuration/eth0-static-ip`, `"ip,rangeStart,rangeEnd"`)
+so they survive reboots (`ip addr add` on its own doesn't);
+`denyinterfaces` is persisted the same way as the rest of this
+feature's config, as a `# BEGIN pi-bluetooth-configuration eth0 static`
+/ `# END ...` delimited block inside `/etc/dhcpcd.conf`.
+
+**Allocated IPs**: `DhcpLeases` (read + notify) reports whatever's
+currently in dnsmasq's own leases file
+(`/var/lib/misc/dnsmasq.leases`) as JSON --
+`[{"ip":...,"mac":...,"hostname":...}, ...]` -- so the app can show
+which devices are actually plugged into `eth0` right now. A background
+thread polls that file every 5 seconds and only notifies when it
+actually changes.
 
 **Safety**: `dnsmasq` is configured with `interface=eth0` and
 `bind-interfaces` specifically so it only ever answers DHCP requests on
@@ -195,8 +210,8 @@ traffic, which would hand out conflicting addresses on a network this
 daemon doesn't own. If you inspect or hand-edit
 `/etc/dnsmasq.conf`/`/etc/dhcpcd.conf`, the daemon's own config lives in
 a `# BEGIN pi-bluetooth-configuration eth0 static` / `# END ...`
-delimited block that's rewritten idempotently on every `set_ethernet`/
-`clear_ethernet` -- anything outside that block is left untouched.
+delimited block that's rewritten idempotently on every `set_ethernet`
+call -- anything outside that block is left untouched.
 
 ## GATT service
 
@@ -207,10 +222,11 @@ Custom 128-bit UUIDs (no existing SIG profile fits this):
 | Service | `7b1e0000-6a45-4d1f-9b0a-3c2f8e4d5a10` | -- | -- |
 | SSID | `7b1e0001-6a45-4d1f-9b0a-3c2f8e4d5a10` | write | UTF-8 network name |
 | Password | `7b1e0002-6a45-4d1f-9b0a-3c2f8e4d5a10` | write | UTF-8 passphrase (omit/empty for open networks) |
-| Command | `7b1e0003-6a45-4d1f-9b0a-3c2f8e4d5a10` | write | ASCII: `scan` \| `connect` \| `forget` \| `set_ethernet` \| `clear_ethernet` |
+| Command | `7b1e0003-6a45-4d1f-9b0a-3c2f8e4d5a10` | write | ASCII: `scan` \| `connect` \| `forget` \| `set_ethernet` \| `finish` |
 | Status | `7b1e0004-6a45-4d1f-9b0a-3c2f8e4d5a10` | read + notify | JSON, see below |
 | ScanResults | `7b1e0005-6a45-4d1f-9b0a-3c2f8e4d5a10` | read + notify | JSON array, see below |
-| EthernetIP | `7b1e0006-6a45-4d1f-9b0a-3c2f8e4d5a10` | read + write + notify | ASCII dotted-quad IPv4 address, see "Ethernet direct-connect" (write only takes effect while WiFi isn't configured) |
+| EthernetIP | `7b1e0006-6a45-4d1f-9b0a-3c2f8e4d5a10` | read + write + notify | ASCII `"ip,rangeStart,rangeEnd"`, see "Ethernet direct-connect" (write only takes effect before `finish` runs) |
+| DhcpLeases | `7b1e0007-6a45-4d1f-9b0a-3c2f8e4d5a10` | read + notify | JSON array, see "Ethernet direct-connect" |
 
 No pairing/encryption gates any of these -- see Security model above.
 SSID/Password are still write-only (no read) purely so a second BLE
@@ -226,15 +242,26 @@ writes themselves.
 3. Write the network name to SSID, the passphrase to Password (skip this
    write entirely for an open network), then write `connect` to Command.
 4. Subscribe to Status notifications (or poll by reading it) until
-   `state` is `connected` or `failed`. On success, expect the Pi to
-   reboot (and BLE to disconnect) a few seconds later -- see "One-shot
-   provisioning and reboot behavior" below.
+   `state` is `connected` or `failed`. A successful connect does *not*
+   reboot the Pi by itself.
+5. Optionally customize the local network: write
+   `"<ip>,<rangeStart>,<rangeEnd>"` to EthernetIP, then write
+   `set_ethernet` to Command (see "Ethernet direct-connect").
+6. Write `finish` to Command. This is what actually concludes setup:
+   expect the Pi to reboot (and BLE to disconnect) a few seconds later
+   -- see "One-shot provisioning and reboot behavior" below.
 
 ### Status JSON
 
 ```json
-{"state":"connected","ssid":"MyWifi","ip":"192.168.1.42","error":""}
+{"state":"connected","ssid":"MyWifi","ip":"192.168.1.42","error":"","finished":false}
 ```
+
+`finished` reflects whether `/.successfully-initialized` exists --
+i.e. whether a previous `finish` already completed. A client should use
+this, not just `state`, to decide whether to show the setup wizard or
+the final read-only details screen: a Pi that's mid-wizard (WiFi just
+joined, `finish` not sent yet) also reports `state:"connected"`.
 
 `state` is one of `idle`, `scanning`, `connecting`, `connected`, `failed`.
 
@@ -343,6 +370,9 @@ interface        = wlan0
 
 [ethernet]
 interface        = eth0
+ip               = 192.168.4.1
+dhcp_range_start = 2
+dhcp_range_end   = 200
 
 [scan]
 max_results      = 10

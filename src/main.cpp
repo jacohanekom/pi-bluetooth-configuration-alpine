@@ -11,22 +11,28 @@
  * GATT service (see README for the exact UUIDs):
  *   SSID        (write)          stage a network name
  *   Password    (write)          stage a passphrase (omit for open networks)
- *   EthernetIP  (read + write)   stage/read eth0's static IP (see eth_control.hpp)
- *   Command     (write)          "scan" | "connect" | "forget" | "set_ethernet" | "clear_ethernet"
- *   Status      (read + notify)  {"state":...,"ssid":...,"ip":...,"error":...}
+ *   EthernetIP  (read + write)   stage/read eth0's "ip,rangeStart,rangeEnd" (see eth_control.hpp)
+ *   DhcpLeases  (read + notify)  [{"ip":...,"mac":...,"hostname":...}, ...] currently on eth0
+ *   Command     (write)          "scan" | "connect" | "forget" | "set_ethernet" | "finish"
+ *   Status      (read + notify)  {"state":...,"ssid":...,"ip":...,"error":...,"finished":...}
  *   ScanResults (read + notify)  [{"ssid":...,"rssi":...,"security":...}, ...]
  *
  * eth0 is always a working gateway: its static IP + DHCP server are
  * (re)applied directly at every startup -- independent of dhcpcd and
  * carrier state -- so a Pi is reachable over Ethernet with no app
- * interaction, cable plugged in or not. "set_ethernet"/
- * "clear_ethernet" let it be customized, but only while WiFi isn't
- * configured yet -- once WiFi is connected, this daemon rejects further
- * changes and the app switches to a read-only display instead (see
- * eth_control.hpp and the README's "Ethernet direct-connect" section).
- * Unlike WiFi, applying these doesn't reboot: Ethernet doesn't share the
- * Pi 3's antenna with Bluetooth, so there's no coexistence problem to
- * route around, and the change is visible immediately.
+ * interaction, cable plugged in or not. "set_ethernet" lets it be
+ * customized during the setup wizard -- including the step right after
+ * WiFi connects, before "finish" is sent -- but once "finish" actually
+ * runs (marking the wizard done and rebooting), this daemon rejects
+ * further changes and the app switches to a read-only display instead
+ * (see eth_control.hpp and the README's "Ethernet direct-connect"
+ * section). Unlike WiFi, applying this doesn't reboot: Ethernet doesn't
+ * share the Pi 3's antenna with Bluetooth, so there's no coexistence
+ * problem to route around, and the change is visible immediately.
+ *
+ * "connect" itself no longer reboots on success -- the wizard has one
+ * more optional step (local network configuration) after WiFi joins,
+ * and only "finish" actually marks the device done and reboots it.
  *
  * No pairing/bonding: characteristics are plain read/write, not
  * encrypted. An earlier revision required BLE pairing, but bonding on the
@@ -83,6 +89,7 @@ constexpr const char* COMMAND_UUID  = "7b1e0003-6a45-4d1f-9b0a-3c2f8e4d5a10";
 constexpr const char* STATUS_UUID   = "7b1e0004-6a45-4d1f-9b0a-3c2f8e4d5a10";
 constexpr const char* SCAN_UUID     = "7b1e0005-6a45-4d1f-9b0a-3c2f8e4d5a10";
 constexpr const char* ETH_IP_UUID   = "7b1e0006-6a45-4d1f-9b0a-3c2f8e4d5a10";
+constexpr const char* LEASES_UUID   = "7b1e0007-6a45-4d1f-9b0a-3c2f8e4d5a10";
 constexpr const char* APP_ROOT      = "/org/bluez/pibtconf";
 constexpr const char* MARKER_FILE   = "/.successfully-initialized";
 constexpr int REBOOT_DELAY_SECS     = 3;
@@ -135,12 +142,17 @@ std::string escape_json(const std::string& s) {
     return out;
 }
 
-std::string status_json(const WifiStatus& s) {
+// "finished" reflects whether this device has already completed the
+// one-shot provisioning wizard (MARKER_FILE exists) -- the client uses
+// this, not just wifi state, to decide whether to show the wizard or
+// the final read-only details screen.
+std::string status_json(const WifiStatus& s, bool finished) {
     std::ostringstream o;
     o << "{\"state\":\"" << s.state_name() << "\","
       << "\"ssid\":\"" << escape_json(s.ssid) << "\","
       << "\"ip\":\"" << escape_json(s.ip) << "\","
-      << "\"error\":\"" << escape_json(s.error) << "\"}";
+      << "\"error\":\"" << escape_json(s.error) << "\","
+      << "\"finished\":" << (finished ? "true" : "false") << "}";
     return o.str();
 }
 
@@ -155,6 +167,54 @@ std::string scan_json(const std::vector<ScanResult>& results) {
     }
     o << "]";
     return o.str();
+}
+
+std::string leases_json(const std::vector<ethctl::Lease>& leases) {
+    std::ostringstream o;
+    o << "[";
+    for (size_t i = 0; i < leases.size(); ++i) {
+        if (i) o << ",";
+        std::string hostname = leases[i].hostname == "*" ? "" : leases[i].hostname;
+        o << "{\"ip\":\"" << escape_json(leases[i].ip) << "\","
+          << "\"mac\":\"" << escape_json(leases[i].mac) << "\","
+          << "\"hostname\":\"" << escape_json(hostname) << "\"}";
+    }
+    o << "]";
+    return o.str();
+}
+
+bool marker_exists(const char* path) {
+    std::ifstream f(path);
+    return f.good();
+}
+
+// EthernetIP's wire format is plain CSV, "<ip>,<rangeStart>,<rangeEnd>"
+// (e.g. "192.168.4.1,2,200") both ways -- simple enough not to need a
+// real JSON parser for the write side, and the daemon has no JSON
+// parsing anywhere else either.
+std::string eth_config_csv(const ethctl::EthControl& eth) {
+    auto cfg = eth.get_config();
+    std::string ip = eth.get_ip();
+    if (ip.empty()) ip = cfg.ip;
+    std::ostringstream o;
+    o << ip << "," << cfg.range_start << "," << cfg.range_end;
+    return o.str();
+}
+
+bool parse_eth_csv(const std::string& csv, std::string& ip, int& range_start, int& range_end) {
+    std::stringstream ss(csv);
+    std::string ip_s, start_s, end_s;
+    if (!std::getline(ss, ip_s, ',')) return false;
+    if (!std::getline(ss, start_s, ',')) return false;
+    if (!std::getline(ss, end_s, ',')) return false;
+    try {
+        range_start = std::stoi(start_s);
+        range_end = std::stoi(end_s);
+    } catch (...) {
+        return false;
+    }
+    ip = trim(ip_s);
+    return true;
 }
 
 // The board's hardware serial (from /proc/cpuinfo) rather than a fixed
@@ -210,6 +270,8 @@ int main(int argc, char** argv) {
     const std::string iface      = cfg.get_str("wifi.interface", "wlan0");
     const std::string eth_iface  = cfg.get_str("ethernet.interface", "eth0");
     const std::string eth_default_ip = cfg.get_str("ethernet.ip", "192.168.4.1");
+    const int eth_default_range_start = cfg.get_int("ethernet.dhcp_range_start", 2);
+    const int eth_default_range_end   = cfg.get_int("ethernet.dhcp_range_end", 200);
     const int max_scan_results   = cfg.get_int("scan.max_results", 10);
     const std::string adapter_path = "/org/bluez/" + adapter;
 
@@ -233,13 +295,13 @@ int main(int argc, char** argv) {
     ethctl::EthControl eth(eth_iface);
 
     // eth0 is meant to always be a usable gateway, not something the app
-    // has to configure first -- reapply its static IP (whatever was
-    // last chosen, or the configured default on a fresh install) on
-    // every startup, since `ip addr add` doesn't survive a reboot.
-    std::thread([&eth, eth_default_ip]() {
+    // has to configure first -- reapply its static IP/range (whatever
+    // was last chosen, or the configured defaults on a fresh install)
+    // on every startup, since `ip addr add` doesn't survive a reboot.
+    std::thread([&eth, eth_default_ip, eth_default_range_start, eth_default_range_end]() {
         InflightGuard guard;
         std::string ip_err;
-        if (!eth.ensure_static_ip(eth_default_ip, ip_err)) {
+        if (!eth.ensure_static_ip(eth_default_ip, eth_default_range_start, eth_default_range_end, ip_err)) {
             std::cerr << "[Ethernet] failed to apply gateway IP: " << ip_err << "\n";
         }
     }).detach();
@@ -266,15 +328,20 @@ int main(int argc, char** argv) {
 
     gattsrv::Characteristic* eth_ip_char = server.add_characteristic(
         ETH_IP_UUID, {"read", "write", "notify"},
-        [&]() -> std::vector<uint8_t> { return to_bytes(eth.get_ip()); },
+        [&]() -> std::vector<uint8_t> { return to_bytes(eth_config_csv(eth)); },
         [&](const std::vector<uint8_t>& v) {
             std::lock_guard<std::mutex> lk(staged_mu);
             staged_eth_ip.assign(v.begin(), v.end());
         });
 
+    gattsrv::Characteristic* leases_char = server.add_characteristic(
+        LEASES_UUID, {"read", "notify"},
+        [&]() -> std::vector<uint8_t> { return to_bytes(leases_json(eth.get_leases())); },
+        nullptr);
+
     gattsrv::Characteristic* status_char = server.add_characteristic(
         STATUS_UUID, {"read", "notify"},
-        [&]() -> std::vector<uint8_t> { return to_bytes(status_json(wifi.get_status())); },
+        [&]() -> std::vector<uint8_t> { return to_bytes(status_json(wifi.get_status(), marker_exists(MARKER_FILE))); },
         nullptr);
 
     gattsrv::Characteristic* scan_char = server.add_characteristic(
@@ -296,50 +363,53 @@ int main(int argc, char** argv) {
         server.notify(scan_char, to_bytes(json));
     };
 
-    // A successful connect is the end of this daemon's job, not the start
-    // of an ongoing session: mark success on disk and reboot into the
-    // Pi's normal role rather than staying up to be managed further.
+    // Joining WiFi no longer reboots by itself -- the wizard has one
+    // more step after this (local network configuration), and the whole
+    // thing only concludes, and reboots, once "finish" is sent. See
+    // do_finish below.
     auto do_connect = [&](std::string ssid, std::string psk) {
         wifi.connect(ssid, psk);
-        auto st = wifi.get_status();
-        server.notify(status_char, to_bytes(status_json(st)));
-        if (st.state == WifiStatus::CONNECTED) {
-            std::ofstream(MARKER_FILE).close();
-            reboot_after_delay();
-        }
+        server.notify(status_char, to_bytes(status_json(wifi.get_status(), marker_exists(MARKER_FILE))));
     };
 
     auto do_forget = [&]() {
         wifi.forget();
-        server.notify(status_char, to_bytes(status_json(wifi.get_status())));
+        server.notify(status_char, to_bytes(status_json(wifi.get_status(), false)));
         std::remove(MARKER_FILE);
         reboot_after_delay();
     };
 
-    // Ethernet direct-connect is only reconfigurable while WiFi isn't
-    // set up yet -- once WiFi is connected, eth0's gateway config is
-    // left as-is and the app switches to a read-only display of it.
-    // Applied immediately when allowed, no reboot needed (see file
-    // header comment).
-    auto do_set_ethernet = [&](std::string ip) {
-        if (wifi.get_status().state == WifiStatus::CONNECTED) {
-            std::cerr << "[Ethernet] ignoring set_ethernet: WiFi is already configured\n";
+    // The end of the wizard: only meaningful once WiFi is actually
+    // connected, since finishing before that would reboot into a Pi
+    // that isn't actually configured. Marks success on disk and reboots
+    // into the Pi's normal role rather than staying up to be managed
+    // further.
+    auto do_finish = [&]() {
+        if (wifi.get_status().state != WifiStatus::CONNECTED) {
+            std::cerr << "[Finish] ignoring: WiFi is not connected\n";
+            return;
+        }
+        std::ofstream(MARKER_FILE).close();
+        server.notify(status_char, to_bytes(status_json(wifi.get_status(), true)));
+        reboot_after_delay();
+    };
+
+    // Ethernet direct-connect is only reconfigurable until the wizard
+    // finishes (MARKER_FILE doesn't exist yet) -- that includes the
+    // window right after WiFi connects but before "finish" is sent.
+    // Once finished, eth0's gateway config is left as-is and the app
+    // switches to a read-only display of it. Applied immediately when
+    // allowed, no reboot needed (see file header comment).
+    auto do_set_ethernet = [&](std::string ip, int range_start, int range_end) {
+        if (marker_exists(MARKER_FILE)) {
+            std::cerr << "[Ethernet] ignoring set_ethernet: setup has already finished\n";
             return;
         }
         std::string ip_err;
-        if (!eth.set_static_ip(ip, ip_err)) {
+        if (!eth.set_static_ip(ip, range_start, range_end, ip_err)) {
             std::cerr << "[Ethernet] failed to set static IP " << ip << ": " << ip_err << "\n";
         }
-        server.notify(eth_ip_char, to_bytes(eth.get_ip()));
-    };
-
-    auto do_clear_ethernet = [&]() {
-        if (wifi.get_status().state == WifiStatus::CONNECTED) {
-            std::cerr << "[Ethernet] ignoring clear_ethernet: WiFi is already configured\n";
-            return;
-        }
-        eth.clear_static_ip();
-        server.notify(eth_ip_char, to_bytes(eth.get_ip()));
+        server.notify(eth_ip_char, to_bytes(eth_config_csv(eth)));
     };
 
     server.add_characteristic(COMMAND_UUID, {"write"}, nullptr,
@@ -363,16 +433,25 @@ int main(int argc, char** argv) {
             } else if (cmd == "forget") {
                 do_forget();
 
+            } else if (cmd == "finish") {
+                do_finish();
+
             } else if (cmd == "set_ethernet") {
-                std::string ip;
+                std::string csv;
                 {
                     std::lock_guard<std::mutex> lk(staged_mu);
-                    ip = staged_eth_ip;
+                    csv = staged_eth_ip;
                 }
-                std::thread([&, ip]() { InflightGuard guard; do_set_ethernet(ip); }).detach();
-
-            } else if (cmd == "clear_ethernet") {
-                std::thread([&]() { InflightGuard guard; do_clear_ethernet(); }).detach();
+                std::string ip;
+                int range_start, range_end;
+                if (!parse_eth_csv(csv, ip, range_start, range_end)) {
+                    std::cerr << "[Ethernet] malformed set_ethernet payload: " << csv << "\n";
+                } else {
+                    std::thread([&, ip, range_start, range_end]() {
+                        InflightGuard guard;
+                        do_set_ethernet(ip, range_start, range_end);
+                    }).detach();
+                }
 
             } else {
                 std::cerr << "[Command] unrecognised command: " << cmd << "\n";
@@ -385,6 +464,21 @@ int main(int argc, char** argv) {
         return 1;
     }
     std::cerr << "[BlueZ] advertising as \"" << dev_name << "\", service " << SERVICE_UUID << "\n";
+
+    // Polls dnsmasq's leases file for changes so a connected client's
+    // "allocated IPs" view updates on its own as devices join/leave
+    // eth0, without needing to re-open the app to see it.
+    std::thread([&]() {
+        std::string last;
+        while (g_running) {
+            std::string json = leases_json(eth.get_leases());
+            if (json != last) {
+                last = json;
+                server.notify(leases_char, to_bytes(json));
+            }
+            std::this_thread::sleep_for(std::chrono::seconds(5));
+        }
+    }).detach();
 
     std::signal(SIGINT, on_signal);
     std::signal(SIGTERM, on_signal);
