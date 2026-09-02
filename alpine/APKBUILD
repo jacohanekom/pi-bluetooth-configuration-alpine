@@ -25,6 +25,7 @@ prepare() {
 	cp "$startdir"/../src/eth_control.hpp "$srcdir"/eth_control.hpp
 	cp "$startdir"/../src/gatt_server.hpp "$srcdir"/gatt_server.hpp
 	cp "$startdir"/../src/relay_control.hpp "$srcdir"/relay_control.hpp
+	cp "$startdir"/../src/victron_control.hpp "$srcdir"/victron_control.hpp
 	cp "$startdir"/../src/wifi_control.hpp "$srcdir"/wifi_control.hpp
 	cp "$startdir"/../src/subprocess.hpp "$srcdir"/subprocess.hpp
 	cp "$startdir"/../config.ini "$srcdir"/config.ini

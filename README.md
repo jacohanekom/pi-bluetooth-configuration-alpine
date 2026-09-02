@@ -324,6 +324,58 @@ the BLE service over it. Each TCP round-trip is capped at a 2-second
 timeout, since it's loopback traffic that should be near-instant if the
 other daemon is actually up.
 
+## Victron solar/battery telemetry
+
+Another separate, optional integration, this time with
+[victron-ve-direct-alpine](https://github.com/jacohanekom/victron-ve-direct-alpine),
+which reads a Victron device over its VE.Direct serial protocol. This
+lets the same BLE app that provisions WiFi also show the latest
+solar/battery reading, no separate app or LAN access needed. This
+integration targets MPPT solar chargers specifically -- see "Victron
+JSON" below for the fields it does (and deliberately doesn't) carry.
+
+This daemon doesn't talk VE.Direct itself -- it queries
+victron-ve-direct-alpine's status control port (`echo status | nc
+127.0.0.1 <port>`, the same one its own README documents) and republishes
+the reply as JSON on the `Victron` characteristic, using the same field
+names as that project's own `data_port` telemetry frames (see its
+README's "JSON output") so there's only one schema to learn across both
+projects.
+
+Unlike relay control, this is read-only -- there's no action to gate
+behind setup finishing, just a reading to show or not. `Victron` is live
+from the moment this daemon starts, regardless of wizard state; the app
+simply chooses to display it on the same post-setup screen as
+WiFi/network stats and relays, not because the daemon requires it.
+
+**Setup**: install and configure
+[victron-ve-direct-alpine](https://github.com/jacohanekom/victron-ve-direct-alpine)
+separately (it owns the actual serial connection to the Victron device),
+then point this daemon at its status port under `[victron]` in
+`/etc/pi-bluetooth-configuration/config.ini`:
+
+```ini
+[victron]
+ctrl_port  = 8562
+```
+
+`ctrl_port` must match the `[output] ctrl_port` value in
+victron-ve-direct-alpine's own `config.ini` -- `8562` is that project's
+own default, so the two match out of the box if neither is customized.
+Restart after changes: `rc-service pi-bluetooth-configuration restart`.
+
+**Protocol**: read (or subscribe to notifications on) `Victron` -- see
+"Victron JSON" below. A background thread polls it every 5 seconds and
+notifies on change, so a connected client's Solar/Battery view updates
+on its own.
+
+**Failure handling**: if victron-ve-direct-alpine isn't running, isn't
+installed, the configured port doesn't match its config, or it's up but
+hasn't synced a frame from the VE.Direct device yet, `Victron` just
+reports `{"connected":false}` -- it never blocks or crashes the BLE
+service over it. Each TCP round-trip is capped at a 2-second timeout,
+same as relay control.
+
 ## GATT service
 
 Custom 128-bit UUIDs (no existing SIG profile fits this):
@@ -339,6 +391,7 @@ Custom 128-bit UUIDs (no existing SIG profile fits this):
 | EthernetIP | `7b1e0006-6a45-4d1f-9b0a-3c2f8e4d5a10` | read + write + notify | ASCII `"ip,rangeStart,rangeEnd"`, see "Ethernet direct-connect" (write only takes effect before `finish` runs) |
 | DhcpLeases | `7b1e0007-6a45-4d1f-9b0a-3c2f8e4d5a10` | read + notify | JSON array, see "Ethernet direct-connect" |
 | Relays | `7b1e0008-6a45-4d1f-9b0a-3c2f8e4d5a10` | read + notify | JSON array, see "Relay control" (reports `[]` until `finish` has run) |
+| Victron | `7b1e0009-6a45-4d1f-9b0a-3c2f8e4d5a10` | read + notify | JSON, see "Victron solar/battery telemetry" (live regardless of `finish`) |
 
 No pairing/encryption gates any of these -- see Security model above.
 SSID/Password are still write-only (no read) purely so a second BLE
@@ -414,6 +467,37 @@ isn't reachable on that port -- not installed, not running, or a
 port/config mismatch between the two daemons). This is an empty array
 (`[]`) until setup has actually finished, regardless of how many relays
 are configured -- see "Relay control" above.
+
+### Victron JSON
+
+```json
+{
+  "connected": true,
+  "device": {"pid": "0xA067", "name": "SmartSolar MPPT 100|50", "serial": "HQ2241A3JKL", "fw": "161"},
+  "V": 12.540,
+  "I": 0.150,
+  "VPV": 18.200,
+  "PPV": 4,
+  "CS": 5,
+  "CS_name": "Float",
+  "ERR": 0,
+  "ERR_name": "No error",
+  "H20": 0.12
+}
+```
+
+`connected: false` (with every other key absent) covers every failure
+case -- victron-ve-direct-alpine not installed, not running, a
+port/config mismatch, or up but hasn't synced a VE.Direct frame yet --
+see "Victron solar/battery telemetry" above. Field names and units match
+victron-ve-direct-alpine's own `data_port` JSON exactly -- see that
+project's README, "JSON output" -- with two deliberate omissions:
+`SOC`/`TTG` (state of charge, time to go), which only exist for battery
+monitors (BMV-series), and `LOAD` (the charger's load output switch
+state), which isn't present on every MPPT model and is always `"ON"` on
+this integration's hardware -- neither is modeled here at all since
+there's nothing informative in either for this integration's target
+hardware.
 
 ### A note on message size
 
@@ -513,10 +597,14 @@ max_results      = 10
 [relays]
 ; relay 7778 Camera Light
 ; relay 7779 Fan
+
+[victron]
+ctrl_port  = 8562
 ```
 
-`[relays]` is optional -- see "Relay control" above for the format and
-what it integrates with.
+`[relays]` and `[victron]` are both optional -- see "Relay control" and
+"Victron solar/battery telemetry" above for the formats and what they
+integrate with.
 
 `device_name` is only a fallback. The advertised BLE name is normally
 the board's own hardware serial number (read from `/proc/cpuinfo` at

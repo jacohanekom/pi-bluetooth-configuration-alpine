@@ -17,6 +17,7 @@
  *   Status      (read + notify)  {"state":...,"ssid":...,"ip":...,"error":...,"finished":...}
  *   ScanResults (read + notify)  [{"ssid":...,"rssi":...,"security":...}, ...]
  *   Relays      (read + notify)  [{"port":...,"label":...,"state":...}, ...] -- see relay_control.hpp
+ *   Victron     (read + notify)  {"connected":...,"device":{...},"V":...,...} -- see victron_control.hpp
  *
  * eth0 is always a working gateway: its static IP + DHCP server are
  * (re)applied directly at every startup -- independent of dhcpcd and
@@ -55,6 +56,15 @@
  * relay_control.hpp and the README's "Relay control" section for the
  * "[relays]" config format that maps ports to display labels.
  *
+ * Victron solar/battery telemetry is a similar optional integration,
+ * this time with victron-ve-direct-alpine: queries its status control
+ * port for the latest reading and republishes it as JSON on the Victron
+ * characteristic. Unlike relay control this is read-only (nothing to
+ * gate against acting on an unprovisioned Pi) and isn't tied to
+ * MARKER_FILE at all -- it's always live, the app just chooses to show
+ * it on the same post-setup screen as WiFi/network stats and relays.
+ * See victron_control.hpp.
+ *
  * Advertised as the board's hardware serial (from /proc/cpuinfo), not a
  * fixed name, so a client's device list distinguishes between multiple
  * aipicam units instead of showing the same string for all of them.
@@ -92,6 +102,7 @@
 #include "eth_control.hpp"
 #include "gatt_server.hpp"
 #include "relay_control.hpp"
+#include "victron_control.hpp"
 #include "wifi_control.hpp"
 
 namespace {
@@ -105,6 +116,7 @@ constexpr const char* SCAN_UUID     = "7b1e0005-6a45-4d1f-9b0a-3c2f8e4d5a10";
 constexpr const char* ETH_IP_UUID   = "7b1e0006-6a45-4d1f-9b0a-3c2f8e4d5a10";
 constexpr const char* LEASES_UUID   = "7b1e0007-6a45-4d1f-9b0a-3c2f8e4d5a10";
 constexpr const char* RELAYS_UUID   = "7b1e0008-6a45-4d1f-9b0a-3c2f8e4d5a10";
+constexpr const char* VICTRON_UUID  = "7b1e0009-6a45-4d1f-9b0a-3c2f8e4d5a10";
 constexpr const char* APP_ROOT      = "/org/bluez/pibtconf";
 constexpr const char* MARKER_FILE   = "/.successfully-initialized";
 constexpr int REBOOT_DELAY_SECS     = 3;
@@ -216,6 +228,36 @@ std::string relays_json(const std::vector<relayctl::RelayConfig>& relays) {
     return o.str();
 }
 
+// Shapes a fresh query of victron-ve-direct-alpine's status port into
+// JSON, using the same field names as that project's own data_port
+// telemetry frames (see its README) so a client only needs to learn one
+// schema for this data. "connected":false (with nothing else present)
+// covers every failure case -- not installed, not running, or up but
+// hasn't synced a VE.Direct frame yet -- since a client only ever needs
+// to know "is there anything to show".
+std::string victron_json(const victronctl::VictronStatus& s) {
+    std::ostringstream o;
+    o << "{\"connected\":" << (s.connected ? "true" : "false");
+    if (s.connected) {
+        o << ",\"device\":{"
+          << "\"pid\":\"" << escape_json(s.pid) << "\","
+          << "\"name\":\"" << escape_json(s.device_name) << "\","
+          << "\"serial\":\"" << escape_json(s.serial) << "\","
+          << "\"fw\":\"" << escape_json(s.fw) << "\"},"
+          << "\"V\":" << s.V << ","
+          << "\"I\":" << s.I << ","
+          << "\"VPV\":" << s.VPV << ","
+          << "\"PPV\":" << s.PPV << ","
+          << "\"CS\":" << s.CS << ","
+          << "\"CS_name\":\"" << escape_json(s.CS_name) << "\","
+          << "\"ERR\":" << s.ERR << ","
+          << "\"ERR_name\":\"" << escape_json(s.ERR_name) << "\","
+          << "\"H20\":" << s.H20;
+    }
+    o << "}";
+    return o.str();
+}
+
 bool marker_exists(const char* path) {
     std::ifstream f(path);
     return f.good();
@@ -307,13 +349,15 @@ int main(int argc, char** argv) {
     const int eth_default_range_end   = cfg.get_int("ethernet.dhcp_range_end", 200);
     const int max_scan_results   = cfg.get_int("scan.max_results", 10);
     const auto relays = relayctl::load_relays(cfg_path);
+    const int victron_ctrl_port = cfg.get_int("victron.ctrl_port", 8562);
     const std::string adapter_path = "/org/bluez/" + adapter;
 
     std::cerr << "[Config] adapter  : " << adapter_path << "\n"
               << "[Config] device   : " << dev_name << (serial.empty() ? " (configured)" : " (hardware serial)") << "\n"
               << "[Config] wifi if  : " << iface << "\n"
               << "[Config] eth if   : " << eth_iface << "\n"
-              << "[Config] relays   : " << relays.size() << " configured\n";
+              << "[Config] relays   : " << relays.size() << " configured\n"
+              << "[Config] victron  : ctrl_port " << victron_ctrl_port << "\n";
 
     dbus_threads_init_default();
 
@@ -397,6 +441,17 @@ int main(int argc, char** argv) {
     gattsrv::Characteristic* relays_char = server.add_characteristic(
         RELAYS_UUID, {"read", "notify"},
         [&]() -> std::vector<uint8_t> { return to_bytes(current_relays_json()); },
+        nullptr);
+
+    // Unlike Relays, Victron telemetry is read-only and isn't gated by
+    // MARKER_FILE -- there's no action to hold back before setup
+    // finishes, just a reading to report (or not, if nothing's
+    // reachable yet). The app chooses to surface it on the same
+    // post-setup screen as WiFi/network stats and relays; this
+    // characteristic itself is live from the moment BLE comes up.
+    gattsrv::Characteristic* victron_char = server.add_characteristic(
+        VICTRON_UUID, {"read", "notify"},
+        [&]() -> std::vector<uint8_t> { return to_bytes(victron_json(victronctl::query_status(victron_ctrl_port))); },
         nullptr);
 
     gattsrv::Characteristic* status_char = server.add_characteristic(
@@ -600,6 +655,25 @@ int main(int argc, char** argv) {
             }
         }).detach();
     }
+
+    // Polls victron-ve-direct-alpine's status port for the latest
+    // telemetry frame so a connected client's Solar/Battery view
+    // updates on its own -- same pattern as the leases/relays polling
+    // above. Harmless when victron-ve-direct-alpine isn't installed:
+    // each attempt just fails to connect (see victron_control.hpp),
+    // which only ever notifies once (the initial "connected":false),
+    // not repeatedly, since this only notifies on change.
+    std::thread([&]() {
+        std::string last;
+        while (g_running) {
+            std::string json = victron_json(victronctl::query_status(victron_ctrl_port));
+            if (json != last) {
+                last = json;
+                server.notify(victron_char, to_bytes(json));
+            }
+            std::this_thread::sleep_for(std::chrono::seconds(5));
+        }
+    }).detach();
 
     std::signal(SIGINT, on_signal);
     std::signal(SIGTERM, on_signal);
