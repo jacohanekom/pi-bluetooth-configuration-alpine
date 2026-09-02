@@ -145,11 +145,11 @@ that's expected, not a crash.
 to configure before it's useful: on every boot, the daemon assigns it a
 static IP directly (`ip addr add`) -- whatever was last chosen, or a
 default of `192.168.4.1` (overridable via `ethernet.ip` in
-`config.ini`) if nothing has been chosen yet -- and starts a DHCP
-server (`dnsmasq`) scoped strictly to `eth0`, so a laptop plugged
-directly into the Pi's ethernet port gets an address automatically, no
-router, no manual IP configuration on the other end, no app interaction
-required.
+`config.ini`) if nothing has been chosen yet -- and starts a combined
+DHCP+DNS server (`dnsmasq`) scoped strictly to `eth0`, so a laptop
+plugged directly into the Pi's ethernet port gets an address *and
+working DNS* automatically, no router, no manual configuration on the
+other end, no app interaction required.
 
 The address is assigned directly rather than through dhcpcd's own
 static-IP config, and deliberately so: dhcpcd only applies its config
@@ -203,15 +203,25 @@ which devices are actually plugged into `eth0` right now. A background
 thread polls that file every 5 seconds and only notifies when it
 actually changes.
 
+**DNS**: `dnsmasq` also answers DNS queries from `eth0` clients (not
+just DHCP), forwarding them upstream using whatever nameservers are in
+`/etc/resolv.conf` -- normally whatever WiFi's own DHCP handed
+`dhcpcd`. The DHCP lease explicitly points clients at this Pi
+(`dhcp-option=option:dns-server,<gateway ip>`) for DNS. Without this, a
+device on `eth0` gets an address and (via "Internet sharing" below) a
+route to the internet, but domain names don't resolve -- exactly the
+symptom this fixes.
+
 **Safety**: `dnsmasq` is configured with `interface=eth0` and
-`bind-interfaces` specifically so it only ever answers DHCP requests on
-`eth0` -- it must never be allowed to also serve WiFi/upstream LAN
-traffic, which would hand out conflicting addresses on a network this
-daemon doesn't own. If you inspect or hand-edit
-`/etc/dnsmasq.conf`/`/etc/dhcpcd.conf`, the daemon's own config lives in
-a `# BEGIN pi-bluetooth-configuration eth0 static` / `# END ...`
-delimited block that's rewritten idempotently on every `set_ethernet`
-call -- anything outside that block is left untouched.
+`bind-interfaces` specifically so it only ever answers DHCP *and DNS*
+requests on `eth0` -- it must never be allowed to also serve WiFi/
+upstream LAN traffic, which would hand out conflicting addresses (DHCP)
+or expose an open resolver (DNS) on a network this daemon doesn't own.
+If you inspect or hand-edit `/etc/dnsmasq.conf`/`/etc/dhcpcd.conf`, the
+daemon's own config lives in a `# BEGIN pi-bluetooth-configuration eth0
+static` / `# END ...` delimited block that's rewritten idempotently on
+every `set_ethernet` call -- anything outside that block is left
+untouched.
 
 **Internet sharing**: a device plugged into `eth0` gets real internet
 access, not just a link to the Pi -- the daemon enables IPv4 forwarding

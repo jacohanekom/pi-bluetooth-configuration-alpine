@@ -1,10 +1,11 @@
 #pragma once
 /**
- * eth_control.hpp -- gives eth0 a fixed static IP and runs a DHCP server
- * (dnsmasq) scoped strictly to eth0, so a laptop plugged directly into
- * the Pi's ethernet port gets an address automatically with no router
- * in the loop -- a direct-connect path for local access/config that's
- * independent of whatever the Pi's WiFi is doing.
+ * eth_control.hpp -- gives eth0 a fixed static IP and runs a DHCP+DNS
+ * server (dnsmasq) scoped strictly to eth0, so a laptop plugged directly
+ * into the Pi's ethernet port gets an address (and working DNS)
+ * automatically with no router in the loop -- a direct-connect path for
+ * local access/config that's independent of whatever the Pi's WiFi is
+ * doing.
  *
  * eth0 is meant to always be a working gateway: main.cpp reapplies the
  * static IP here on every startup, so a fresh (or just-rebooted) Pi is
@@ -35,9 +36,14 @@
  * disturbing whatever else is already in that file.
  *
  * Safety note: dnsmasq is configured with `interface=`/`bind-interfaces`
- * specifically so it only ever answers DHCP requests on eth0 -- getting
- * this wrong and having it serve the LAN/WiFi side too would hand out
- * conflicting addresses on a network this daemon doesn't own.
+ * specifically so it only ever answers DHCP *and DNS* requests on eth0
+ * -- getting this wrong and having it serve the LAN/WiFi side too would
+ * hand out conflicting addresses (DHCP) or expose an open resolver
+ * (DNS) on a network this daemon doesn't own. DNS queries from eth0
+ * clients are forwarded upstream using whatever nameservers are in
+ * /etc/resolv.conf -- normally whatever WiFi's own DHCP handed dhcpcd --
+ * so eth0 clients get the same DNS resolution WiFi clients on this
+ * Pi's own upstream network would.
  *
  * enable_internet_sharing() NATs eth0's traffic out through the WiFi
  * interface (which is what actually has the internet connection), so a
@@ -222,14 +228,27 @@ public:
         }
         run_command({"ip", "link", "set", iface_, "up"});
 
+        // dnsmasq also answers DNS queries from eth0 clients here (no
+        // "port=0"), forwarding them upstream using whatever nameservers
+        // are in /etc/resolv.conf -- normally whatever WiFi's own DHCP
+        // handed dhcpcd. Without this, eth0 clients get an address and a
+        // route to the internet (see "Internet sharing") but no working
+        // DNS: dnsmasq with DNS disabled either hands out no DNS server
+        // at all, or (if one were hardcoded) points clients at something
+        // not actually listening on port 53. "bind-interfaces" +
+        // "interface=eth0" below keeps this DNS service scoped to eth0
+        // only, same as the DHCP side -- see the Safety note above.
+        // dhcp-option 6 is set explicitly (rather than relying on
+        // dnsmasq's own auto-fill) so the DHCP lease unambiguously points
+        // clients at this address for DNS.
         std::ostringstream dnsmasq_block;
         dnsmasq_block << "interface=" << iface_ << "\n"
                        << "bind-interfaces\n"
                        << "dhcp-authoritative\n"
-                       << "port=0\n" // DHCP only -- no DNS service
                        << "dhcp-leasefile=" << LEASES_FILE << "\n"
                        << "dhcp-range=" << prefix << "." << range_start << ","
-                       << prefix << "." << range_end << ",255.255.255.0,12h\n";
+                       << prefix << "." << range_end << ",255.255.255.0,12h\n"
+                       << "dhcp-option=option:dns-server," << ip << "\n";
         replace_marker_block(DNSMASQ_CONF, dnsmasq_block.str());
 
         run_command({"rc-update", "add", "dnsmasq", "default"});
