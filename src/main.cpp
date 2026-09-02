@@ -13,9 +13,10 @@
  *   Password    (write)          stage a passphrase (omit for open networks)
  *   EthernetIP  (read + write)   stage/read eth0's "ip,rangeStart,rangeEnd" (see eth_control.hpp)
  *   DhcpLeases  (read + notify)  [{"ip":...,"mac":...,"hostname":...}, ...] currently on eth0
- *   Command     (write)          "scan" | "connect" | "forget" | "set_ethernet" | "finish"
+ *   Command     (write)          "scan" | "connect" | "forget" | "set_ethernet" | "finish" | "relay <port> on|off"
  *   Status      (read + notify)  {"state":...,"ssid":...,"ip":...,"error":...,"finished":...}
  *   ScanResults (read + notify)  [{"ssid":...,"rssi":...,"security":...}, ...]
+ *   Relays      (read + notify)  [{"port":...,"label":...,"state":...}, ...] -- see relay_control.hpp
  *
  * eth0 is always a working gateway: its static IP + DHCP server are
  * (re)applied directly at every startup -- independent of dhcpcd and
@@ -41,6 +42,18 @@
  * it wasn't worth what it protected against -- see the README's Security
  * model section. This means WiFi credentials cross BLE in the clear;
  * treat this as suitable for a trusted home/lab network, not a public one.
+ *
+ * Relay control is a separate, optional integration with
+ * pi-relay-control-alpine: this daemon doesn't drive GPIO itself, it just
+ * forwards "relay <port> on|off" (from Command) to whichever relay is
+ * listening on that TCP port on 127.0.0.1, and reports live state back
+ * on the Relays characteristic. It's no part of the setup wizard --
+ * relay commands are rejected and Relays reports an empty list until
+ * MARKER_FILE exists, i.e. only once setup has actually finished, the
+ * same point at which the app switches to showing WiFi/network stats
+ * (relay controls belong on that same screen, not the wizard). See
+ * relay_control.hpp and the README's "Relay control" section for the
+ * "[relays]" config format that maps ports to display labels.
  *
  * Advertised as the board's hardware serial (from /proc/cpuinfo), not a
  * fixed name, so a client's device list distinguishes between multiple
@@ -78,6 +91,7 @@
 #include "config.hpp"
 #include "eth_control.hpp"
 #include "gatt_server.hpp"
+#include "relay_control.hpp"
 #include "wifi_control.hpp"
 
 namespace {
@@ -90,6 +104,7 @@ constexpr const char* STATUS_UUID   = "7b1e0004-6a45-4d1f-9b0a-3c2f8e4d5a10";
 constexpr const char* SCAN_UUID     = "7b1e0005-6a45-4d1f-9b0a-3c2f8e4d5a10";
 constexpr const char* ETH_IP_UUID   = "7b1e0006-6a45-4d1f-9b0a-3c2f8e4d5a10";
 constexpr const char* LEASES_UUID   = "7b1e0007-6a45-4d1f-9b0a-3c2f8e4d5a10";
+constexpr const char* RELAYS_UUID   = "7b1e0008-6a45-4d1f-9b0a-3c2f8e4d5a10";
 constexpr const char* APP_ROOT      = "/org/bluez/pibtconf";
 constexpr const char* MARKER_FILE   = "/.successfully-initialized";
 constexpr int REBOOT_DELAY_SECS     = 3;
@@ -178,6 +193,24 @@ std::string leases_json(const std::vector<ethctl::Lease>& leases) {
         o << "{\"ip\":\"" << escape_json(leases[i].ip) << "\","
           << "\"mac\":\"" << escape_json(leases[i].mac) << "\","
           << "\"hostname\":\"" << escape_json(hostname) << "\"}";
+    }
+    o << "]";
+    return o.str();
+}
+
+// Queries each configured relay's live state (via relay_control.hpp,
+// one TCP round-trip per relay to pi-relay-control-alpine) every time
+// this is called -- simple, and there are only ever a handful of
+// relays, so this is cheap enough to run both on-demand (a GATT read)
+// and on the poll/notify thread below.
+std::string relays_json(const std::vector<relayctl::RelayConfig>& relays) {
+    std::ostringstream o;
+    o << "[";
+    for (size_t i = 0; i < relays.size(); ++i) {
+        if (i) o << ",";
+        o << "{\"port\":" << relays[i].port << ","
+          << "\"label\":\"" << escape_json(relays[i].label) << "\","
+          << "\"state\":\"" << relayctl::query_state(relays[i].port) << "\"}";
     }
     o << "]";
     return o.str();
@@ -273,12 +306,14 @@ int main(int argc, char** argv) {
     const int eth_default_range_start = cfg.get_int("ethernet.dhcp_range_start", 2);
     const int eth_default_range_end   = cfg.get_int("ethernet.dhcp_range_end", 200);
     const int max_scan_results   = cfg.get_int("scan.max_results", 10);
+    const auto relays = relayctl::load_relays(cfg_path);
     const std::string adapter_path = "/org/bluez/" + adapter;
 
     std::cerr << "[Config] adapter  : " << adapter_path << "\n"
               << "[Config] device   : " << dev_name << (serial.empty() ? " (configured)" : " (hardware serial)") << "\n"
               << "[Config] wifi if  : " << iface << "\n"
-              << "[Config] eth if   : " << eth_iface << "\n";
+              << "[Config] eth if   : " << eth_iface << "\n"
+              << "[Config] relays   : " << relays.size() << " configured\n";
 
     dbus_threads_init_default();
 
@@ -298,11 +333,19 @@ int main(int argc, char** argv) {
     // has to configure first -- reapply its static IP/range (whatever
     // was last chosen, or the configured defaults on a fresh install)
     // on every startup, since `ip addr add` doesn't survive a reboot.
-    std::thread([&eth, eth_default_ip, eth_default_range_start, eth_default_range_end]() {
+    // Once that's in place, NAT eth0's traffic out through WiFi (see
+    // eth_control.hpp's enable_internet_sharing) so a device plugged
+    // into eth0 gets real internet access, not just a link to the Pi
+    // itself -- WiFi is what actually has the internet connection here.
+    std::thread([&eth, eth_default_ip, eth_default_range_start, eth_default_range_end, eth_iface, iface]() {
         InflightGuard guard;
         std::string ip_err;
         if (!eth.ensure_static_ip(eth_default_ip, eth_default_range_start, eth_default_range_end, ip_err)) {
             std::cerr << "[Ethernet] failed to apply gateway IP: " << ip_err << "\n";
+        }
+        std::string nat_err;
+        if (!ethctl::enable_internet_sharing(eth_iface, iface, nat_err)) {
+            std::cerr << "[Ethernet] failed to enable internet sharing (" << eth_iface << " -> " << iface << "): " << nat_err << "\n";
         }
     }).detach();
 
@@ -337,6 +380,23 @@ int main(int argc, char** argv) {
     gattsrv::Characteristic* leases_char = server.add_characteristic(
         LEASES_UUID, {"read", "notify"},
         [&]() -> std::vector<uint8_t> { return to_bytes(leases_json(eth.get_leases())); },
+        nullptr);
+
+    // Relays are no part of the setup wizard -- they only ever report
+    // real state once the Pi has actually finished setup (MARKER_FILE
+    // exists), the same point at which the app's details screen starts
+    // showing WiFi/network stats and, alongside them, relay controls.
+    // Before that, this reports an empty list rather than querying
+    // pi-relay-control-alpine at all -- that daemon's own start_pre()
+    // gate (see its README, "Requires device provisioning") means
+    // there's nothing listening on those ports yet anyway.
+    auto current_relays_json = [&]() -> std::string {
+        return marker_exists(MARKER_FILE) ? relays_json(relays) : "[]";
+    };
+
+    gattsrv::Characteristic* relays_char = server.add_characteristic(
+        RELAYS_UUID, {"read", "notify"},
+        [&]() -> std::vector<uint8_t> { return to_bytes(current_relays_json()); },
         nullptr);
 
     gattsrv::Characteristic* status_char = server.add_characteristic(
@@ -412,6 +472,34 @@ int main(int argc, char** argv) {
         server.notify(eth_ip_char, to_bytes(eth_config_csv(eth)));
     };
 
+    // Relays are no part of the setup wizard -- they're only meaningful
+    // once the Pi is actually set up, at which point the app's details
+    // screen (the same one showing WiFi/network stats) offers them
+    // alongside it. Refusing here isn't just UI-side politeness: this
+    // mirrors pi-relay-control-alpine's own start_pre() gate, which
+    // refuses to run at all until MARKER_FILE exists (see that repo's
+    // README, "Requires device provisioning") -- before that point,
+    // there's no relay daemon on the other end of the socket to command
+    // in the first place.
+    //
+    // Forwards "relay <port> on|off" to whichever relay
+    // pi-relay-control-alpine has listening on that TCP port (see
+    // relay_control.hpp) and pushes the refreshed Relays state back to
+    // the client either way -- including on failure (state comes back
+    // "unknown"), so the UI reflects reality rather than optimistically
+    // assuming the write worked.
+    auto do_relay = [&](int port, const std::string& action) {
+        if (!marker_exists(MARKER_FILE)) {
+            std::cerr << "[Relay] ignoring relay command: setup has not finished yet\n";
+            return;
+        }
+        std::string err;
+        std::string resp = relayctl::send_command(port, action, err);
+        if (!err.empty()) std::cerr << "[Relay] " << err << "\n";
+        else std::cerr << "[Relay] port " << port << " " << action << " -> " << resp << "\n";
+        server.notify(relays_char, to_bytes(current_relays_json()));
+    };
+
     server.add_characteristic(COMMAND_UUID, {"write"}, nullptr,
         [&](const std::vector<uint8_t>& v) {
             std::string cmd = trim(std::string(v.begin(), v.end()));
@@ -453,6 +541,16 @@ int main(int argc, char** argv) {
                     }).detach();
                 }
 
+            } else if (cmd.rfind("relay ", 0) == 0) {
+                std::istringstream iss(cmd.substr(6));
+                int port = 0;
+                std::string action;
+                if (!(iss >> port >> action) || (action != "on" && action != "off")) {
+                    std::cerr << "[Relay] malformed command, expected: relay <port> on|off (" << cmd << ")\n";
+                } else {
+                    std::thread([&, port, action]() { InflightGuard guard; do_relay(port, action); }).detach();
+                }
+
             } else {
                 std::cerr << "[Command] unrecognised command: " << cmd << "\n";
             }
@@ -479,6 +577,29 @@ int main(int argc, char** argv) {
             std::this_thread::sleep_for(std::chrono::seconds(5));
         }
     }).detach();
+
+    // Polls each configured relay's live state so a connected client
+    // sees changes made from elsewhere (another client, always_on
+    // resuming after pi-relay-control-alpine restarts, etc.) without
+    // having to trigger a write itself first. Skipped entirely when no
+    // relays are configured, since current_relays_json() would never
+    // change either way. Before setup finishes, current_relays_json()
+    // reports "[]" without touching the network -- see relays_char above
+    // -- so this doesn't start hammering pi-relay-control-alpine (which
+    // isn't even running yet) until there's an actual reason to.
+    if (!relays.empty()) {
+        std::thread([&]() {
+            std::string last;
+            while (g_running) {
+                std::string json = current_relays_json();
+                if (json != last) {
+                    last = json;
+                    server.notify(relays_char, to_bytes(json));
+                }
+                std::this_thread::sleep_for(std::chrono::seconds(5));
+            }
+        }).detach();
+    }
 
     std::signal(SIGINT, on_signal);
     std::signal(SIGTERM, on_signal);

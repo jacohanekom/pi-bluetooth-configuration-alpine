@@ -7,7 +7,7 @@ SRCDIR    = src
 
 all: $(TARGET)
 
-$(TARGET): $(SRCDIR)/main.cpp $(SRCDIR)/config.hpp $(SRCDIR)/eth_control.hpp $(SRCDIR)/gatt_server.hpp $(SRCDIR)/wifi_control.hpp $(SRCDIR)/subprocess.hpp
+$(TARGET): $(SRCDIR)/main.cpp $(SRCDIR)/config.hpp $(SRCDIR)/eth_control.hpp $(SRCDIR)/gatt_server.hpp $(SRCDIR)/relay_control.hpp $(SRCDIR)/wifi_control.hpp $(SRCDIR)/subprocess.hpp
 	$(CXX) $(CXXFLAGS) -o $(TARGET) $(SRCDIR)/main.cpp $(LDFLAGS)
 
 install: all

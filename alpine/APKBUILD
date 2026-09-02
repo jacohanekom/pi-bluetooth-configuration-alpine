@@ -7,7 +7,7 @@ url="https://github.com/jacohanekom/pi-bluetooth-configuration-alpine"
 arch="aarch64"
 license="custom"
 makedepends="dbus-dev openssl-dev pkgconf"
-depends="dbus-libs dbus-openrc libcrypto3 bluez bluez-openrc wpa_supplicant wpa_supplicant-openrc dhcpcd dhcpcd-openrc iproute2 dnsmasq dnsmasq-openrc"
+depends="dbus-libs dbus-openrc libcrypto3 bluez bluez-openrc wpa_supplicant wpa_supplicant-openrc dhcpcd dhcpcd-openrc iproute2 dnsmasq dnsmasq-openrc iptables"
 options="!check"
 
 source=""
@@ -24,6 +24,7 @@ prepare() {
 	cp "$startdir"/../src/config.hpp "$srcdir"/config.hpp
 	cp "$startdir"/../src/eth_control.hpp "$srcdir"/eth_control.hpp
 	cp "$startdir"/../src/gatt_server.hpp "$srcdir"/gatt_server.hpp
+	cp "$startdir"/../src/relay_control.hpp "$srcdir"/relay_control.hpp
 	cp "$startdir"/../src/wifi_control.hpp "$srcdir"/wifi_control.hpp
 	cp "$startdir"/../src/subprocess.hpp "$srcdir"/subprocess.hpp
 	cp "$startdir"/../config.ini "$srcdir"/config.ini

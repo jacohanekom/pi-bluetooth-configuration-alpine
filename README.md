@@ -213,6 +213,107 @@ a `# BEGIN pi-bluetooth-configuration eth0 static` / `# END ...`
 delimited block that's rewritten idempotently on every `set_ethernet`
 call -- anything outside that block is left untouched.
 
+**Internet sharing**: a device plugged into `eth0` gets real internet
+access, not just a link to the Pi -- the daemon enables IPv4 forwarding
+and NATs (`iptables`/`MASQUERADE`) `eth0`'s traffic out through the WiFi
+interface, which is what actually holds the internet connection here.
+Applied once at startup, right after `eth0`'s static IP -- see
+"Internet sharing (eth0 -> WiFi)" below for details.
+
+## Internet sharing (eth0 -> WiFi)
+
+`eth0` is a dead-end network of its own (see "Ethernet direct-connect"
+above) unless something routes its traffic somewhere with actual
+internet access -- which, on this Pi, is WiFi. At startup, right after
+applying `eth0`'s static IP, the daemon:
+
+1. Enables `net.ipv4.ip_forward` (both live, via `/proc/sys/...`, and
+   persisted for the next boot via a drop-in in `/etc/sysctl.d/`).
+2. Adds `iptables` rules NATing traffic from `eth0` out through the WiFi
+   interface (`iptables -t nat -A POSTROUTING -o <wifi_iface> -j
+   MASQUERADE`) plus the matching `FORWARD` rules to actually let that
+   traffic across between the two interfaces.
+
+This isn't gated by WiFi's own connection state or the setup wizard --
+the rules reference the WiFi interface by name and are harmless to have
+in place even before it's associated to anything; they simply have
+nothing to NAT through until it is. Idempotent: each rule is checked
+(`iptables -C`) before being added, so restarting the daemon (or
+rebooting) doesn't pile up duplicate rules.
+
+**Requires the `iptables` package** (a runtime dependency of the `.apk`
+-- see below; install it yourself if building from source or the
+tarball) **and a kernel with netfilter NAT support** (`iptable_nat`,
+`nf_nat`, `nf_conntrack` -- built into Alpine's `linux-rpi` kernel).
+
+**Known limitation**: there's no way to disable this short of editing
+`eth_control.hpp` (`enable_internet_sharing`) -- like the rest of
+`eth0`'s "always a working gateway" behavior, it's unconditional. If you
+don't want `eth0` devices reaching the internet through this Pi, don't
+plug anything into it, or remove the resulting `iptables` rules
+yourself.
+
+## Relay control
+
+A separate, optional integration with
+[pi-relay-control-alpine](https://github.com/jacohanekom/pi-relay-control-alpine),
+letting the same BLE app that provisions WiFi also flip relays on the
+Pi -- no separate BLE service or app needed for something as simple as
+turning a light or a fan on and off.
+
+This daemon doesn't drive GPIO itself and has no idea what's wired to
+which pin -- it's a thin TCP client that forwards `on`/`off`/`status` to
+whichever port pi-relay-control-alpine has that relay listening on
+(`127.0.0.1:<port>`, the same protocol `nc` uses -- see that repo's
+README), and reports the result back over BLE.
+
+Relay control is no part of the provisioning wizard -- it only works
+once setup has actually finished (`finish` has run and
+`/.successfully-initialized` exists). Before that, `relay <port> on|off`
+is rejected (logged, no-op) and `Relays` reports an empty list, without
+even querying pi-relay-control-alpine: that daemon's own `start_pre()`
+gate (see its README, "Requires device provisioning") means nothing is
+listening on those ports yet anyway. This mirrors where the client app
+surfaces the feature too -- alongside WiFi/network stats on the
+post-setup details screen, not as a step in the wizard.
+
+**Setup**: install and configure
+[pi-relay-control-alpine](https://github.com/jacohanekom/pi-relay-control-alpine)
+separately (it owns the actual GPIO pins and TCP ports), then list the
+same ports here under `[relays]` in `/etc/pi-bluetooth-configuration/config.ini`,
+one line per relay:
+
+```ini
+[relays]
+relay 7778 Camera Light
+relay 7779 Fan
+```
+
+`<port>` must match a `relay <gpio_pin> <port> [...]` line in
+pi-relay-control-alpine's own `/etc/pi-relay-control.conf` -- this file
+only needs the port and a free-text display label, since GPIO wiring is
+that other daemon's concern, not this one's. Restart after changes:
+`rc-service pi-bluetooth-configuration restart`. Leave `[relays]` empty
+(or omit it) if pi-relay-control-alpine isn't installed -- the `Relays`
+characteristic then just reports an empty list.
+
+**Protocol**: once setup has finished, write `relay <port> on` or
+`relay <port> off` to `Command`, then read (or subscribe to
+notifications on) `Relays` for the result -- see "Relays JSON" below. A
+background thread also polls every configured relay's state every 5
+seconds (again, only once setup has finished) and notifies on change,
+so a connected client sees relays toggled from elsewhere (another
+client, `always_on` resuming after pi-relay-control-alpine restarts,
+etc.) without having to write anything itself first.
+
+**Failure handling**: if pi-relay-control-alpine isn't running, isn't
+installed, or the configured port doesn't match its config, a `relay`
+command or a `Relays` read just reports that relay's `state` as
+`unknown` (logged on the daemon's side) -- it never blocks or crashes
+the BLE service over it. Each TCP round-trip is capped at a 2-second
+timeout, since it's loopback traffic that should be near-instant if the
+other daemon is actually up.
+
 ## GATT service
 
 Custom 128-bit UUIDs (no existing SIG profile fits this):
@@ -222,11 +323,12 @@ Custom 128-bit UUIDs (no existing SIG profile fits this):
 | Service | `7b1e0000-6a45-4d1f-9b0a-3c2f8e4d5a10` | -- | -- |
 | SSID | `7b1e0001-6a45-4d1f-9b0a-3c2f8e4d5a10` | write | UTF-8 network name |
 | Password | `7b1e0002-6a45-4d1f-9b0a-3c2f8e4d5a10` | write | UTF-8 passphrase (omit/empty for open networks) |
-| Command | `7b1e0003-6a45-4d1f-9b0a-3c2f8e4d5a10` | write | ASCII: `scan` \| `connect` \| `forget` \| `set_ethernet` \| `finish` |
+| Command | `7b1e0003-6a45-4d1f-9b0a-3c2f8e4d5a10` | write | ASCII: `scan` \| `connect` \| `forget` \| `set_ethernet` \| `finish` \| `relay <port> on\|off` (`relay` only takes effect after `finish` runs) |
 | Status | `7b1e0004-6a45-4d1f-9b0a-3c2f8e4d5a10` | read + notify | JSON, see below |
 | ScanResults | `7b1e0005-6a45-4d1f-9b0a-3c2f8e4d5a10` | read + notify | JSON array, see below |
 | EthernetIP | `7b1e0006-6a45-4d1f-9b0a-3c2f8e4d5a10` | read + write + notify | ASCII `"ip,rangeStart,rangeEnd"`, see "Ethernet direct-connect" (write only takes effect before `finish` runs) |
 | DhcpLeases | `7b1e0007-6a45-4d1f-9b0a-3c2f8e4d5a10` | read + notify | JSON array, see "Ethernet direct-connect" |
+| Relays | `7b1e0008-6a45-4d1f-9b0a-3c2f8e4d5a10` | read + notify | JSON array, see "Relay control" (reports `[]` until `finish` has run) |
 
 No pairing/encryption gates any of these -- see Security model above.
 SSID/Password are still write-only (no read) purely so a second BLE
@@ -288,6 +390,21 @@ Sorted strongest-first, deduplicated by SSID, capped at
 `scan.max_results` (default 10). Hidden networks (blank SSID in the scan)
 are omitted since there's nothing to show for them.
 
+### Relays JSON
+
+```json
+[{"port":7778,"label":"Camera Light","state":"on"},
+ {"port":7779,"label":"Fan","state":"off"}]
+```
+
+One entry per relay configured in the `[relays]` section of
+`config.ini` (see "Relay control" above), in the order they're listed
+there. `state` is `on`, `off`, or `unknown` (pi-relay-control-alpine
+isn't reachable on that port -- not installed, not running, or a
+port/config mismatch between the two daemons). This is an empty array
+(`[]`) until setup has actually finished, regardless of how many relays
+are configured -- see "Relay control" above.
+
 ### A note on message size
 
 GATT characteristic values top out at 512 bytes (the spec limit), and
@@ -302,10 +419,12 @@ Every push builds `pi-bluetooth-configuration-aarch64.apk` (GitHub
 Actions artifact; tagged `v*` pushes also attach it to a GitHub Release),
 built via `abuild` from [`alpine/APKBUILD`](alpine/APKBUILD). It installs
 cleanly with `apk`, pulling in `dbus`, `bluez`, `wpa_supplicant`,
-`dhcpcd`, and `dnsmasq` (plus their OpenRC services) automatically.
-`dnsmasq` is started automatically the first time the daemon applies
-`eth0`'s default gateway IP (see "Ethernet direct-connect") -- no need
-to enable it manually.
+`dhcpcd`, `dnsmasq`, and `iptables` (plus their OpenRC services, where
+applicable) automatically. `dnsmasq` is started automatically the first
+time the daemon applies `eth0`'s default gateway IP (see "Ethernet
+direct-connect") -- no need to enable it manually. `iptables` needs no
+service of its own; the daemon applies its NAT rules itself at startup
+(see "Internet sharing (eth0 -> WiFi)").
 
 It's signed with a throwaway key generated fresh in CI each run (there's
 no distributed repo to establish trust for), so install with
@@ -334,7 +453,7 @@ Every push builds `pi-bluetooth-configuration-alpine-aarch64.tar.gz`
 Release).
 
 ```sh
-apk add dbus dbus-openrc bluez bluez-openrc wpa_supplicant wpa_supplicant-openrc dhcpcd dhcpcd-openrc iproute2 dnsmasq dnsmasq-openrc
+apk add dbus dbus-openrc bluez bluez-openrc wpa_supplicant wpa_supplicant-openrc dhcpcd dhcpcd-openrc iproute2 dnsmasq dnsmasq-openrc iptables
 
 tar xzf pi-bluetooth-configuration-alpine-aarch64.tar.gz
 cd pi-bluetooth-configuration-alpine-aarch64
@@ -350,11 +469,15 @@ rc-service pi-bluetooth-configuration start
 ## Build from source
 
 ```sh
-apk add build-base dbus-dev openssl-dev pkgconf
+apk add build-base dbus-dev openssl-dev pkgconf iptables
 
 make
 sudo make install               # installs to /usr/bin, /etc, /etc/init.d
 ```
+
+`iptables` is a runtime dependency, not a build one -- listed here too
+since a from-source build doesn't otherwise pull it in automatically the
+way the `.apk` does.
 
 ## Configuration
 
@@ -376,7 +499,14 @@ dhcp_range_end   = 200
 
 [scan]
 max_results      = 10
+
+[relays]
+; relay 7778 Camera Light
+; relay 7779 Fan
 ```
+
+`[relays]` is optional -- see "Relay control" above for the format and
+what it integrates with.
 
 `device_name` is only a fallback. The advertised BLE name is normally
 the board's own hardware serial number (read from `/proc/cpuinfo` at

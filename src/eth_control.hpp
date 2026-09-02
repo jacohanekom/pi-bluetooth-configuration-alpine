@@ -38,6 +38,13 @@
  * specifically so it only ever answers DHCP requests on eth0 -- getting
  * this wrong and having it serve the LAN/WiFi side too would hand out
  * conflicting addresses on a network this daemon doesn't own.
+ *
+ * enable_internet_sharing() NATs eth0's traffic out through the WiFi
+ * interface (which is what actually has the internet connection), so a
+ * laptop plugged into eth0 gets real internet access through the Pi, not
+ * just a link to the Pi itself. Applied once at startup, independent of
+ * WiFi's own connection state -- the iptables rules reference the WiFi
+ * interface by name and work whether or not it's associated yet.
  */
 #include <cctype>
 #include <cstdio>
@@ -250,5 +257,71 @@ public:
 private:
     std::string iface_;
 };
+
+// Enables IPv4 forwarding and NATs lan_iface's (eth0's) traffic out
+// through wan_iface (the WiFi interface, which is what actually has the
+// internet connection) -- so a laptop plugged directly into eth0 gets
+// real internet access routed through the Pi's own WiFi uplink, not just
+// a link to the Pi itself.
+//
+// Idempotent and safe to call on every startup: each rule is checked
+// with `iptables -C` before being added with `-A`, rather than appended
+// unconditionally, so repeated restarts don't pile up duplicate rules
+// (which would still work, just messily -- and would never be cleaned
+// back up).
+//
+// Persists net.ipv4.ip_forward via a sysctl.d drop-in for the next boot
+// (Alpine's own `sysctl` OpenRC service applies /etc/sysctl.d/* at boot,
+// before this daemon starts) and also writes it directly to
+// /proc/sys/net/ipv4/ip_forward so it's live immediately, the same
+// "reapply now, don't wait for the next boot" pattern set_static_ip uses
+// for eth0's own address.
+inline bool enable_internet_sharing(const std::string& lan_iface, const std::string& wan_iface, std::string& err) {
+    {
+        std::ofstream sysctl_conf("/etc/sysctl.d/30-pi-bluetooth-configuration.conf", std::ios::trunc);
+        if (sysctl_conf.is_open()) sysctl_conf << "net.ipv4.ip_forward = 1\n";
+    }
+    {
+        std::ofstream forward("/proc/sys/net/ipv4/ip_forward");
+        if (!forward.is_open()) {
+            err = "failed to open /proc/sys/net/ipv4/ip_forward";
+            return false;
+        }
+        forward << "1";
+    }
+
+    // `iptables -C` exits 0 if the rule already exists, non-zero
+    // otherwise -- used purely as a presence check, its own output is
+    // discarded either way.
+    auto ensure_rule = [](const std::vector<std::string>& check_argv,
+                          const std::vector<std::string>& add_argv,
+                          std::string& err_out) -> bool {
+        if (run_command(check_argv).exit_code == 0) return true;
+        auto add = run_command(add_argv);
+        if (add.exit_code != 0) {
+            err_out += (err_out.empty() ? "" : "; ") + std::string("iptables rule failed: ") + add.output;
+            return false;
+        }
+        return true;
+    };
+
+    bool ok = true;
+    ok = ensure_rule(
+        {"iptables", "-t", "nat", "-C", "POSTROUTING", "-o", wan_iface, "-j", "MASQUERADE"},
+        {"iptables", "-t", "nat", "-A", "POSTROUTING", "-o", wan_iface, "-j", "MASQUERADE"},
+        err) && ok;
+    ok = ensure_rule(
+        {"iptables", "-C", "FORWARD", "-i", lan_iface, "-o", wan_iface, "-j", "ACCEPT"},
+        {"iptables", "-A", "FORWARD", "-i", lan_iface, "-o", wan_iface, "-j", "ACCEPT"},
+        err) && ok;
+    ok = ensure_rule(
+        {"iptables", "-C", "FORWARD", "-i", wan_iface, "-o", lan_iface, "-m", "state",
+         "--state", "RELATED,ESTABLISHED", "-j", "ACCEPT"},
+        {"iptables", "-A", "FORWARD", "-i", wan_iface, "-o", lan_iface, "-m", "state",
+         "--state", "RELATED,ESTABLISHED", "-j", "ACCEPT"},
+        err) && ok;
+
+    return ok;
+}
 
 } // namespace ethctl
