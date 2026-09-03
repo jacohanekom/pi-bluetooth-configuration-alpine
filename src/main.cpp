@@ -710,6 +710,29 @@ int main(int argc, char** argv) {
     }
     std::cerr << "[BlueZ] advertising as \"" << dev_name << "\", service " << SERVICE_UUID << "\n";
 
+    // Polls Status the same way leases/relays/victron below are polled --
+    // status_char otherwise only notifies from do_connect/do_forget/
+    // do_finish, and a client's very first read of it (right after
+    // connecting, deciding wizard vs. the finished-details screen) has no
+    // retry of its own. If that one read is lost -- the same BLE
+    // unreliability the relay write retries above exist for -- nothing
+    // would ever correct it for the rest of that connection, leaving an
+    // already-fully-set-up Pi stuck showing the wizard's network scan
+    // indefinitely. This closes that gap the same way the others do: a
+    // fresh value within 5s regardless of whether the initial read made
+    // it.
+    std::thread([&]() {
+        std::string last;
+        while (g_running) {
+            std::string json = status_json(wifi.get_status(), marker_exists(MARKER_FILE));
+            if (json != last) {
+                last = json;
+                server.notify(status_char, to_bytes(json));
+            }
+            std::this_thread::sleep_for(std::chrono::seconds(5));
+        }
+    }).detach();
+
     // Polls dnsmasq's leases file for changes so a connected client's
     // "allocated IPs" view updates on its own as devices join/leave
     // eth0, without needing to re-open the app to see it.
