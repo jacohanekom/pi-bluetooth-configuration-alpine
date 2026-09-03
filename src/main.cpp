@@ -374,6 +374,26 @@ int main(int argc, char** argv) {
     std::map<int, std::mutex> relay_port_mu;
     for (const auto& r : relays) relay_port_mu[r.port];
     const int victron_ctrl_port = cfg.get_int("victron.ctrl_port", 8562);
+
+    // Relays/Victron's GATT "read" is serviced synchronously, inline,
+    // from the single-threaded dbus_connection_read_write_dispatch loop
+    // below -- there's no worker thread for a ReadValue call the way
+    // there is for a write. Their true values require a TCP round trip
+    // (relayctl::send_command/victronctl::query_status, each with its own
+    // up-to-2s timeout), and a client always issues that first read right
+    // after connecting (see BLEManager's didDiscoverCharacteristicsFor).
+    // Blocking BlueZ's only D-Bus dispatch thread for seconds at exactly
+    // that moment -- while the link is least established -- looked
+    // exactly like a real disconnect from the client's side, regardless
+    // of which Bluetooth adapter was in use, since the problem was never
+    // radio-level to begin with. These caches, kept warm by do_relay/the
+    // periodic poll threads below (which already do this same query off
+    // the dispatch thread), let a "read" just return the latest known
+    // value instantly instead of blocking on the network itself.
+    std::mutex relays_cache_mu;
+    std::string relays_cache_json = "[]";
+    std::mutex victron_cache_mu;
+    std::string victron_cache_json = "{\"connected\":false}";
     const std::string adapter_path = "/org/bluez/" + adapter;
 
     std::cerr << "[Config] adapter  : " << adapter_path << "\n"
@@ -458,13 +478,25 @@ int main(int argc, char** argv) {
     // pi-relay-control-alpine at all -- that daemon's own start_pre()
     // gate (see its README, "Requires device provisioning") means
     // there's nothing listening on those ports yet anyway.
+    // The slow part (relays_json's per-port TCP queries) still runs here,
+    // synchronously, on whichever thread calls this -- do_relay and the
+    // periodic poll thread below, never the D-Bus dispatch thread itself
+    // (see relays_cache_json's comment). Updating the cache here, as a
+    // side effect of every call, is what keeps relays_char's actual
+    // "read" callback fast regardless of which caller triggered this.
     auto current_relays_json = [&]() -> std::string {
-        return marker_exists(MARKER_FILE) ? relays_json(relays, relay_port_mu) : "[]";
+        std::string json = marker_exists(MARKER_FILE) ? relays_json(relays, relay_port_mu) : "[]";
+        std::lock_guard<std::mutex> lk(relays_cache_mu);
+        relays_cache_json = json;
+        return json;
     };
 
     gattsrv::Characteristic* relays_char = server.add_characteristic(
         RELAYS_UUID, {"read", "notify"},
-        [&]() -> std::vector<uint8_t> { return to_bytes(current_relays_json()); },
+        [&]() -> std::vector<uint8_t> {
+            std::lock_guard<std::mutex> lk(relays_cache_mu);
+            return to_bytes(relays_cache_json);
+        },
         nullptr);
 
     // Unlike Relays, Victron telemetry is read-only and isn't gated by
@@ -475,7 +507,10 @@ int main(int argc, char** argv) {
     // characteristic itself is live from the moment BLE comes up.
     gattsrv::Characteristic* victron_char = server.add_characteristic(
         VICTRON_UUID, {"read", "notify"},
-        [&]() -> std::vector<uint8_t> { return to_bytes(victron_json(victronctl::query_status(victron_ctrl_port))); },
+        [&]() -> std::vector<uint8_t> {
+            std::lock_guard<std::mutex> lk(victron_cache_mu);
+            return to_bytes(victron_cache_json);
+        },
         nullptr);
 
     gattsrv::Characteristic* status_char = server.add_characteristic(
@@ -786,6 +821,10 @@ int main(int argc, char** argv) {
         std::string last;
         while (g_running) {
             std::string json = victron_json(victronctl::query_status(victron_ctrl_port));
+            {
+                std::lock_guard<std::mutex> lk(victron_cache_mu);
+                victron_cache_json = json;
+            }
             if (json != last) {
                 last = json;
                 server.notify(victron_char, to_bytes(json));
