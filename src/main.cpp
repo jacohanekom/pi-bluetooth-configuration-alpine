@@ -585,23 +585,56 @@ int main(int argc, char** argv) {
             std::cerr << "[Relay] ignoring relay command for unconfigured port " << port << "\n";
             return;
         }
+        // Retries until pi-relay-control-alpine actually confirms the
+        // change ("OK RELAY=ON"/"OK RELAY=OFF") rather than accepting the
+        // first attempt regardless of outcome -- a transient failure
+        // (relay busy, a dropped connection, etc.) would otherwise
+        // silently leave the relay unchanged with only a log line to show
+        // for it. Bounded by both an attempt count and a wall-clock
+        // budget so a persistently unreachable relay still gives up
+        // rather than retrying forever.
+        constexpr int max_attempts = 5;
+        constexpr auto retry_delay = std::chrono::milliseconds(300);
+        constexpr auto max_total_time = std::chrono::seconds(10);
+        auto deadline = std::chrono::steady_clock::now() + max_total_time;
+
         std::string err, resp;
-        {
-            // Locked only around the command itself, on just this port's
-            // mutex -- not across the current_relays_json() call below,
-            // which locks each port (including this one) again itself.
-            // Holding it across both would self-deadlock on this thread
-            // re-locking a non-recursive mutex it already owns. The write
-            // has already fully applied by the time this unlocks, so any
-            // query that lands after -- from that call or the periodic
-            // poll thread -- sees the real post-command state regardless;
-            // there's no staleness window left to protect against once
-            // the command itself has finished.
-            std::lock_guard<std::mutex> lk(relay_port_mu[port]);
-            resp = relayctl::send_command(port, action, err);
+        bool confirmed = false;
+        int attempt = 0;
+        while (!confirmed && ++attempt <= max_attempts && std::chrono::steady_clock::now() < deadline) {
+            {
+                // Locked only around the command itself, on just this
+                // port's mutex -- not across the current_relays_json()
+                // call below, which locks each port (including this one)
+                // again itself. Holding it across both would self-deadlock
+                // on this thread re-locking a non-recursive mutex it
+                // already owns. The write has already fully applied by
+                // the time this unlocks, so any query that lands after --
+                // from that call or the periodic poll thread -- sees the
+                // real post-command state regardless; there's no
+                // staleness window left to protect against once the
+                // command itself has finished.
+                std::lock_guard<std::mutex> lk(relay_port_mu[port]);
+                resp = relayctl::send_command(port, action, err);
+            }
+            confirmed = err.empty() && resp.rfind("OK", 0) == 0;
+            if (!confirmed && attempt < max_attempts) {
+                std::cerr << "[Relay] port " << port << " " << action << " attempt " << attempt << "/"
+                           << max_attempts << " -> " << (err.empty() ? resp : err) << ", retrying\n";
+                std::this_thread::sleep_for(retry_delay);
+            }
         }
-        if (!err.empty()) std::cerr << "[Relay] " << err << "\n";
-        else std::cerr << "[Relay] port " << port << " " << action << " -> " << resp << "\n";
+
+        if (confirmed) {
+            std::cerr << "[Relay] port " << port << " " << action << " -> " << resp
+                       << " (attempt " << attempt << "/" << max_attempts << ")\n";
+        } else if (!err.empty()) {
+            std::cerr << "[Relay] port " << port << " " << action << " gave up after " << attempt
+                       << " attempts: " << err << "\n";
+        } else {
+            std::cerr << "[Relay] port " << port << " " << action << " gave up after " << attempt
+                       << " attempts, last response: " << resp << "\n";
+        }
         server.notify(relays_char, to_bytes(current_relays_json()));
     };
 
