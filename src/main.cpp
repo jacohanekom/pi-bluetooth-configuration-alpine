@@ -101,6 +101,7 @@
 
 #include "config.hpp"
 #include "eth_control.hpp"
+#include "agent.hpp"
 #include "gatt_server.hpp"
 #include "relay_control.hpp"
 #include "victron_control.hpp"
@@ -737,6 +738,17 @@ int main(int argc, char** argv) {
                 std::cerr << "[Command] unrecognised command: " << cmd << "\n";
             }
         });
+
+    // See agent.hpp for why this exists: without it, BlueZ's own built-in
+    // GATT profiles (Battery Service, in particular) demand
+    // authentication this daemon has no way to satisfy, and disconnects
+    // the device outright a few seconds into every single connection.
+    // Not fatal to starting up if it fails -- the GATT service itself
+    // doesn't depend on it -- but leaves that disconnect loop in place.
+    std::string agent_err;
+    if (!agentctl::register_pairing_agent(conn, agent_err)) {
+        std::cerr << "[BlueZ] failed to register pairing agent: " << agent_err << "\n";
+    }
 
     std::string start_err;
     if (!server.start(start_err)) {

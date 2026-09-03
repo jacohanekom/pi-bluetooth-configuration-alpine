@@ -21,6 +21,7 @@ builddir="$srcdir"
 prepare() {
 	default_prepare
 	cp "$startdir"/../src/main.cpp "$srcdir"/main.cpp
+	cp "$startdir"/../src/agent.hpp "$srcdir"/agent.hpp
 	cp "$startdir"/../src/config.hpp "$srcdir"/config.hpp
 	cp "$startdir"/../src/eth_control.hpp "$srcdir"/eth_control.hpp
 	cp "$startdir"/../src/gatt_server.hpp "$srcdir"/gatt_server.hpp

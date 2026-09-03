@@ -280,12 +280,23 @@ public:
 
         if (!set_adapter_bool("Powered", true, err_out)) return false;
         if (!set_adapter_string("Alias", device_name_, err_out)) return false;
-        // No pairing agent is registered, so leave the adapter unpairable --
-        // BlueZ never needs to prompt for pairing since nothing here
-        // requires an encrypted link, and this also keeps the Pi from
-        // showing up as something manually "pairable" in a client's
-        // system Bluetooth settings outside of this app's own flow.
-        if (!set_adapter_bool("Pairable", false, err_out)) return false;
+        // Pairable, not unpairable: this GATT service itself still has no
+        // pairing/encryption of its own (see the README's "Security
+        // model" -- WiFi credentials still cross BLE in the clear, same
+        // as always). But BlueZ's own built-in GATT profiles (Battery
+        // Service, Device Information, Current Time Service) demand an
+        // authenticated link regardless of what this app requires, and
+        // iOS's system Bluetooth daemon reads Battery Level on every
+        // connected peripheral automatically for its own battery-percent
+        // indicator. With Pairable=false and no agent, that failed
+        // authentication attempt led BlueZ to disconnect the device
+        // outright every single time, a few seconds after each connect
+        // (confirmed via a live HCI trace) -- indistinguishable from
+        // constant BLE flakiness without tracing this deep. See
+        // agent.hpp for the NoInputNoOutput agent this pairs with, which
+        // lets that authentication complete via headless Just Works
+        // bonding instead of failing.
+        if (!set_adapter_bool("Pairable", true, err_out)) return false;
         if (!set_adapter_bool("Discoverable", true, err_out)) return false;
 
         DBusMessage* reply;
