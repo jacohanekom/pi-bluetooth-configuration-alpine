@@ -401,6 +401,20 @@ int main(int argc, char** argv) {
     std::mutex scan_mu;
     std::string last_scan_json = "[]";
 
+    // Serializes every relay command/query against the periodic relay
+    // poll thread below -- without this, a manual on/off (do_relay) and
+    // the poll's own current_relays_json() call can run concurrently
+    // against pi-relay-control-alpine, and whichever's notify happens to
+    // reach the BLE client last wins. If that's the poll's stale
+    // pre-toggle read (started just before the command, but racing it),
+    // the switch visibly reverts to the old state even though the
+    // command itself succeeded -- the relay really did toggle, the UI
+    // just showed a stale read moments later. Holding this for a
+    // command's entire send-then-requery makes that interleaving
+    // impossible: the poll thread either runs fully before or fully
+    // after, never mid-command.
+    std::mutex relays_mu;
+
     server.add_characteristic(SSID_UUID, {"write"}, nullptr,
         [&](const std::vector<uint8_t>& v) {
             std::lock_guard<std::mutex> lk(staged_mu);
@@ -548,6 +562,7 @@ int main(int argc, char** argv) {
             std::cerr << "[Relay] ignoring relay command: setup has not finished yet\n";
             return;
         }
+        std::lock_guard<std::mutex> lk(relays_mu);
         std::string err;
         std::string resp = relayctl::send_command(port, action, err);
         if (!err.empty()) std::cerr << "[Relay] " << err << "\n";
@@ -646,10 +661,13 @@ int main(int argc, char** argv) {
         std::thread([&]() {
             std::string last;
             while (g_running) {
-                std::string json = current_relays_json();
-                if (json != last) {
-                    last = json;
-                    server.notify(relays_char, to_bytes(json));
+                {
+                    std::lock_guard<std::mutex> lk(relays_mu);
+                    std::string json = current_relays_json();
+                    if (json != last) {
+                        last = json;
+                        server.notify(relays_char, to_bytes(json));
+                    }
                 }
                 std::this_thread::sleep_for(std::chrono::seconds(5));
             }
