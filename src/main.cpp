@@ -608,6 +608,15 @@ int main(int argc, char** argv) {
     server.add_characteristic(COMMAND_UUID, {"write"}, nullptr,
         [&](const std::vector<uint8_t>& v) {
             std::string cmd = trim(std::string(v.begin(), v.end()));
+            // Unconditional, logged before any parsing/dispatch below --
+            // every well-formed command otherwise only logs deep inside
+            // its own handler (e.g. do_relay), so a write that reaches
+            // BlueZ/D-Bus but somehow never gets this far would otherwise
+            // leave no trace at all. If this line is ever missing for a
+            // command the client believes it sent, the write never
+            // reached the daemon in the first place -- not a bug in any
+            // of the handlers below, but in the BLE link itself.
+            std::cerr << "[Command] received: \"" << cmd << "\"\n";
 
             if (cmd == "scan") {
                 std::thread([&]() { InflightGuard guard; do_scan(); }).detach();
