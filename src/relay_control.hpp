@@ -25,7 +25,9 @@
 #include <vector>
 
 #include <arpa/inet.h>
+#include <fcntl.h>
 #include <netinet/in.h>
+#include <sys/select.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -109,7 +111,35 @@ inline std::string send_command(int port, const std::string& cmd, std::string& e
     addr.sin_port = htons(static_cast<uint16_t>(port));
     addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
 
-    if (connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
+    // connect() itself isn't covered by SO_*TIMEO above (those only bound
+    // send/recv) -- on loopback it's normally instant, but this daemon
+    // holds a per-port mutex (see main.cpp's relay_port_mu) for the
+    // duration of this call, so an unbounded connect() to one stuck or
+    // unresponsive relay could hang every future command/query for that
+    // same port indefinitely rather than just failing this one call.
+    // Non-blocking connect + select() bounds it to the same 2s budget.
+    int flags = fcntl(fd, F_GETFL, 0);
+    fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+    int rc = connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr));
+    if (rc < 0 && errno == EINPROGRESS) {
+        fd_set wfds;
+        FD_ZERO(&wfds);
+        FD_SET(fd, &wfds);
+        timeval connect_tv{2, 0};
+        rc = select(fd + 1, nullptr, &wfds, nullptr, &connect_tv);
+        if (rc > 0) {
+            int so_err = 0;
+            socklen_t so_err_len = sizeof(so_err);
+            getsockopt(fd, SOL_SOCKET, SO_ERROR, &so_err, &so_err_len);
+            rc = (so_err == 0) ? 0 : -1;
+            if (so_err != 0) errno = so_err;
+        } else if (rc == 0) {
+            errno = ETIMEDOUT;
+            rc = -1;
+        }
+    }
+    fcntl(fd, F_SETFL, flags); // restore blocking mode for send()/recv() below
+    if (rc < 0) {
         err = "connect to 127.0.0.1:" + std::to_string(port) + " failed: " + strerror(errno);
         close(fd);
         return "";

@@ -90,6 +90,7 @@
 #include <cstdio>
 #include <fstream>
 #include <iostream>
+#include <map>
 #include <mutex>
 #include <sstream>
 #include <string>
@@ -215,14 +216,26 @@ std::string leases_json(const std::vector<ethctl::Lease>& leases) {
 // this is called -- simple, and there are only ever a handful of
 // relays, so this is cheap enough to run both on-demand (a GATT read)
 // and on the poll/notify thread below.
-std::string relays_json(const std::vector<relayctl::RelayConfig>& relays) {
+// port_mu locks each relay individually (just around that relay's own
+// query) rather than one lock for the whole sweep -- see do_relay for
+// why a lock is needed at all, and relay_port_mu's own comment for why
+// it's per-port. A short, per-relay critical section here means a slow
+// query against one relay still can't block a command to a different
+// one from this same loop either.
+std::string relays_json(const std::vector<relayctl::RelayConfig>& relays,
+                         std::map<int, std::mutex>& port_mu) {
     std::ostringstream o;
     o << "[";
     for (size_t i = 0; i < relays.size(); ++i) {
         if (i) o << ",";
+        std::string state;
+        {
+            std::lock_guard<std::mutex> lk(port_mu[relays[i].port]);
+            state = relayctl::query_state(relays[i].port);
+        }
         o << "{\"port\":" << relays[i].port << ","
           << "\"label\":\"" << escape_json(relays[i].label) << "\","
-          << "\"state\":\"" << relayctl::query_state(relays[i].port) << "\"}";
+          << "\"state\":\"" << state << "\"}";
     }
     o << "]";
     return o.str();
@@ -349,6 +362,17 @@ int main(int argc, char** argv) {
     const int eth_default_range_end   = cfg.get_int("ethernet.dhcp_range_end", 200);
     const int max_scan_results   = cfg.get_int("scan.max_results", 10);
     const auto relays = relayctl::load_relays(cfg_path);
+
+    // One mutex per configured relay port -- populated once, up front,
+    // before any thread that might read it starts, so every later
+    // relay_port_mu[port] lookup below only ever finds an existing key
+    // and never triggers a concurrent std::map insert/rehash. Keyed per
+    // port (not one mutex for every relay) so a manual on/off command
+    // to one relay is never blocked behind a slow or stuck query against
+    // a completely different one -- see relays_json/do_relay below for
+    // why a lock is needed here at all.
+    std::map<int, std::mutex> relay_port_mu;
+    for (const auto& r : relays) relay_port_mu[r.port];
     const int victron_ctrl_port = cfg.get_int("victron.ctrl_port", 8562);
     const std::string adapter_path = "/org/bluez/" + adapter;
 
@@ -401,20 +425,6 @@ int main(int argc, char** argv) {
     std::mutex scan_mu;
     std::string last_scan_json = "[]";
 
-    // Serializes every relay command/query against the periodic relay
-    // poll thread below -- without this, a manual on/off (do_relay) and
-    // the poll's own current_relays_json() call can run concurrently
-    // against pi-relay-control-alpine, and whichever's notify happens to
-    // reach the BLE client last wins. If that's the poll's stale
-    // pre-toggle read (started just before the command, but racing it),
-    // the switch visibly reverts to the old state even though the
-    // command itself succeeded -- the relay really did toggle, the UI
-    // just showed a stale read moments later. Holding this for a
-    // command's entire send-then-requery makes that interleaving
-    // impossible: the poll thread either runs fully before or fully
-    // after, never mid-command.
-    std::mutex relays_mu;
-
     server.add_characteristic(SSID_UUID, {"write"}, nullptr,
         [&](const std::vector<uint8_t>& v) {
             std::lock_guard<std::mutex> lk(staged_mu);
@@ -449,7 +459,7 @@ int main(int argc, char** argv) {
     // gate (see its README, "Requires device provisioning") means
     // there's nothing listening on those ports yet anyway.
     auto current_relays_json = [&]() -> std::string {
-        return marker_exists(MARKER_FILE) ? relays_json(relays) : "[]";
+        return marker_exists(MARKER_FILE) ? relays_json(relays, relay_port_mu) : "[]";
     };
 
     gattsrv::Characteristic* relays_char = server.add_characteristic(
@@ -562,9 +572,34 @@ int main(int argc, char** argv) {
             std::cerr << "[Relay] ignoring relay command: setup has not finished yet\n";
             return;
         }
-        std::lock_guard<std::mutex> lk(relays_mu);
-        std::string err;
-        std::string resp = relayctl::send_command(port, action, err);
+        // relay_port_mu is pre-populated once at startup with exactly the
+        // configured ports (see its declaration above) so every lookup
+        // below is a plain read on an existing key, never a concurrent
+        // std::map insert racing the periodic poll thread's own lookups.
+        // port comes straight from the client's write, unvalidated, so
+        // that guarantee only holds if an unconfigured port is rejected
+        // here first, before ever touching the map.
+        bool configured = std::any_of(relays.begin(), relays.end(),
+                                       [&](const relayctl::RelayConfig& r) { return r.port == port; });
+        if (!configured) {
+            std::cerr << "[Relay] ignoring relay command for unconfigured port " << port << "\n";
+            return;
+        }
+        std::string err, resp;
+        {
+            // Locked only around the command itself, on just this port's
+            // mutex -- not across the current_relays_json() call below,
+            // which locks each port (including this one) again itself.
+            // Holding it across both would self-deadlock on this thread
+            // re-locking a non-recursive mutex it already owns. The write
+            // has already fully applied by the time this unlocks, so any
+            // query that lands after -- from that call or the periodic
+            // poll thread -- sees the real post-command state regardless;
+            // there's no staleness window left to protect against once
+            // the command itself has finished.
+            std::lock_guard<std::mutex> lk(relay_port_mu[port]);
+            resp = relayctl::send_command(port, action, err);
+        }
         if (!err.empty()) std::cerr << "[Relay] " << err << "\n";
         else std::cerr << "[Relay] port " << port << " " << action << " -> " << resp << "\n";
         server.notify(relays_char, to_bytes(current_relays_json()));
@@ -661,13 +696,14 @@ int main(int argc, char** argv) {
         std::thread([&]() {
             std::string last;
             while (g_running) {
-                {
-                    std::lock_guard<std::mutex> lk(relays_mu);
-                    std::string json = current_relays_json();
-                    if (json != last) {
-                        last = json;
-                        server.notify(relays_char, to_bytes(json));
-                    }
+                // current_relays_json() -> relays_json() locks each port
+                // individually around its own query -- no outer lock
+                // needed here, and one would only add cross-port blocking
+                // this loop doesn't need (see relay_port_mu's comment).
+                std::string json = current_relays_json();
+                if (json != last) {
+                    last = json;
+                    server.notify(relays_char, to_bytes(json));
                 }
                 std::this_thread::sleep_for(std::chrono::seconds(5));
             }
