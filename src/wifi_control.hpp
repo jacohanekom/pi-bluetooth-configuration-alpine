@@ -166,7 +166,19 @@ public:
         auto st = run_command({"wpa_cli", "-i", iface_, "status"});
         if (status_field(st.output, "wpa_state") == "COMPLETED") {
             std::string ssid = status_field(st.output, "ssid");
-            std::string ip = status_field(st.output, "ip_address");
+            // Not status_field(..., "ip_address") -- wpa_cli only reports
+            // that field when wpa_supplicant itself manages DHCP (its own
+            // -D dhcp integration or an action script), which this setup
+            // doesn't use; dhcpcd runs as a separate client here, same as
+            // connect() above, so the address has to come from the
+            // interface itself the same way connect() reads it. Without
+            // this, a restart while already connected (e.g. `rc-service
+            // pi-bluetooth-configuration restart`) would see ssid but an
+            // always-empty ip, fail this check, and get stuck reporting
+            // IDLE forever -- the client would then show its "scanning
+            // for networks" wizard step instead of the real connected
+            // status, even though the Pi's WiFi never actually dropped.
+            std::string ip = read_ipv4_address();
             if (!ssid.empty() && !ip.empty()) {
                 set_status(WifiStatus{WifiStatus::CONNECTED, ssid, ip, ""});
             }
