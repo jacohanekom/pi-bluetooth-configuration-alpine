@@ -4,9 +4,12 @@
  * BLE GATT peripheral that lets a phone/app join this Pi to a WiFi network
  * without SSH or a keyboard: pair over Bluetooth LE, write an SSID and
  * passphrase, write "connect", and watch the status characteristic for the
- * result. Built directly on BlueZ's D-Bus API (see gatt_server.hpp) --
- * scanning/joining/DHCP are driven through wpa_cli and dhcpcd (see
- * wifi_control.hpp).
+ * result. The BLE peripheral role itself lives on a Raspberry Pi Pico 2 W's
+ * own BTstack build, connected over USB as a plain serial port (see
+ * pico_transport.hpp for why, and pico/aipicam_ble_bridge for its firmware)
+ * -- this daemon just drives the actual WiFi/relay/Ethernet logic and pushes
+ * characteristic values across that link. Scanning/joining/DHCP are driven
+ * through wpa_cli and dhcpcd (see wifi_control.hpp).
  *
  * GATT service (see README for the exact UUIDs):
  *   SSID        (write)          stage a network name
@@ -97,12 +100,9 @@
 #include <thread>
 #include <vector>
 
-#include <dbus/dbus.h>
-
 #include "config.hpp"
 #include "eth_control.hpp"
-#include "agent.hpp"
-#include "gatt_server.hpp"
+#include "pico_transport.hpp"
 #include "relay_control.hpp"
 #include "victron_control.hpp"
 #include "wifi_control.hpp"
@@ -119,7 +119,6 @@ constexpr const char* ETH_IP_UUID   = "7b1e0006-6a45-4d1f-9b0a-3c2f8e4d5a10";
 constexpr const char* LEASES_UUID   = "7b1e0007-6a45-4d1f-9b0a-3c2f8e4d5a10";
 constexpr const char* RELAYS_UUID   = "7b1e0008-6a45-4d1f-9b0a-3c2f8e4d5a10";
 constexpr const char* VICTRON_UUID  = "7b1e0009-6a45-4d1f-9b0a-3c2f8e4d5a10";
-constexpr const char* APP_ROOT      = "/org/bluez/pibtconf";
 constexpr const char* MARKER_FILE   = "/.successfully-initialized";
 constexpr int REBOOT_DELAY_SECS     = 3;
 
@@ -352,7 +351,11 @@ int main(int argc, char** argv) {
     }
 
     Config cfg(cfg_path);
-    const std::string adapter    = cfg.get_str("bluetooth.adapter", "hci0");
+    // Which serial port the Pico's own USB-CDC-ACM interface enumerates
+    // as -- see pico_transport.hpp for why the BLE peripheral role lives
+    // on a Pico's own BTstack build now, not this daemon talking to
+    // BlueZ directly.
+    const std::string serial_port = cfg.get_str("bluetooth.serial_port", "/dev/ttyACM0");
     const std::string configured_name = cfg.get_str("bluetooth.device_name", "pi-bluetooth-configuration");
     const std::string serial     = read_pi_serial();
     const std::string dev_name   = serial.empty() ? configured_name : serial;
@@ -376,17 +379,21 @@ int main(int argc, char** argv) {
     for (const auto& r : relays) relay_port_mu[r.port];
     const int victron_ctrl_port = cfg.get_int("victron.ctrl_port", 8562);
 
-    // Relays/Victron's GATT "read" is serviced synchronously, inline,
-    // from the single-threaded dbus_connection_read_write_dispatch loop
-    // below -- there's no worker thread for a ReadValue call the way
-    // there is for a write. Their true values require a TCP round trip
-    // (relayctl::send_command/victronctl::query_status, each with its own
-    // up-to-2s timeout), and a client always issues that first read right
-    // after connecting (see BLEManager's didDiscoverCharacteristicsFor).
-    // Blocking BlueZ's only D-Bus dispatch thread for seconds at exactly
-    // that moment -- while the link is least established -- looked
-    // exactly like a real disconnect from the client's side, regardless
-    // of which Bluetooth adapter was in use, since the problem was never
+    // Relays/Victron's "read" (on_read below) only actually runs once,
+    // at PicoTransport::start() (seeding the Pico's initial cache -- see
+    // pico_transport.hpp) -- every later update instead comes from
+    // do_relay/the periodic poll threads below calling notify() with an
+    // already-computed value. This cache exists so those two paths share
+    // one "last known good" value rather than the periodic thread's own
+    // fresh query racing a concurrent seed read against
+    // pi-relay-control-alpine/victron-ve-direct-alpine (each with its own
+    // up-to-2s timeout). Originally this also kept a slow query from
+    // blocking BlueZ's single-threaded D-Bus dispatch loop for seconds at
+    // exactly the moment a client first connected, which looked exactly
+    // like a real disconnect regardless of which Bluetooth adapter was in
+    // use -- moot now that the BLE peripheral role lives on the Pico
+    // instead (see pico_transport.hpp), but the caching itself is still
+    // worth keeping for the reason above.
     // radio-level to begin with. These caches, kept warm by do_relay/the
     // periodic poll threads below (which already do this same query off
     // the dispatch thread), let a "read" just return the latest known
@@ -395,25 +402,12 @@ int main(int argc, char** argv) {
     std::string relays_cache_json = "[]";
     std::mutex victron_cache_mu;
     std::string victron_cache_json = "{\"connected\":false}";
-    const std::string adapter_path = "/org/bluez/" + adapter;
-
-    std::cerr << "[Config] adapter  : " << adapter_path << "\n"
+    std::cerr << "[Config] pico     : " << serial_port << "\n"
               << "[Config] device   : " << dev_name << (serial.empty() ? " (configured)" : " (hardware serial)") << "\n"
               << "[Config] wifi if  : " << iface << "\n"
               << "[Config] eth if   : " << eth_iface << "\n"
               << "[Config] relays   : " << relays.size() << " configured\n"
               << "[Config] victron  : ctrl_port " << victron_ctrl_port << "\n";
-
-    dbus_threads_init_default();
-
-    DBusError err;
-    dbus_error_init(&err);
-    DBusConnection* conn = dbus_bus_get(DBUS_BUS_SYSTEM, &err);
-    if (dbus_error_is_set(&err) || !conn) {
-        std::cerr << "[DBus] failed to connect to system bus: " << err.message << "\n";
-        return 1;
-    }
-    dbus_connection_set_exit_on_disconnect(conn, 0);
 
     WifiControl wifi(iface);
     ethctl::EthControl eth(eth_iface);
@@ -438,7 +432,7 @@ int main(int argc, char** argv) {
         }
     }).detach();
 
-    gattsrv::GattServer server(conn, adapter_path, APP_ROOT, SERVICE_UUID, dev_name);
+    picoserv::PicoTransport server(serial_port);
 
     std::mutex staged_mu;
     std::string staged_ssid, staged_psk, staged_eth_ip;
@@ -458,7 +452,7 @@ int main(int argc, char** argv) {
             staged_psk.assign(v.begin(), v.end());
         });
 
-    gattsrv::Characteristic* eth_ip_char = server.add_characteristic(
+    picoserv::Characteristic* eth_ip_char = server.add_characteristic(
         ETH_IP_UUID, {"read", "write", "notify"},
         [&]() -> std::vector<uint8_t> { return to_bytes(eth_config_csv(eth)); },
         [&](const std::vector<uint8_t>& v) {
@@ -466,7 +460,7 @@ int main(int argc, char** argv) {
             staged_eth_ip.assign(v.begin(), v.end());
         });
 
-    gattsrv::Characteristic* leases_char = server.add_characteristic(
+    picoserv::Characteristic* leases_char = server.add_characteristic(
         LEASES_UUID, {"read", "notify"},
         [&]() -> std::vector<uint8_t> { return to_bytes(leases_json(eth.get_leases())); },
         nullptr);
@@ -492,7 +486,7 @@ int main(int argc, char** argv) {
         return json;
     };
 
-    gattsrv::Characteristic* relays_char = server.add_characteristic(
+    picoserv::Characteristic* relays_char = server.add_characteristic(
         RELAYS_UUID, {"read", "notify"},
         [&]() -> std::vector<uint8_t> {
             std::lock_guard<std::mutex> lk(relays_cache_mu);
@@ -506,7 +500,7 @@ int main(int argc, char** argv) {
     // reachable yet). The app chooses to surface it on the same
     // post-setup screen as WiFi/network stats and relays; this
     // characteristic itself is live from the moment BLE comes up.
-    gattsrv::Characteristic* victron_char = server.add_characteristic(
+    picoserv::Characteristic* victron_char = server.add_characteristic(
         VICTRON_UUID, {"read", "notify"},
         [&]() -> std::vector<uint8_t> {
             std::lock_guard<std::mutex> lk(victron_cache_mu);
@@ -514,12 +508,12 @@ int main(int argc, char** argv) {
         },
         nullptr);
 
-    gattsrv::Characteristic* status_char = server.add_characteristic(
+    picoserv::Characteristic* status_char = server.add_characteristic(
         STATUS_UUID, {"read", "notify"},
         [&]() -> std::vector<uint8_t> { return to_bytes(status_json(wifi.get_status(), marker_exists(MARKER_FILE))); },
         nullptr);
 
-    gattsrv::Characteristic* scan_char = server.add_characteristic(
+    picoserv::Characteristic* scan_char = server.add_characteristic(
         SCAN_UUID, {"read", "notify"},
         [&]() -> std::vector<uint8_t> {
             std::lock_guard<std::mutex> lk(scan_mu);
@@ -680,11 +674,11 @@ int main(int argc, char** argv) {
             // Unconditional, logged before any parsing/dispatch below --
             // every well-formed command otherwise only logs deep inside
             // its own handler (e.g. do_relay), so a write that reaches
-            // BlueZ/D-Bus but somehow never gets this far would otherwise
-            // leave no trace at all. If this line is ever missing for a
-            // command the client believes it sent, the write never
-            // reached the daemon in the first place -- not a bug in any
-            // of the handlers below, but in the BLE link itself.
+            // this callback but somehow never gets this far would
+            // otherwise leave no trace at all. If this line is ever
+            // missing for a command the client believes it sent, the
+            // write never reached the Pico (or the Pico never forwarded
+            // it over serial) -- not a bug in any of the handlers below.
             std::cerr << "[Command] received: \"" << cmd << "\"\n";
 
             if (cmd == "scan") {
@@ -739,23 +733,12 @@ int main(int argc, char** argv) {
             }
         });
 
-    // See agent.hpp for why this exists: without it, BlueZ's own built-in
-    // GATT profiles (Battery Service, in particular) demand
-    // authentication this daemon has no way to satisfy, and disconnects
-    // the device outright a few seconds into every single connection.
-    // Not fatal to starting up if it fails -- the GATT service itself
-    // doesn't depend on it -- but leaves that disconnect loop in place.
-    std::string agent_err;
-    if (!agentctl::register_pairing_agent(conn, agent_err)) {
-        std::cerr << "[BlueZ] failed to register pairing agent: " << agent_err << "\n";
-    }
-
     std::string start_err;
     if (!server.start(start_err)) {
-        std::cerr << "[BlueZ] failed to start GATT server: " << start_err << "\n";
+        std::cerr << "[Pico] failed to start: " << start_err << "\n";
         return 1;
     }
-    std::cerr << "[BlueZ] advertising as \"" << dev_name << "\", service " << SERVICE_UUID << "\n";
+    std::cerr << "[Pico] bridge ready on " << serial_port << ", service " << SERVICE_UUID << "\n";
 
     // Polls Status the same way leases/relays/victron below are polled --
     // status_char otherwise only notifies from do_connect/do_forget/
@@ -848,8 +831,11 @@ int main(int argc, char** argv) {
     std::signal(SIGINT, on_signal);
     std::signal(SIGTERM, on_signal);
 
+    // PicoTransport runs its own reader thread (see pico_transport.hpp)
+    // -- unlike the old BlueZ path, there's no shared dispatch loop this
+    // thread needs to keep pumping, just a wait for a shutdown signal.
     while (g_running) {
-        dbus_connection_read_write_dispatch(conn, 200);
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
     }
 
     std::cerr << "[Main] shutting down, waiting for in-flight scan/connect work...\n";

@@ -16,7 +16,14 @@ output_log="/var/log/${RC_SVCNAME}.log"
 error_log="/var/log/${RC_SVCNAME}.log"
 
 depend() {
-    need dbus bluetooth
+    # No dbus/bluetooth need here -- the BLE peripheral role lives on a
+    # Pico's own BTstack build now (see src/pico_transport.hpp),
+    # connected over USB as a plain serial port. OpenRC has no clean
+    # "wait for this USB device node to exist" dependency; if the Pico
+    # isn't plugged in (or hasn't finished enumerating) yet when this
+    # starts, pico_transport.hpp's start() just fails to open the serial
+    # port and this daemon exits non-zero, which supervise-daemon's
+    # respawn_delay/respawn_max above already retry indefinitely.
     need wpa_supplicant
     after firewall
 }

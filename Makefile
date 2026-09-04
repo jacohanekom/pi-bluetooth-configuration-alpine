@@ -1,13 +1,13 @@
 CXX       = g++
 PKGCONFIG = pkg-config
-CXXFLAGS  = -Wall -Wextra -O2 -std=c++20 -pthread $(shell $(PKGCONFIG) --cflags dbus-1 libcrypto)
-LDFLAGS   = -pthread $(shell $(PKGCONFIG) --libs dbus-1 libcrypto)
+CXXFLAGS  = -Wall -Wextra -O2 -std=c++20 -pthread $(shell $(PKGCONFIG) --cflags libcrypto)
+LDFLAGS   = -pthread $(shell $(PKGCONFIG) --libs libcrypto)
 TARGET    = pi-bluetooth-configuration
 SRCDIR    = src
 
 all: $(TARGET)
 
-$(TARGET): $(SRCDIR)/main.cpp $(SRCDIR)/agent.hpp $(SRCDIR)/config.hpp $(SRCDIR)/eth_control.hpp $(SRCDIR)/gatt_server.hpp $(SRCDIR)/relay_control.hpp $(SRCDIR)/victron_control.hpp $(SRCDIR)/wifi_control.hpp $(SRCDIR)/subprocess.hpp
+$(TARGET): $(SRCDIR)/main.cpp $(SRCDIR)/config.hpp $(SRCDIR)/eth_control.hpp $(SRCDIR)/pico_transport.hpp $(SRCDIR)/relay_control.hpp $(SRCDIR)/victron_control.hpp $(SRCDIR)/wifi_control.hpp $(SRCDIR)/subprocess.hpp
 	$(CXX) $(CXXFLAGS) -o $(TARGET) $(SRCDIR)/main.cpp $(LDFLAGS)
 
 install: all
