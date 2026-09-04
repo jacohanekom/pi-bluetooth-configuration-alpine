@@ -10,19 +10,22 @@ jobs:
     # Genuinely aarch64 hardware (no QEMU) -- matches the actual deploy
     # target and keeps the container build a native compile rather than
     # an emulated cross-build. Note this only proves the code compiles and
-    # links -- there's no real Bluetooth adapter in this runner, so the
-    # BlueZ D-Bus integration itself can only be exercised on an actual Pi.
+    # links -- there's no real Pico attached to this runner, so
+    # pico_transport.hpp's actual USB-serial link can only be exercised
+    # on an actual Pi with the Pico plugged in.
     runs-on: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v4
 
-      # dbus-dev and openssl-dev are normal Alpine packages -- there's
-      # nothing to fetch and build from source here.
+      # openssl-dev is a normal Alpine package -- there's nothing to
+      # fetch and build from source here. No dbus-dev: the BLE peripheral
+      # role lives on a Pico's own BTstack build now (see
+      # src/pico_transport.hpp), not this daemon talking to BlueZ.
       - name: Build in Alpine container
         run: |
           docker run --rm -v "$PWD":/work -w /work alpine:3.20 sh -c '
             set -e
-            apk add --no-cache build-base dbus-dev openssl-dev pkgconf
+            apk add --no-cache build-base openssl-dev pkgconf
 
             make
 
