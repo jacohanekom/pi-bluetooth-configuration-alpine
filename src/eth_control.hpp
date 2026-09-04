@@ -24,10 +24,16 @@
  * ignore eth0 entirely (`denyinterfaces`) so it can't fight over the
  * address once carrier does appear.
  *
- * Unlike WiFi, applying this doesn't need a reboot: Ethernet doesn't
- * share the Pi 3's antenna with Bluetooth, so there's no coexistence
- * problem to route around -- the affected services (dhcpcd, dnsmasq)
- * are just restarted directly and the change takes effect immediately.
+ * Unlike a WiFi network change, applying this doesn't need a reboot:
+ * eth0 is entirely independent of whatever wlan0 is doing (station mode,
+ * AP fallback, or mid-transition between the two -- see
+ * ap_control.hpp), so there's no coexistence problem to route around --
+ * the affected services (dhcpcd, dnsmasq) are just restarted directly
+ * and the change takes effect immediately. WiFi's own connect/forget/
+ * finish flows reboot by deliberate design choice (see main.cpp), not
+ * because of any hardware necessity -- a working connection to reach
+ * this daemon on again is only guaranteed after a full restart anyway,
+ * once either flow concludes.
  *
  * The chosen IP and DHCP range are persisted in a plain state file so
  * they survive reboots (unlike `ip addr add`, which doesn't); the
@@ -109,17 +115,21 @@ inline int last_octet(const std::string& ip) {
     try { return std::stoi(ip.substr(ip.rfind('.') + 1)); } catch (...) { return -1; }
 }
 
-// Replaces (or removes entirely, if new_block is empty) our
+// Replaces (or removes entirely, if new_block is empty) a
 // marker-delimited block in a config file, leaving everything else in
-// the file untouched.
-inline void replace_marker_block(const std::string& path, const std::string& new_block) {
+// the file untouched. begin/end default to this file's own eth0 markers;
+// ap_control.hpp reuses this same helper with its own distinct markers
+// so both can coexist in the same dnsmasq.conf, each managing only its
+// own interface's block.
+inline void replace_marker_block(const std::string& path, const std::string& new_block,
+                                  const std::string& begin = BEGIN_MARKER, const std::string& end = END_MARKER) {
     std::ifstream in(path);
     std::ostringstream kept;
     std::string line;
     bool in_block = false;
     while (std::getline(in, line)) {
-        if (line == BEGIN_MARKER) { in_block = true; continue; }
-        if (line == END_MARKER) { in_block = false; continue; }
+        if (line == begin) { in_block = true; continue; }
+        if (line == end) { in_block = false; continue; }
         if (!in_block) kept << line << "\n";
     }
     in.close();
@@ -127,7 +137,7 @@ inline void replace_marker_block(const std::string& path, const std::string& new
     std::ofstream out(path, std::ios::trunc);
     out << kept.str();
     if (!new_block.empty()) {
-        out << BEGIN_MARKER << "\n" << new_block << END_MARKER << "\n";
+        out << begin << "\n" << new_block << end << "\n";
     }
 }
 

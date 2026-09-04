@@ -7,7 +7,7 @@ SRCDIR    = src
 
 all: $(TARGET)
 
-$(TARGET): $(SRCDIR)/main.cpp $(SRCDIR)/config.hpp $(SRCDIR)/eth_control.hpp $(SRCDIR)/pico_transport.hpp $(SRCDIR)/relay_control.hpp $(SRCDIR)/victron_control.hpp $(SRCDIR)/wifi_control.hpp $(SRCDIR)/subprocess.hpp
+$(TARGET): $(SRCDIR)/main.cpp $(SRCDIR)/config.hpp $(SRCDIR)/ap_control.hpp $(SRCDIR)/eth_control.hpp $(SRCDIR)/http_server.hpp $(SRCDIR)/mdns_responder.hpp $(SRCDIR)/relay_control.hpp $(SRCDIR)/victron_control.hpp $(SRCDIR)/wifi_control.hpp $(SRCDIR)/subprocess.hpp
 	$(CXX) $(CXXFLAGS) -o $(TARGET) $(SRCDIR)/main.cpp $(LDFLAGS)
 
 install: all

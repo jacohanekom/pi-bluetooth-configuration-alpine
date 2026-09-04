@@ -2,12 +2,12 @@
 pkgname=pi-bluetooth-configuration
 pkgver=1.0.0
 pkgrel=0
-pkgdesc="Configure WiFi over Bluetooth LE (Alpine/OpenRC, Raspberry Pi 3)"
+pkgdesc="Configure WiFi over a fallback access point (Alpine/OpenRC, Raspberry Pi 3)"
 url="https://github.com/jacohanekom/pi-bluetooth-configuration-alpine"
 arch="aarch64"
 license="custom"
 makedepends="openssl-dev pkgconf"
-depends="libcrypto3 wpa_supplicant wpa_supplicant-openrc dhcpcd dhcpcd-openrc iproute2 dnsmasq dnsmasq-openrc iptables"
+depends="libcrypto3 wpa_supplicant wpa_supplicant-openrc dhcpcd dhcpcd-openrc iproute2 dnsmasq dnsmasq-openrc iptables hostapd hostapd-openrc"
 options="!check"
 
 source=""
@@ -17,15 +17,23 @@ builddir="$srcdir"
 # one directory up (this repo's root), not in a source= tarball, since
 # they're part of this same repo rather than a separate upstream project.
 # openssl (libcrypto) is a normal Alpine package -- nothing to vendor or
-# build from source here. No dbus/bluez here at all: the BLE peripheral
-# role lives on a Pico's own BTstack build now (see pico_transport.hpp),
-# connected over USB as a plain serial port.
+# build from source here. No dbus/bluez/BLE here at all: setup is done
+# entirely over the Pi's own onboard WiFi radio -- station mode to join
+# a real network, hostapd-driven AP mode as the fallback when that
+# fails or nothing's configured yet (see ap_control.hpp) -- with a
+# plain HTTP API (http_server.hpp) for a phone to talk to either way,
+# discoverable via a hand-rolled mDNS responder (mdns_responder.hpp)
+# rather than Avahi -- Avahi hard-depends on the `dbus` package in
+# Alpine, which would reintroduce exactly the daemon/service-management
+# surface removed above.
 prepare() {
 	default_prepare
 	cp "$startdir"/../src/main.cpp "$srcdir"/main.cpp
 	cp "$startdir"/../src/config.hpp "$srcdir"/config.hpp
+	cp "$startdir"/../src/ap_control.hpp "$srcdir"/ap_control.hpp
 	cp "$startdir"/../src/eth_control.hpp "$srcdir"/eth_control.hpp
-	cp "$startdir"/../src/pico_transport.hpp "$srcdir"/pico_transport.hpp
+	cp "$startdir"/../src/http_server.hpp "$srcdir"/http_server.hpp
+	cp "$startdir"/../src/mdns_responder.hpp "$srcdir"/mdns_responder.hpp
 	cp "$startdir"/../src/relay_control.hpp "$srcdir"/relay_control.hpp
 	cp "$startdir"/../src/victron_control.hpp "$srcdir"/victron_control.hpp
 	cp "$startdir"/../src/wifi_control.hpp "$srcdir"/wifi_control.hpp

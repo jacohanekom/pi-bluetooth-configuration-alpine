@@ -1,104 +1,69 @@
 # pi-bluetooth-configuration-alpine
 
-Configure a Raspberry Pi 3's WiFi over Bluetooth LE -- no SSH, no keyboard,
-no display. A phone or app connects to the Pi over BLE (no pairing --
-see Security model below), writes an SSID and passphrase, writes
-`connect`, and watches a status characteristic for the result. For
-Raspberry Pi 3 running Alpine Linux (aarch64).
+Configure a Raspberry Pi 3's WiFi using only its own onboard WiFi radio --
+no SSH, no keyboard, no display, no second board, no Bluetooth. On
+startup this daemon tries to join whatever network is already
+configured; if that fails -- including the common case of nothing being
+configured yet -- it switches the radio into its own access point that a
+phone can join directly, reaching a plain HTTP/JSON API to submit real
+credentials. This is the same shape ESP8266/ESP32 "WiFiManager"-style
+devices use for headless setup. For Raspberry Pi 3 running Alpine Linux
+(aarch64).
 
-Built directly on [BlueZ](http://www.bluez.org/)'s D-Bus GATT-peripheral
-API (`org.bluez.GattManager1` / `GattService1` / `GattCharacteristic1` /
-`LEAdvertisement1`) using plain `libdbus` -- no GLib, no sd-bus/systemd
-dependency. WiFi itself is driven through `wpa_cli` (wpa_supplicant's
-control interface) and `dhcpcd`.
+WiFi station mode is driven through `wpa_cli` (wpa_supplicant's control
+interface) and `dhcpcd`; the fallback access point is driven through
+`hostapd` plus a dedicated `dnsmasq` DHCP scope. The HTTP API itself is a
+minimal, dependency-free server over plain POSIX sockets (no framework),
+thread-per-connection. The Pi advertises itself over mDNS/Bonjour (see
+"Discovery" below) so the client app can find it automatically instead
+of requiring its address to be typed in. No Bluetooth, no D-Bus, no
+BlueZ anywhere in this design -- see git history if you're looking for
+the earlier BLE-based revision this replaced.
 
-This is a one-shot provisioning flow, not a managed session. `connect`
-itself doesn't reboot -- it leaves room for one more step, customizing
-`eth0`'s local network configuration, before a `finish` command creates
-`/.successfully-initialized` and reboots the Pi a few seconds later; a
-`forget` removes that file and reboots the same way. There is no
-ongoing management interface beyond BLE -- once WiFi is set up (or torn
-down), the Pi reboots into its normal role rather than staying up to be
-managed further. See "One-shot provisioning and reboot behavior" below.
-
-## Raspberry Pi 3 prerequisite: dbus and bluetooth must be running
-
-The Pi 3's Bluetooth chip (BCM43438) is wired to the SoC over UART, not
-USB. On current Alpine `linux-rpi` kernels this needs **no manual
-`hciattach`/`btattach` step** -- the kernel's own `hci_uart_bcm` serdev
-driver binds to it and loads firmware automatically at boot (look for
-`hci_uart_bcm serial0-0: ...` in `dmesg`). Older guides (including a
-previous revision of this section, and the
-[Alpine wiki's Raspberry Pi 3 Bluetooth page](https://wiki.alpinelinux.org/wiki/Raspberry_Pi_3_-_Setting_Up_Bluetooth))
-describe a manual `hciattach`/`btattach` dance against `/dev/ttyAMA0`;
-on the kernel this was verified against, that tty didn't even exist
-under that name (the PL011 enumerated as `ttyAMA1`) and manual attach
-wasn't needed at all, so try without it first.
-
-What this daemon (and `bluetoothctl`) actually needs running first is
-`dbus` and `bluetooth`:
-
-```sh
-rc-update add dbus default
-rc-service dbus start
-rc-update add bluetooth default
-rc-service bluetooth start
-
-bluetoothctl list   # should print "Controller <mac> ... [default]"
-```
-
-If `dbus` isn't running, `bluetoothctl` doesn't just fail cleanly -- it
-aborts with an assertion inside BlueZ's D-Bus wrapper
-(`dbus_connection_get_object_path_data(): assertion "connection != NULL"
-failed`), which looks alarming but just means "no system bus to connect
-to". Starting `dbus` first fixes it.
-
-This is a one-time platform setup step, independent of this package --
-until `hci0` exists and `dbus`/`bluetooth` are both up, this daemon will
-keep failing to power on the adapter and `supervise-daemon` will just
-keep respawning it every 5s (harmless, just check `rc-service
-pi-bluetooth-configuration status` / the log if it never reports
-advertising). If `bluetoothctl list` shows no controller even with both
-services running, then check `dmesg | grep -iE 'uart|pl011|hci'` for
-`hci_uart_bcm` load failures, and fall back to the manual `hciattach`/
-`btattach` steps on the Alpine wiki page linked above.
+This is a one-shot provisioning flow, not a managed session. Submitting
+credentials while the fallback AP is active necessarily ends that AP (the
+radio can't run station and AP mode at once), so a successful join in
+that case immediately creates `/.successfully-initialized` and reboots
+the Pi a few seconds later; a `forget` removes that file and reboots the
+same way. There is no ongoing management interface beyond this same HTTP
+API -- once WiFi is set up (or torn down), the Pi reboots into its normal
+role rather than staying up to be managed further. See "One-shot
+provisioning and reboot behavior" below.
 
 ## How it verifies
 
-CI (GitHub Actions) compiles this against Alpine's real `dbus-dev` and
-`openssl-dev` headers on every push, which catches D-Bus API misuse and
-build breakage. It cannot exercise the actual runtime behavior, though --
-there's no Bluetooth radio, no `bluetoothd`, and no WiFi interface in a
-GitHub Actions container. **The BLE GATT flow and the WiFi join itself
-have only been verified by code review and on one physical Pi 3, not
-broadly.** Test on your own hardware before relying on this for
-unattended provisioning.
+CI (GitHub Actions) compiles this against Alpine's real `openssl-dev`
+headers on every push, which catches build breakage, and separately
+reproduces the exact `.apk` build (via `abuild`/`alpine/APKBUILD`),
+which additionally catches missing runtime dependencies (like
+`hostapd`/`hostapd-openrc`) and packaging mistakes. Neither can exercise
+the actual runtime behavior, though -- there's no WiFi radio, no
+`hostapd`, and no real network interface in a GitHub Actions container.
+**The AP-fallback flow and the WiFi join itself have only been verified
+by code review and on one physical Pi 3, not broadly.** Test on your own
+hardware before relying on this for unattended provisioning.
 
 ## Security model
 
-**No pairing, no encryption on BLE.** WiFi credentials (SSID and
-passphrase) cross the BLE link in the clear to any device that connects
-during the provisioning window -- there is no authentication or
-encryption gate at all on this GATT service. This is a deliberate
-trade-off, not an oversight: an earlier revision required BLE
-pairing/bonding ("Just Works", since a headless Pi has no display or
-keyboard to confirm a passkey with), but bonding on the Pi 3's BCM43438
-proved unreliable enough in practice -- bond state going out of sync
-between BlueZ and the central after either side's pairing record was
-reset, manifesting as repeated OS-level "Connection Request" prompts and
-CoreBluetooth's `peerRemovedPairingInformation` error -- that it wasn't
-worth what "Just Works" pairing actually protected against in the first
-place (which was already only passive eavesdropping, not an active
-attacker, per the same trade-off most headless BLE-provisioned IoT
-devices make).
+**No authentication, no encryption, on either the fallback AP or the
+HTTP API.** The AP itself is open (no password), and every HTTP request
+is plain unauthenticated HTTP -- WiFi credentials cross both the AP's own
+air interface and this API in the clear to anyone in range during the
+provisioning window. This is a deliberate trade-off, not an oversight:
+requiring a password just to reach the setup flow that hands out the
+real network's password in the clear anyway wouldn't add meaningful
+protection, just friction, and TLS with no sensible way to provision a
+trusted certificate onto a headless device buys little over plain HTTP
+here either.
 
 Practical implication: **only use this on a trusted home/lab network,
-during a provisioning window you control.** Anyone with a BLE-capable
-device in range during that window can read the Pi's current WiFi status
-or push new credentials to it. If you need real access control, put the
-Pi somewhere physically private while provisioning, or don't leave
-`pi-bluetooth-configuration` running/advertising outside of the moments
-you're actively using it.
+during a provisioning window you control.** Anyone in WiFi range during
+that window can join the fallback AP, read the Pi's current status, or
+push new credentials to it. If you need real access control, put the Pi
+somewhere physically private while provisioning, or don't leave it in
+fallback-AP mode outside of the moments you're actively using it (it
+only enters that mode automatically when it can't join a configured
+network, so this mainly means: configure it promptly).
 
 SSID and password bytes never pass through a shell: `wifi_control.hpp`
 hands `wpa_cli` hex-encoded SSIDs and a PSK it derives itself
@@ -113,20 +78,35 @@ control-interface quoting rules entirely.
 
 This daemon isn't meant to stay up managing an active WiFi connection --
 its only job is to get the Pi onto a network (or off one) and then get
-out of the way:
+out of the way. `POST /connect`'s exact behavior depends on whether the
+fallback AP is currently active, because of a hard hardware constraint:
+this radio can't run AP and station mode at once, so submitting real
+credentials while the AP is active necessarily severs the phone's own
+connection to this daemon (reached via the AP) the moment the radio
+switches over -- there's no way to keep serving that same phone a
+"did it work" answer afterward.
 
-- **`connect` succeeds** (`Status` reports `state=connected` with a
-  non-empty `ip`): does *not* reboot by itself -- `EthernetIP` stays
-  writable for one more optional step (customizing `eth0`'s local
-  network configuration) before the client sends `finish`.
-- **`finish`**: only takes effect if WiFi is actually connected (a
+- **If the fallback AP is active** (fresh setup, or the previously
+  configured network couldn't be joined): `POST /connect` acknowledges
+  the request immediately, then on a background thread tears the AP
+  down and attempts to join the given network. On success, this
+  immediately creates `/.successfully-initialized` and reboots -- there's
+  no separate `finish` step in this path, since by the time the outcome
+  is known the AP (and the phone's only path to this daemon) is already
+  gone. On failure, the AP is restarted so the phone has something to
+  reconnect to and retry against.
+- **If the AP is *not* active** (already on a real network, e.g.
+  reconfiguring): `POST /connect` joins the given network without
+  marking setup finished or rebooting -- `POST /ethernet` stays available
+  for one more optional step (customizing `eth0`'s local network
+  configuration) before the client sends `POST /finish`.
+- **`POST /finish`**: only takes effect if WiFi is actually connected (a
   no-op, logged, otherwise). Creates `/.successfully-initialized` (an
   empty marker file at the filesystem root), waits 3 seconds (enough
-  time for that final `Status` notification to actually reach the BLE
-  client before the connection drops), then reboots the Pi. This is
-  what actually concludes the wizard.
-- **`forget`**: removes `/.successfully-initialized` if present, then
-  reboots the same way (also after the 3-second delay).
+  time for the HTTP response to actually reach the client before the
+  connection drops), then reboots the Pi.
+- **`POST /forget`**: removes `/.successfully-initialized` if present,
+  then reboots the same way (also after the 3-second delay).
 
 `/.successfully-initialized` is meant for other boot-time scripts/units
 on the Pi to check (`test -f /.successfully-initialized`) to know
@@ -135,9 +115,12 @@ itself doesn't read it back.
 
 The reboot is a plain `reboot` (no shell, via the same argv-array
 `run_command` helper used for `wpa_cli`/`dhcpcd`), which goes through
-OpenRC's normal shutdown sequence. Expect the BLE connection (and this
+OpenRC's normal shutdown sequence. Expect the HTTP connection (and this
 daemon along with it) to disappear a few seconds after either action --
-that's expected, not a crash.
+that's expected, not a crash. If the phone was on the fallback AP when
+this happened, it will need to rejoin its regular WiFi network (or the
+newly-configured one, once the Pi finishes rebooting onto it) to reach
+the Pi again.
 
 ## Ethernet direct-connect
 
@@ -163,16 +146,17 @@ leave `eth0` alone entirely (`denyinterfaces`), removing the carrier
 dependency altogether.
 
 This is customizable for as long as the setup wizard hasn't finished --
-which includes the window right after WiFi connects but before `finish`
-is sent, the wizard's "local network configuration" step: write
-`"<ip>,<rangeStart>,<rangeEnd>"` (e.g. `"192.168.4.1,2,200"`) to
-`EthernetIP`, then write `set_ethernet` to `Command`, to replace the
-gateway IP and DHCP range with new ones. **Once `finish` actually runs,
-the daemon rejects further `set_ethernet` writes** (logged, no-op) --
-at that point Ethernet's job is done being reconfigurable, so its
-config is left alone. Reading `EthernetIP` at any time returns the same
-`"ip,rangeStart,rangeEnd"` format reflecting whatever's actually live
-on `eth0` right now, regardless of which state you're in.
+which includes the whole time the fallback AP is active, and (when it
+wasn't needed) the window right after WiFi connects but before `POST
+/finish` is sent: `POST /ethernet` with `{"ip":...,"rangeStart":...,
+"rangeEnd":...}` (e.g. `{"ip":"192.168.4.1","rangeStart":2,"rangeEnd":200}`)
+replaces the gateway IP and DHCP range with new ones. **Once setup
+actually finishes, the daemon rejects further `POST /ethernet` calls**
+(logged, no-op) -- at that point Ethernet's job is done being
+reconfigurable, so its config is left alone. `GET /ethernet` (or the
+`eth` field of `GET /status`) at any time returns
+`{"ip":...,"rangeStart":...,"rangeEnd":...}` reflecting whatever's
+actually live on `eth0` right now, regardless of which state you're in.
 
 This exists because plugging a WiFi-configured Pi into the same LAN over
 Ethernet at the same time as testing WiFi can produce exactly the kind
@@ -182,11 +166,13 @@ its own dedicated, isolated subnet sidesteps that entirely, and doubles
 as a "plug in directly with a laptop" recovery path if WiFi is ever
 misconfigured.
 
-Unlike WiFi, applying/changing this doesn't reboot the Pi: Ethernet
-doesn't share the Pi 3's antenna with Bluetooth, so there's no
-coexistence problem forcing a clean restart, and the change
+Unlike a WiFi network change, applying/changing this doesn't reboot the
+Pi: eth0 is entirely independent of whatever wlan0 is doing, so there's
+no coexistence problem forcing a clean restart, and the change
 (`dhcpcd`/`dnsmasq` restarted directly) takes effect within a couple of
-seconds.
+seconds. WiFi's own connect/forget/finish flows reboot by deliberate
+design choice, not hardware necessity -- see "One-shot provisioning and
+reboot behavior" above.
 
 The chosen IP and DHCP range persist in a plain state file
 (`/etc/pi-bluetooth-configuration/eth0-static-ip`, `"ip,rangeStart,rangeEnd"`)
@@ -195,13 +181,12 @@ so they survive reboots (`ip addr add` on its own doesn't);
 feature's config, as a `# BEGIN pi-bluetooth-configuration eth0 static`
 / `# END ...` delimited block inside `/etc/dhcpcd.conf`.
 
-**Allocated IPs**: `DhcpLeases` (read + notify) reports whatever's
+**Allocated IPs**: the `leases` field of `GET /status` reports whatever's
 currently in dnsmasq's own leases file
 (`/var/lib/misc/dnsmasq.leases`) as JSON --
 `[{"ip":...,"mac":...,"hostname":...}, ...]` -- so the app can show
-which devices are actually plugged into `eth0` right now. A background
-thread polls that file every 5 seconds and only notifies when it
-actually changes.
+which devices are actually plugged into `eth0` right now, read fresh on
+every poll.
 
 **DNS**: `dnsmasq` also answers DNS queries from `eth0` clients (not
 just DHCP), forwarding them upstream using whatever nameservers are in
@@ -267,22 +252,22 @@ yourself.
 
 A separate, optional integration with
 [pi-relay-control-alpine](https://github.com/jacohanekom/pi-relay-control-alpine),
-letting the same BLE app that provisions WiFi also flip relays on the
-Pi -- no separate BLE service or app needed for something as simple as
+letting the same app that provisions WiFi also flip relays on the
+Pi -- no separate app or protocol needed for something as simple as
 turning a light or a fan on and off.
 
 This daemon doesn't drive GPIO itself and has no idea what's wired to
 which pin -- it's a thin TCP client that forwards `on`/`off`/`status` to
 whichever port pi-relay-control-alpine has that relay listening on
 (`127.0.0.1:<port>`, the same protocol `nc` uses -- see that repo's
-README), and reports the result back over BLE.
+README), and reports the result back over HTTP.
 
 Relay control is no part of the provisioning wizard -- it only works
-once setup has actually finished (`finish` has run and
-`/.successfully-initialized` exists). Before that, `relay <port> on|off`
-is rejected (logged, no-op) and `Relays` reports an empty list, without
-even querying pi-relay-control-alpine: that daemon's own `start_pre()`
-gate (see its README, "Requires device provisioning") means nothing is
+once setup has actually finished (`/.successfully-initialized` exists).
+Before that, `POST /relay` is rejected (logged, no-op, `ok:false`) and
+the `relays` field of `GET /status` reports an empty list, without even
+querying pi-relay-control-alpine: that daemon's own `start_pre()` gate
+(see its README, "Requires device provisioning") means nothing is
 listening on those ports yet anyway. This mirrors where the client app
 surfaces the feature too -- alongside WiFi/network stats on the
 post-setup details screen, not as a step in the wizard.
@@ -304,32 +289,34 @@ pi-relay-control-alpine's own `/etc/pi-relay-control.conf` -- this file
 only needs the port and a free-text display label, since GPIO wiring is
 that other daemon's concern, not this one's. Restart after changes:
 `rc-service pi-bluetooth-configuration restart`. Leave `[relays]` empty
-(or omit it) if pi-relay-control-alpine isn't installed -- the `Relays`
-characteristic then just reports an empty list.
+(or omit it) if pi-relay-control-alpine isn't installed -- the `relays`
+field of `GET /status` then just reports an empty list.
 
-**Protocol**: once setup has finished, write `relay <port> on` or
-`relay <port> off` to `Command`, then read (or subscribe to
-notifications on) `Relays` for the result -- see "Relays JSON" below. A
-background thread also polls every configured relay's state every 5
-seconds (again, only once setup has finished) and notifies on change,
-so a connected client sees relays toggled from elsewhere (another
-client, `always_on` resuming after pi-relay-control-alpine restarts,
-etc.) without having to write anything itself first.
+**Protocol**: once setup has finished, `POST /relay` with
+`{"port":7778,"state":"on"}` (or `"off"`) -- the response includes the
+freshly-queried `relays` array immediately, so the client gets an
+authoritative update without waiting for its next `GET /status` poll --
+see "Relays JSON" below. `GET /status` itself also queries every
+configured relay's live state fresh on every call (no caching), so a
+client polling it sees relays toggled from elsewhere (another client,
+`always_on` resuming after pi-relay-control-alpine restarts, etc.)
+without having to act itself first.
 
 **Failure handling**: if pi-relay-control-alpine isn't running, isn't
 installed, or the configured port doesn't match its config, a `relay`
-command or a `Relays` read just reports that relay's `state` as
+command or a status query just reports that relay's `state` as
 `unknown` (logged on the daemon's side) -- it never blocks or crashes
-the BLE service over it. Each TCP round-trip is capped at a 2-second
-timeout, since it's loopback traffic that should be near-instant if the
-other daemon is actually up.
+the HTTP server over it (each connection is its own thread -- see "HTTP
+API" below). Each TCP round-trip is capped at a 2-second timeout, since
+it's loopback traffic that should be near-instant if the other daemon
+is actually up.
 
 ## Victron solar/battery telemetry
 
 Another separate, optional integration, this time with
 [victron-ve-direct-alpine](https://github.com/jacohanekom/victron-ve-direct-alpine),
 which reads a Victron device over its VE.Direct serial protocol. This
-lets the same BLE app that provisions WiFi also show the latest
+lets the same app that provisions WiFi also show the latest
 solar/battery reading, no separate app or LAN access needed. This
 integration targets MPPT solar chargers specifically -- see "Victron
 JSON" below for the fields it does (and deliberately doesn't) carry.
@@ -337,14 +324,14 @@ JSON" below for the fields it does (and deliberately doesn't) carry.
 This daemon doesn't talk VE.Direct itself -- it queries
 victron-ve-direct-alpine's status control port (`echo status | nc
 127.0.0.1 <port>`, the same one its own README documents) and republishes
-the reply as JSON on the `Victron` characteristic, using the same field
-names as that project's own `data_port` telemetry frames (see its
+the reply as JSON in the `victron` field of `GET /status`, using the same
+field names as that project's own `data_port` telemetry frames (see its
 README's "JSON output") so there's only one schema to learn across both
 projects.
 
 Unlike relay control, this is read-only -- there's no action to gate
-behind setup finishing, just a reading to show or not. `Victron` is live
-from the moment this daemon starts, regardless of wizard state; the app
+behind setup finishing, just a reading to show or not. It's live from
+the moment this daemon starts, regardless of wizard state; the app
 simply chooses to display it on the same post-setup screen as
 WiFi/network stats and relays, not because the daemon requires it.
 
@@ -364,94 +351,148 @@ victron-ve-direct-alpine's own `config.ini` -- `8562` is that project's
 own default, so the two match out of the box if neither is customized.
 Restart after changes: `rc-service pi-bluetooth-configuration restart`.
 
-**Protocol**: read (or subscribe to notifications on) `Victron` -- see
-"Victron JSON" below. A background thread polls it every 5 seconds and
-notifies on change, so a connected client's Solar/Battery view updates
-on its own.
+**Protocol**: read the `victron` field of `GET /status` -- see "Victron
+JSON" below. Queried fresh on every poll (no caching), so a client's
+Solar/Battery view updates on its own as it keeps polling.
 
 **Failure handling**: if victron-ve-direct-alpine isn't running, isn't
 installed, the configured port doesn't match its config, or it's up but
-hasn't synced a frame from the VE.Direct device yet, `Victron` just
-reports `{"connected":false}` -- it never blocks or crashes the BLE
-service over it. Each TCP round-trip is capped at a 2-second timeout,
-same as relay control.
+hasn't synced a frame from the VE.Direct device yet, this just reports
+`{"connected":false}` -- it never blocks or crashes the HTTP server over
+it. Each TCP round-trip is capped at a 2-second timeout, same as relay
+control.
 
-## GATT service
+## Discovery (mDNS/Bonjour)
 
-Custom 128-bit UUIDs (no existing SIG profile fits this):
+This daemon advertises itself over multicast DNS (RFC 6762/6763 -- the
+protocol Apple calls Bonjour) as `<serial>._aipicam._tcp.local.`, where
+`<serial>` is this Pi's own hardware serial number, same as the fallback
+AP's own SSID (see "One-shot provisioning and reboot behavior" above) --
+so a client app can find it automatically (iOS's `NWBrowser`, or any
+other mDNS-aware client) instead of requiring its address to be typed
+in, on whichever network (the fallback AP, or a real one once joined) it
+happens to be reachable on.
 
-| Characteristic | UUID | Properties | Contents |
-|---|---|---|---|
-| Service | `7b1e0000-6a45-4d1f-9b0a-3c2f8e4d5a10` | -- | -- |
-| SSID | `7b1e0001-6a45-4d1f-9b0a-3c2f8e4d5a10` | write | UTF-8 network name |
-| Password | `7b1e0002-6a45-4d1f-9b0a-3c2f8e4d5a10` | write | UTF-8 passphrase (omit/empty for open networks) |
-| Command | `7b1e0003-6a45-4d1f-9b0a-3c2f8e4d5a10` | write | ASCII: `scan` \| `connect` \| `forget` \| `set_ethernet` \| `finish` \| `relay <port> on\|off` (`relay` only takes effect after `finish` runs) |
-| Status | `7b1e0004-6a45-4d1f-9b0a-3c2f8e4d5a10` | read + notify | JSON, see below |
-| ScanResults | `7b1e0005-6a45-4d1f-9b0a-3c2f8e4d5a10` | read + notify | JSON array, see below |
-| EthernetIP | `7b1e0006-6a45-4d1f-9b0a-3c2f8e4d5a10` | read + write + notify | ASCII `"ip,rangeStart,rangeEnd"`, see "Ethernet direct-connect" (write only takes effect before `finish` runs) |
-| DhcpLeases | `7b1e0007-6a45-4d1f-9b0a-3c2f8e4d5a10` | read + notify | JSON array, see "Ethernet direct-connect" |
-| Relays | `7b1e0008-6a45-4d1f-9b0a-3c2f8e4d5a10` | read + notify | JSON array, see "Relay control" (reports `[]` until `finish` has run) |
-| Victron | `7b1e0009-6a45-4d1f-9b0a-3c2f8e4d5a10` | read + notify | JSON, see "Victron solar/battery telemetry" (live regardless of `finish`) |
+Hand-rolled over a plain UDP multicast socket (`src/mdns_responder.hpp`)
+rather than using [Avahi](https://avahi.org/), the standard tool for
+this on Linux: Avahi hard-depends on the `dbus` package in Alpine
+(`avahi-openrc` requires it), which would reintroduce exactly the extra
+daemon/service-management surface this project spent real effort
+removing when BLE/BlueZ went away (see git history). This implementation
+covers only what's needed to advertise this one fixed service and
+answer queries for it -- it's not a general mDNS stack, and this daemon
+never itself browses or resolves anything else on the network.
 
-No pairing/encryption gates any of these -- see Security model above.
-SSID/Password are still write-only (no read) purely so a second BLE
-client can't fetch back a passphrase the first one staged; it's not a
-security boundary against a client that's actually listening in on the
-writes themselves.
+Advertised on every active network interface (normally both `wlan0` and
+`eth0` at once -- see "Ethernet direct-connect" above), re-announcing
+automatically whenever this Pi's own set of IPv4 addresses changes
+(WiFi joining/leaving, the fallback AP starting/stopping, Ethernet being
+plugged in) so a client already browsing notices without needing to
+requery. No pairing/encryption here either -- same trust model as
+everything else in this daemon (see Security model above): anyone on
+the network can see this Pi advertised and resolve its address.
+
+**Verification**: the DNS message encoding itself (`write_name`,
+`parse_questions`, `build_full_response`, etc. in `mdns_responder.hpp`)
+was checked directly against Apple's own `dns-sd` command-line tool (the
+same underlying stack iOS's `NWBrowser` uses) on a Mac before being
+wired into the Linux-only multicast socket layer that actually ships --
+`dns-sd -B _aipicam._tcp local.` (browse), `dns-sd -L <serial>
+_aipicam._tcp local.` (resolve to host:port), and `dns-sd -B
+_services._dns-sd._udp local.` (the generic "what services exist here"
+meta-query) all round-tripped correctly. The socket layer itself (which
+interfaces to join on, `IP_PKTINFO`-based per-interface replies) is
+Linux-specific and, like the rest of this daemon's networking code
+(`ap_control.hpp`, `hostapd`), can only be exercised at runtime on
+actual Pi hardware -- CI only proves it compiles.
+
+## HTTP API
+
+Plain JSON over HTTP/1.1, no authentication (see Security model above).
+Every response closes the connection (no keep-alive); a request body, if
+any, must be a flat JSON object -- no nesting, matching exactly what
+these routes need.
+
+| Route | Body | Response |
+|---|---|---|
+| `GET /status` | -- | Combined snapshot: `wifi`, `apActive`, `eth`, `leases`, `relays`, `victron`, `scan` -- see "Status JSON" below. No server push (no BLE-style notify): poll this periodically instead. |
+| `POST /scan` | -- | `{"ok":true}` immediately; triggers a background scan (~4s). Poll `GET /status`'s `scan` field for results. |
+| `POST /connect` | `{"ssid":...,"password":...}` (omit/empty password for an open network) | `{"ok":true}` immediately; see "One-shot provisioning and reboot behavior" above for what happens next, which differs depending on whether the fallback AP is currently active. |
+| `POST /forget` | -- | `{"ok":true}` immediately; forgets the configured network and reboots a few seconds later. |
+| `POST /finish` | -- | `{"ok":true}` immediately; only takes effect if WiFi is connected and the fallback AP isn't active (see above) -- concludes setup and reboots. |
+| `GET /ethernet` | -- | `{"ip":...,"rangeStart":...,"rangeEnd":...}` -- eth0's current gateway config. |
+| `POST /ethernet` | `{"ip":...,"rangeStart":...,"rangeEnd":...}` | `{"ok":true}`; see "Ethernet direct-connect" (rejected once setup has finished). |
+| `POST /relay` | `{"port":...,"state":"on"\|"off"}` | `{"ok":bool,"relays":[...]}` -- see "Relay control" (rejected until setup has finished). |
 
 ### Protocol
 
-1. Connect to the Pi over BLE (no pairing step -- connecting is enough).
-2. Optionally write `scan` to Command, wait ~5s, then read (or subscribe
-   to notifications on) ScanResults for a picklist.
-3. Write the network name to SSID, the passphrase to Password (skip this
-   write entirely for an open network), then write `connect` to Command.
-4. Subscribe to Status notifications (or poll by reading it) until
-   `state` is `connected` or `failed`. A successful connect does *not*
-   reboot the Pi by itself.
-5. Optionally customize the local network: write
-   `"<ip>,<rangeStart>,<rangeEnd>"` to EthernetIP, then write
-   `set_ethernet` to Command (see "Ethernet direct-connect").
-6. Write `finish` to Command. This is what actually concludes setup:
-   expect the Pi to reboot (and BLE to disconnect) a few seconds later
-   -- see "One-shot provisioning and reboot behavior" below.
+1. Join the Pi's fallback AP (its own hardware serial as the SSID, no
+   password) if it's advertising one, or otherwise reach the Pi on
+   whatever network it's already on.
+2. Optionally `POST /scan`, wait ~5s, then check `GET /status`'s `scan`
+   field for a picklist.
+3. `POST /connect` with the chosen `ssid`/`password`.
+4. Poll `GET /status` until `wifi.state` is `connected` or `failed`.
+   What happens next depends on `apActive` at the time `/connect` was
+   called -- see "One-shot provisioning and reboot behavior" above. If
+   the AP was active, expect to lose the connection to the Pi entirely
+   at this point (the AP goes away as part of joining the real network) --
+   there is no further polling to do from this same network path.
+5. If the AP was *not* active (already on a real network, reconfiguring):
+   optionally customize the local network with `POST /ethernet`, then
+   `POST /finish` to conclude setup -- expect the Pi to reboot a few
+   seconds later.
 
 ### Status JSON
 
-```json
-{"state":"connected","ssid":"MyWifi","ip":"192.168.1.42","error":"","finished":false}
-```
-
-`finished` reflects whether `/.successfully-initialized` exists --
-i.e. whether a previous `finish` already completed. A client should use
-this, not just `state`, to decide whether to show the setup wizard or
-the final read-only details screen: a Pi that's mid-wizard (WiFi just
-joined, `finish` not sent yet) also reports `state:"connected"`.
-
-`state` is one of `idle`, `scanning`, `connecting`, `connected`, `failed`.
-
-This reflects wpa_supplicant's actual live state. Rather than checking
-just once at startup (which can race wpa_supplicant still finishing a
-reconnect and cache a stale `idle` forever after), every read lazily
-re-queries `wpa_cli status` for as long as this process hasn't yet
-tracked a definite state of its own -- so if WiFi was already connected
-before this daemon started (e.g. the Pi just rebooted and wpa_supplicant
-reconnected on its own), `Status` correctly reports `connected` on the
-first read, however long after startup that read happens to occur. Once
-this process performs its own `connect`/`forget`, that takes over and
-the live re-check stops, so it never overwrites an in-progress
-`connecting` state with something stale from wpa_supplicant mid-change.
-
-### ScanResults JSON
+`GET /status` returns:
 
 ```json
-[{"ssid":"MyWifi","rssi":-52,"security":"WPA2"},
- {"ssid":"Neighbour","rssi":-81,"security":"WPA2"}]
+{
+  "wifi": {"state":"connected","ssid":"MyWifi","ip":"192.168.1.42","error":"","finished":false},
+  "apActive": false,
+  "eth": {"ip":"192.168.4.1","rangeStart":2,"rangeEnd":200},
+  "leases": [{"ip":"192.168.4.55","mac":"...","hostname":"laptop"}],
+  "relays": [{"port":7778,"label":"Camera","state":"on"}],
+  "victron": {"connected": false},
+  "scan": [{"ssid":"MyWifi","rssi":-52,"security":"WPA2"}]
+}
 ```
 
-Sorted strongest-first, deduplicated by SSID, capped at
+`wifi.finished` reflects whether `/.successfully-initialized` exists --
+i.e. whether setup has already completed. A client should use this, not
+just `wifi.state`, to decide whether to show the setup wizard or the
+final read-only details screen: a Pi that's mid-wizard (WiFi just
+joined, not finished yet) also reports `wifi.state:"connected"`.
+
+`wifi.state` is one of `idle`, `scanning`, `connecting`, `connected`,
+`failed`. This reflects wpa_supplicant's actual live state. Rather than
+checking just once at startup (which can race wpa_supplicant still
+finishing a reconnect and cache a stale `idle` forever after), every
+read lazily re-queries `wpa_cli status` for as long as this process
+hasn't yet tracked a definite state of its own -- so if WiFi was already
+connected before this daemon started (e.g. the Pi just rebooted and
+wpa_supplicant reconnected on its own), `wifi.state` correctly reports
+`connected` on the first read, however long after startup that read
+happens to occur. Once this process performs its own connect/forget,
+that takes over and the live re-check stops, so it never overwrites an
+in-progress `connecting` state with something stale from wpa_supplicant
+mid-change.
+
+`apActive` reflects whether the fallback access point is currently
+running (see "One-shot provisioning and reboot behavior" above).
+
+`scan` is sorted strongest-first, deduplicated by SSID, capped at
 `scan.max_results` (default 10). Hidden networks (blank SSID in the scan)
-are omitted since there's nothing to show for them.
+are omitted since there's nothing to show for them. Starts as `[]` until
+the first `POST /scan` completes.
+
+`eth` and `leases` are documented in "Ethernet direct-connect" above,
+`relays` in "Relay control", `victron` in "Victron solar/battery
+telemetry" -- all computed fresh on every `GET /status` call (no
+server-side caching), since a slow query only ever delays this one
+request, not a shared dispatch thread (this server is
+thread-per-connection).
 
 ### Relays JSON
 
@@ -499,26 +540,21 @@ this integration's hardware -- neither is modeled here at all since
 there's nothing informative in either for this integration's target
 hardware.
 
-### A note on message size
-
-GATT characteristic values top out at 512 bytes (the spec limit), and
-`ReadValue` honours BlueZ's `offset` option so long values are delivered
-correctly via BlueZ's own read-blob mechanism -- no custom chunking
-protocol needed on either side. `scan.max_results` defaults to 10 to stay
-comfortably within that limit even with longer SSIDs.
-
 ## Install the .apk (recommended)
 
 Every push builds `pi-bluetooth-configuration-aarch64.apk` (GitHub
 Actions artifact; tagged `v*` pushes also attach it to a GitHub Release),
 built via `abuild` from [`alpine/APKBUILD`](alpine/APKBUILD). It installs
-cleanly with `apk`, pulling in `dbus`, `bluez`, `wpa_supplicant`,
-`dhcpcd`, `dnsmasq`, and `iptables` (plus their OpenRC services, where
-applicable) automatically. `dnsmasq` is started automatically the first
-time the daemon applies `eth0`'s default gateway IP (see "Ethernet
-direct-connect") -- no need to enable it manually. `iptables` needs no
-service of its own; the daemon applies its NAT rules itself at startup
-(see "Internet sharing (eth0 -> WiFi)").
+cleanly with `apk`, pulling in `wpa_supplicant`, `dhcpcd`, `dnsmasq`,
+`iptables`, and `hostapd` (plus their OpenRC services, where applicable)
+automatically. `dnsmasq` is started automatically the first time the
+daemon applies `eth0`'s default gateway IP (see "Ethernet
+direct-connect") -- no need to enable it manually. `hostapd` is
+deliberately *not* enabled at boot -- this daemon starts/stops it itself,
+dynamically, as it enters/leaves fallback-AP mode (see "One-shot
+provisioning and reboot behavior" above). `iptables` needs no service of
+its own; the daemon applies its NAT rules itself at startup (see
+"Internet sharing (eth0 -> WiFi)").
 
 It's signed with a throwaway key generated fresh in CI each run (there's
 no distributed repo to establish trust for), so install with
@@ -527,13 +563,9 @@ no distributed repo to establish trust for), so install with
 ```sh
 apk add --allow-untrusted ./pi-bluetooth-configuration-aarch64.apk
 
-rc-update add dbus default
-rc-update add bluetooth default
 rc-update add wpa_supplicant default
 rc-update add pi-bluetooth-configuration default
 
-rc-service dbus start
-rc-service bluetooth start
 rc-service wpa_supplicant start
 rc-service pi-bluetooth-configuration start
 ```
@@ -547,7 +579,7 @@ Every push builds `pi-bluetooth-configuration-alpine-aarch64.tar.gz`
 Release).
 
 ```sh
-apk add dbus dbus-openrc bluez bluez-openrc wpa_supplicant wpa_supplicant-openrc dhcpcd dhcpcd-openrc iproute2 dnsmasq dnsmasq-openrc iptables
+apk add wpa_supplicant wpa_supplicant-openrc dhcpcd dhcpcd-openrc iproute2 dnsmasq dnsmasq-openrc iptables hostapd hostapd-openrc
 
 tar xzf pi-bluetooth-configuration-alpine-aarch64.tar.gz
 cd pi-bluetooth-configuration-alpine-aarch64
@@ -563,27 +595,33 @@ rc-service pi-bluetooth-configuration start
 ## Build from source
 
 ```sh
-apk add build-base dbus-dev openssl-dev pkgconf iptables
+apk add build-base openssl-dev pkgconf iptables hostapd
 
 make
 sudo make install               # installs to /usr/bin, /etc, /etc/init.d
 ```
 
-`iptables` is a runtime dependency, not a build one -- listed here too
-since a from-source build doesn't otherwise pull it in automatically the
-way the `.apk` does.
+`iptables`/`hostapd` are runtime dependencies, not build ones -- listed
+here too since a from-source build doesn't otherwise pull them in
+automatically the way the `.apk` does.
 
 ## Configuration
 
 Edit `/etc/pi-bluetooth-configuration/config.ini`:
 
 ```ini
-[bluetooth]
-adapter          = hci0
-device_name      = pi-bluetooth-configuration
+[http]
+port             = 8080
 
 [wifi]
 interface        = wlan0
+device_name      = pi-bluetooth-configuration
+connect_timeout_secs = 20
+
+[ap]
+ip               = 192.168.5.1
+dhcp_range_start = 2
+dhcp_range_end   = 200
 
 [ethernet]
 interface        = eth0
@@ -606,18 +644,26 @@ ctrl_port  = 8562
 "Victron solar/battery telemetry" above for the formats and what they
 integrate with.
 
-`device_name` is only a fallback. The advertised BLE name is normally
-the board's own hardware serial number (read from `/proc/cpuinfo` at
-startup), not this configured string -- so a client's device list shows
-which physical Pi is which instead of the same name for every unit.
-`device_name` is used as-is only when a serial can't be read (e.g. not
-running on real Pi hardware).
+`[wifi]`'s `device_name` is only a fallback. The fallback AP's SSID is
+normally the board's own hardware serial number (read from
+`/proc/cpuinfo` at startup), not this configured string -- so a client's
+WiFi network list shows which physical Pi is which instead of the same
+name for every unit. `device_name` is used as-is only when a serial
+can't be read (e.g. not running on real Pi hardware).
+`connect_timeout_secs` is how long to wait, on startup, for
+wpa_supplicant to join whatever's already configured before giving up
+and starting the fallback AP instead.
+
+`[ap]`'s subnet is deliberately distinct from `[ethernet]`'s so the two
+can never collide if a client happens to be on both eth0 and the
+fallback AP at once.
 
 `wpa_supplicant` must already be running against the same interface with
 a control socket (`ctrl_interface=/var/run/wpa_supplicant` and
 `update_config=1` in `/etc/wpa_supplicant/wpa_supplicant.conf`) -- this
 daemon talks to it via `wpa_cli`, it doesn't start or own
-`wpa_supplicant` itself.
+`wpa_supplicant` itself (though it does briefly stop/start it around
+entering/leaving fallback-AP mode -- see `ap_control.hpp`).
 
 Restart after changes: `rc-service pi-bluetooth-configuration restart`
 
@@ -631,12 +677,20 @@ rc-update add pi-bluetooth-configuration default   # start on boot
 rc-service pi-bluetooth-configuration status
 ```
 
-Runs as root (it needs to reconfigure the adapter and WiFi), respawns
-automatically on failure (5s delay, unlimited retries, via
-`supervise-daemon`), and logs to `/var/log/pi-bluetooth-configuration.log`.
+Runs as root (it needs to reconfigure the WiFi radio, run hostapd, and
+edit network config files), respawns automatically on failure (5s delay,
+unlimited retries, via `supervise-daemon`), and logs to
+`/var/log/pi-bluetooth-configuration.log`.
 
 ## Known limitations (v1)
 
+- **No AP+station concurrency.** This radio can only be in station mode
+  or AP mode at once, never both -- a hard hardware/driver constraint,
+  not a design choice. This is why `POST /connect` behaves differently
+  depending on whether the fallback AP is active (see "One-shot
+  provisioning and reboot behavior" above), and why a phone loses its
+  connection to the Pi partway through submitting fresh credentials in
+  that case.
 - **Single active network.** `connect`/`forget` clear *every* network
   wpa_supplicant currently knows about (queried live via
   `wpa_cli list_networks`, not tracked in-process) before acting --
@@ -650,7 +704,8 @@ automatically on failure (5s delay, unlimited retries, via
 - **Scan is a fixed 4s sleep-then-fetch**, not an event-driven wait for
   `CTRL-EVENT-SCAN-RESULTS`. Simple and reliable, if not instant.
 - **No authentication or encryption at all** -- see Security model
-  above. The BLE service is wide open to anyone who can reach it.
+  above. Both the fallback AP and the HTTP API are wide open to anyone
+  who can reach them.
 - **Reboots unconditionally on success/forget**, with no way to opt out
   short of editing `src/main.cpp`. If you need the daemon to stay up
   afterward for some other purpose, remove the `reboot_after_delay()`

@@ -1,7 +1,7 @@
 #!/sbin/openrc-run
 
 name="pi-bluetooth-configuration"
-description="Configure WiFi over Bluetooth LE"
+description="Configure WiFi over a fallback access point"
 
 command="/usr/bin/pi-bluetooth-configuration"
 command_args="--config /etc/pi-bluetooth-configuration/config.ini"
@@ -16,14 +16,15 @@ output_log="/var/log/${RC_SVCNAME}.log"
 error_log="/var/log/${RC_SVCNAME}.log"
 
 depend() {
-    # No dbus/bluetooth need here -- the BLE peripheral role lives on a
-    # Pico's own BTstack build now (see src/pico_transport.hpp),
-    # connected over USB as a plain serial port. OpenRC has no clean
-    # "wait for this USB device node to exist" dependency; if the Pico
-    # isn't plugged in (or hasn't finished enumerating) yet when this
-    # starts, pico_transport.hpp's start() just fails to open the serial
-    # port and this daemon exits non-zero, which supervise-daemon's
-    # respawn_delay/respawn_max above already retry indefinitely.
+    # No dbus/bluetooth need here -- setup happens entirely over the
+    # Pi's own onboard WiFi radio (see src/ap_control.hpp/main.cpp's
+    # boot sequence), not BLE. wpa_supplicant is what actually attempts
+    # to join a configured network on its own; this daemon just waits to
+    # see whether that succeeds before falling back to AP mode, so it
+    # needs to already be running first. hostapd is deliberately NOT
+    # listed here -- it's started/stopped dynamically by this daemon
+    # itself as AP mode is entered/left (ap_control.hpp), not run as an
+    # always-on OpenRC service.
     need wpa_supplicant
     after firewall
 }
