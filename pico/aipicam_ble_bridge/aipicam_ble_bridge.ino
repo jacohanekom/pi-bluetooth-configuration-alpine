@@ -30,6 +30,12 @@
  * this; only try Adafruit TinyUSB if plain Serial doesn't enumerate).
  */
 #include <BTstackLib.h>
+// att_server_notify() lives here -- BTstackLib.h itself only pulls in
+// ble/att_db.h (client-side GATT + the att_server_t type, but not this),
+// so this needs its own explicit include. Confirmed against BTstack's
+// own att_server.h source: declared there as
+// "uint8_t att_server_notify(hci_con_handle_t, uint16_t, const uint8_t*, uint16_t)".
+#include "ble/att_server.h"
 #include <SPI.h>
 #include <pico/unique_id.h>
 
