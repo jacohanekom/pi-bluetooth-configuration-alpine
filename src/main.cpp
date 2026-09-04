@@ -1,84 +1,101 @@
 /**
  * pi-bluetooth-configuration
  * ===========================
- * BLE GATT peripheral that lets a phone/app join this Pi to a WiFi network
- * without SSH or a keyboard: pair over Bluetooth LE, write an SSID and
- * passphrase, write "connect", and watch the status characteristic for the
- * result. The BLE peripheral role itself lives on a Raspberry Pi Pico 2 W's
- * own BTstack build, connected over USB as a plain serial port (see
- * pico_transport.hpp for why, and pico/aipicam_ble_bridge for its firmware)
- * -- this daemon just drives the actual WiFi/relay/Ethernet logic and pushes
- * characteristic values across that link. Scanning/joining/DHCP are driven
- * through wpa_cli and dhcpcd (see wifi_control.hpp).
+ * Lets a phone/app join this Pi to a WiFi network without SSH or a
+ * keyboard, using the Pi's own onboard WiFi radio for both roles at
+ * different times -- never BLE, never a second board. On startup this
+ * daemon tries to join whatever's already configured (wpa_supplicant,
+ * started by OpenRC before this daemon, attempts that entirely on its
+ * own); if that doesn't succeed within a bounded time -- including the
+ * common case of nothing being configured at all yet -- wlan0 switches
+ * into its own access point (see ap_control.hpp) that a phone can join
+ * directly, reaching this daemon's HTTP API (see http_server.hpp) at a
+ * fixed local address to submit real credentials.
  *
- * GATT service (see README for the exact UUIDs):
- *   SSID        (write)          stage a network name
- *   Password    (write)          stage a passphrase (omit for open networks)
- *   EthernetIP  (read + write)   stage/read eth0's "ip,rangeStart,rangeEnd" (see eth_control.hpp)
- *   DhcpLeases  (read + notify)  [{"ip":...,"mac":...,"hostname":...}, ...] currently on eth0
- *   Command     (write)          "scan" | "connect" | "forget" | "set_ethernet" | "finish" | "relay <port> on|off"
- *   Status      (read + notify)  {"state":...,"ssid":...,"ip":...,"error":...,"finished":...}
- *   ScanResults (read + notify)  [{"ssid":...,"rssi":...,"security":...}, ...]
- *   Relays      (read + notify)  [{"port":...,"label":...,"state":...}, ...] -- see relay_control.hpp
- *   Victron     (read + notify)  {"connected":...,"device":{...},"V":...,...} -- see victron_control.hpp
+ * This replaces two earlier designs entirely (see git history): a
+ * direct BlueZ/D-Bus GATT peripheral, and -- after BlueZ's own built-in
+ * GATT profiles proved to force a disconnect loop no userspace config
+ * could fix -- offloading BLE to a Raspberry Pi Pico 2 W over USB
+ * serial. Both were scrapped in favor of this: a plain WiFi AP + HTTP
+ * API is a far more standard, battle-tested pattern for headless device
+ * setup (the same shape ESP8266/ESP32 WiFiManager-style devices use),
+ * and it reuses infrastructure (hostapd, dnsmasq) this project already
+ * needed for other things.
+ *
+ * HTTP API (JSON; see the route table in main() for the exact shapes):
+ *   GET  /status    combined snapshot -- wifi state, whether AP mode is
+ *                   currently active, eth0's config, DHCP leases, relay
+ *                   states, Victron telemetry, and the last scan's
+ *                   results. No server push (unlike the old BLE
+ *                   notify): clients are expected to poll this
+ *                   periodically instead -- simpler and more robust
+ *                   than the notify-plus-cache machinery either earlier
+ *                   design needed.
+ *   POST /scan      triggers a background WiFi scan; poll GET /status
+ *                   for results once it finishes (a few seconds later).
+ *   POST /connect   {"ssid":...,"password":...} -- see do_connect's own
+ *                   comment for why this behaves differently depending
+ *                   on whether AP mode is currently active.
+ *   POST /forget    forgets the configured network, reboots.
+ *   POST /finish    concludes setup (only meaningful when NOT starting
+ *                   from AP mode -- see do_connect).
+ *   GET  /ethernet  current eth0 gateway IP + DHCP range.
+ *   POST /ethernet  {"ip":...,"rangeStart":...,"rangeEnd":...} -- stage
+ *                   eth0's local network config; see eth_control.hpp.
+ *   POST /relay     {"port":...,"state":"on"|"off"} -- see relay_control.hpp.
  *
  * eth0 is always a working gateway: its static IP + DHCP server are
- * (re)applied directly at every startup -- independent of dhcpcd and
- * carrier state -- so a Pi is reachable over Ethernet with no app
- * interaction, cable plugged in or not. "set_ethernet" lets it be
- * customized during the setup wizard -- including the step right after
- * WiFi connects, before "finish" is sent -- but once "finish" actually
- * runs (marking the wizard done and rebooting), this daemon rejects
- * further changes and the app switches to a read-only display instead
- * (see eth_control.hpp and the README's "Ethernet direct-connect"
- * section). Unlike WiFi, applying this doesn't reboot: Ethernet doesn't
- * share the Pi 3's antenna with Bluetooth, so there's no coexistence
- * problem to route around, and the change is visible immediately.
+ * (re)applied directly at every startup -- independent of dhcpcd,
+ * carrier state, and whatever wlan0 is currently doing -- so a Pi is
+ * reachable over Ethernet with no app interaction, cable plugged in or
+ * not. POST /ethernet lets it be customized any time before "finish"
+ * actually runs (marking the wizard done and rebooting); after that this
+ * daemon rejects further changes and the app switches to a read-only
+ * display instead (see eth_control.hpp and the README's "Ethernet
+ * direct-connect" section). Applying it doesn't reboot: Ethernet doesn't
+ * share the radio with wlan0, so there's no coexistence problem to route
+ * around, and the change is visible immediately.
  *
- * "connect" itself no longer reboots on success -- the wizard has one
- * more optional step (local network configuration) after WiFi joins,
- * and only "finish" actually marks the device done and reboots it.
- *
- * No pairing/bonding: characteristics are plain read/write, not
- * encrypted. An earlier revision required BLE pairing, but bonding on the
- * Pi 3's BCM43438 proved unreliable enough in practice (bond desync
- * between BlueZ and the central, repeated OS-level pairing prompts) that
- * it wasn't worth what it protected against -- see the README's Security
- * model section. This means WiFi credentials cross BLE in the clear;
- * treat this as suitable for a trusted home/lab network, not a public one.
+ * No auth on this daemon's own HTTP API: requests are plain HTTP, not
+ * encrypted or authenticated. The AP itself is open (no password) too --
+ * seem this project's security model (see the README) already treats
+ * the WiFi-configuration flow as suitable for a trusted home/lab
+ * environment only, not a public one; this means WiFi credentials cross
+ * both the AP's own air interface and this HTTP API in the clear.
  *
  * Relay control is a separate, optional integration with
- * pi-relay-control-alpine: this daemon doesn't drive GPIO itself, it just
- * forwards "relay <port> on|off" (from Command) to whichever relay is
- * listening on that TCP port on 127.0.0.1, and reports live state back
- * on the Relays characteristic. It's no part of the setup wizard --
- * relay commands are rejected and Relays reports an empty list until
- * MARKER_FILE exists, i.e. only once setup has actually finished, the
- * same point at which the app switches to showing WiFi/network stats
- * (relay controls belong on that same screen, not the wizard). See
- * relay_control.hpp and the README's "Relay control" section for the
- * "[relays]" config format that maps ports to display labels.
+ * pi-relay-control-alpine: this daemon doesn't drive GPIO itself, it
+ * just forwards on/off to whichever relay is listening on that TCP port
+ * on 127.0.0.1, and reports live state back via GET /status. It's no
+ * part of the setup wizard -- relay commands are rejected and
+ * GET /status reports an empty relay list until MARKER_FILE exists,
+ * i.e. only once setup has actually finished, the same point at which
+ * the app switches to showing WiFi/network stats (relay controls belong
+ * on that same screen, not the wizard). See relay_control.hpp and the
+ * README's "Relay control" section for the "[relays]" config format
+ * that maps ports to display labels.
  *
  * Victron solar/battery telemetry is a similar optional integration,
  * this time with victron-ve-direct-alpine: queries its status control
- * port for the latest reading and republishes it as JSON on the Victron
- * characteristic. Unlike relay control this is read-only (nothing to
- * gate against acting on an unprovisioned Pi) and isn't tied to
- * MARKER_FILE at all -- it's always live, the app just chooses to show
- * it on the same post-setup screen as WiFi/network stats and relays.
- * See victron_control.hpp.
+ * port for the latest reading and republishes it as JSON. Unlike relay
+ * control this is read-only (nothing to gate against acting on an
+ * unprovisioned Pi) and isn't tied to MARKER_FILE at all -- it's always
+ * live, the app just chooses to show it on the same post-setup screen as
+ * WiFi/network stats and relays. See victron_control.hpp.
  *
- * Advertised as the board's hardware serial (from /proc/cpuinfo), not a
- * fixed name, so a client's device list distinguishes between multiple
- * aipicam units instead of showing the same string for all of them.
+ * The AP's own SSID is the board's hardware serial (from /proc/cpuinfo),
+ * not a fixed name, so multiple aipicam units are distinguishable in a
+ * phone's WiFi network list instead of all showing the same name.
  *
  * This is a one-shot provisioning flow, not a managed session: a
- * successful "connect" creates MARKER_FILE and reboots the Pi a few
- * seconds later (enough time for the final Status notification to reach
- * the client first); a "forget" removes MARKER_FILE and reboots the same
- * way. There is deliberately no ongoing management interface beyond BLE
- * -- once WiFi is set up, the expectation is that the Pi reboots into its
- * normal role, not that a client keeps talking to this daemon.
+ * successful "finish" (or a "connect" that started from AP mode -- see
+ * do_connect) creates MARKER_FILE and reboots the Pi a few seconds
+ * later; a "forget" removes MARKER_FILE and reboots the same way. There
+ * is deliberately no ongoing management interface beyond this same HTTP
+ * API -- once WiFi is set up, the expectation is that the Pi reboots
+ * into its normal role, and this daemon (and the API) stay available on
+ * the joined network for the relay/Victron/status use described above,
+ * not for repeating the wizard.
  *
  * Build (Alpine Linux):
  *   make
@@ -87,9 +104,9 @@
  */
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <csignal>
-#include <cstdint>
 #include <cstdio>
 #include <fstream>
 #include <iostream>
@@ -100,27 +117,18 @@
 #include <thread>
 #include <vector>
 
+#include "ap_control.hpp"
 #include "config.hpp"
 #include "eth_control.hpp"
-#include "pico_transport.hpp"
+#include "http_server.hpp"
 #include "relay_control.hpp"
 #include "victron_control.hpp"
 #include "wifi_control.hpp"
 
 namespace {
 
-constexpr const char* SERVICE_UUID  = "7b1e0000-6a45-4d1f-9b0a-3c2f8e4d5a10";
-constexpr const char* SSID_UUID     = "7b1e0001-6a45-4d1f-9b0a-3c2f8e4d5a10";
-constexpr const char* PSK_UUID      = "7b1e0002-6a45-4d1f-9b0a-3c2f8e4d5a10";
-constexpr const char* COMMAND_UUID  = "7b1e0003-6a45-4d1f-9b0a-3c2f8e4d5a10";
-constexpr const char* STATUS_UUID   = "7b1e0004-6a45-4d1f-9b0a-3c2f8e4d5a10";
-constexpr const char* SCAN_UUID     = "7b1e0005-6a45-4d1f-9b0a-3c2f8e4d5a10";
-constexpr const char* ETH_IP_UUID   = "7b1e0006-6a45-4d1f-9b0a-3c2f8e4d5a10";
-constexpr const char* LEASES_UUID   = "7b1e0007-6a45-4d1f-9b0a-3c2f8e4d5a10";
-constexpr const char* RELAYS_UUID   = "7b1e0008-6a45-4d1f-9b0a-3c2f8e4d5a10";
-constexpr const char* VICTRON_UUID  = "7b1e0009-6a45-4d1f-9b0a-3c2f8e4d5a10";
-constexpr const char* MARKER_FILE   = "/.successfully-initialized";
-constexpr int REBOOT_DELAY_SECS     = 3;
+constexpr const char* MARKER_FILE = "/.successfully-initialized";
+constexpr int REBOOT_DELAY_SECS = 3;
 
 std::atomic<bool> g_running{true};
 std::atomic<int> g_inflight{0};
@@ -134,10 +142,6 @@ struct InflightGuard {
     InflightGuard() { ++g_inflight; }
     ~InflightGuard() { --g_inflight; }
 };
-
-std::vector<uint8_t> to_bytes(const std::string& s) {
-    return std::vector<uint8_t>(s.begin(), s.end());
-}
 
 std::string trim(const std::string& s) {
     const char* ws = " \t\r\n";
@@ -168,6 +172,56 @@ std::string escape_json(const std::string& s) {
         }
     }
     return out;
+}
+
+// Bare-bones flat-JSON-object value extraction -- good enough for this
+// daemon's own small, flat POST bodies ({"ssid":"...","password":"..."}
+// and similar), not a general parser. No nesting, no arrays -- nothing
+// this daemon's own API ever needs to receive uses either.
+std::string json_get_string(const std::string& body, const std::string& key) {
+    std::string needle = "\"" + key + "\"";
+    auto pos = body.find(needle);
+    if (pos == std::string::npos) return "";
+    pos = body.find(':', pos + needle.size());
+    if (pos == std::string::npos) return "";
+    pos = body.find('"', pos);
+    if (pos == std::string::npos) return "";
+    ++pos;
+    std::string out;
+    while (pos < body.size() && body[pos] != '"') {
+        if (body[pos] == '\\' && pos + 1 < body.size()) {
+            char esc = body[pos + 1];
+            switch (esc) {
+                case 'n': out += '\n'; break;
+                case 'r': out += '\r'; break;
+                case 't': out += '\t'; break;
+                case '"': out += '"'; break;
+                case '\\': out += '\\'; break;
+                case '/': out += '/'; break;
+                default: out += esc;
+            }
+            pos += 2;
+        } else {
+            out += body[pos];
+            ++pos;
+        }
+    }
+    return out;
+}
+
+long json_get_int(const std::string& body, const std::string& key, long def) {
+    std::string needle = "\"" + key + "\"";
+    auto pos = body.find(needle);
+    if (pos == std::string::npos) return def;
+    pos = body.find(':', pos + needle.size());
+    if (pos == std::string::npos) return def;
+    ++pos;
+    while (pos < body.size() && std::isspace(static_cast<unsigned char>(body[pos]))) ++pos;
+    size_t start = pos;
+    if (pos < body.size() && (body[pos] == '-' || body[pos] == '+')) ++pos;
+    while (pos < body.size() && std::isdigit(static_cast<unsigned char>(body[pos]))) ++pos;
+    if (pos == start) return def;
+    try { return std::stol(body.substr(start, pos - start)); } catch (...) { return def; }
 }
 
 // "finished" reflects whether this device has already completed the
@@ -211,17 +265,19 @@ std::string leases_json(const std::vector<ethctl::Lease>& leases) {
     return o.str();
 }
 
+bool marker_exists(const char* path) {
+    std::ifstream f(path);
+    return f.good();
+}
+
 // Queries each configured relay's live state (via relay_control.hpp,
 // one TCP round-trip per relay to pi-relay-control-alpine) every time
 // this is called -- simple, and there are only ever a handful of
-// relays, so this is cheap enough to run both on-demand (a GATT read)
-// and on the poll/notify thread below.
-// port_mu locks each relay individually (just around that relay's own
-// query) rather than one lock for the whole sweep -- see do_relay for
-// why a lock is needed at all, and relay_port_mu's own comment for why
-// it's per-port. A short, per-relay critical section here means a slow
-// query against one relay still can't block a command to a different
-// one from this same loop either.
+// relays, so this is cheap enough to run on every GET /status. Unlike
+// the old BLE-era design, there's no shared dispatch thread this could
+// block (http_server.hpp is thread-per-connection -- a slow relay query
+// only ever delays its own request), so the caching layer that used to
+// exist here for exactly that reason is gone.
 std::string relays_json(const std::vector<relayctl::RelayConfig>& relays,
                          std::map<int, std::mutex>& port_mu) {
     std::ostringstream o;
@@ -230,6 +286,12 @@ std::string relays_json(const std::vector<relayctl::RelayConfig>& relays,
         if (i) o << ",";
         std::string state;
         {
+            // Still locked per-port -- not to protect against a shared
+            // dispatch thread anymore, just so a concurrent GET /status
+            // and POST /relay for the *same* port (two separate HTTP
+            // connections, genuinely concurrent threads now) can't
+            // interleave their TCP conversations with
+            // pi-relay-control-alpine.
             std::lock_guard<std::mutex> lk(port_mu[relays[i].port]);
             state = relayctl::query_state(relays[i].port);
         }
@@ -271,45 +333,23 @@ std::string victron_json(const victronctl::VictronStatus& s) {
     return o.str();
 }
 
-bool marker_exists(const char* path) {
-    std::ifstream f(path);
-    return f.good();
-}
-
-// EthernetIP's wire format is plain CSV, "<ip>,<rangeStart>,<rangeEnd>"
-// (e.g. "192.168.4.1,2,200") both ways -- simple enough not to need a
-// real JSON parser for the write side, and the daemon has no JSON
-// parsing anywhere else either.
-std::string eth_config_csv(const ethctl::EthControl& eth) {
+std::string eth_config_json(const ethctl::EthControl& eth) {
     auto cfg = eth.get_config();
     std::string ip = eth.get_ip();
     if (ip.empty()) ip = cfg.ip;
     std::ostringstream o;
-    o << ip << "," << cfg.range_start << "," << cfg.range_end;
+    o << "{\"ip\":\"" << escape_json(ip) << "\","
+      << "\"rangeStart\":" << cfg.range_start << ","
+      << "\"rangeEnd\":" << cfg.range_end << "}";
     return o.str();
 }
 
-bool parse_eth_csv(const std::string& csv, std::string& ip, int& range_start, int& range_end) {
-    std::stringstream ss(csv);
-    std::string ip_s, start_s, end_s;
-    if (!std::getline(ss, ip_s, ',')) return false;
-    if (!std::getline(ss, start_s, ',')) return false;
-    if (!std::getline(ss, end_s, ',')) return false;
-    try {
-        range_start = std::stoi(start_s);
-        range_end = std::stoi(end_s);
-    } catch (...) {
-        return false;
-    }
-    ip = trim(ip_s);
-    return true;
-}
-
 // The board's hardware serial (from /proc/cpuinfo) rather than a fixed
-// configured name, so a client's "nearby devices" list distinguishes
-// between multiple aipicam units instead of showing the same string for
-// all of them. Falls back to bluetooth.device_name (e.g. when not
-// running on real Pi hardware) if it can't be read.
+// configured name, so multiple aipicam units are distinguishable in a
+// phone's WiFi network list (the AP's own SSID -- see ap_control.hpp)
+// instead of all showing the same name. Falls back to
+// wifi.device_name (e.g. when not running on real Pi hardware) if it
+// can't be read.
 std::string read_pi_serial() {
     std::ifstream f("/proc/cpuinfo");
     std::string line;
@@ -324,11 +364,12 @@ std::string read_pi_serial() {
     return "";
 }
 
-// Waits long enough for the just-sent BLE notification to actually reach
-// the client before the reboot drops the connection, then reboots.
-// Fire-and-forget: once the reboot command is issued, the whole system
-// (including this process) is going down regardless of what run_command
-// reports back.
+// Waits long enough for the just-sent HTTP response to actually reach
+// the client before anything this triggers (an AP teardown, in
+// particular) could drop the connection it travelled over, then
+// reboots. Fire-and-forget: once the reboot command is issued, the
+// whole system (including this process) is going down regardless of
+// what run_command reports back.
 void reboot_after_delay() {
     std::thread([]() {
         std::this_thread::sleep_for(std::chrono::seconds(REBOOT_DELAY_SECS));
@@ -351,12 +392,7 @@ int main(int argc, char** argv) {
     }
 
     Config cfg(cfg_path);
-    // Which serial port the Pico's own USB-CDC-ACM interface enumerates
-    // as -- see pico_transport.hpp for why the BLE peripheral role lives
-    // on a Pico's own BTstack build now, not this daemon talking to
-    // BlueZ directly.
-    const std::string serial_port = cfg.get_str("bluetooth.serial_port", "/dev/ttyACM0");
-    const std::string configured_name = cfg.get_str("bluetooth.device_name", "pi-bluetooth-configuration");
+    const std::string configured_name = cfg.get_str("wifi.device_name", "pi-bluetooth-configuration");
     const std::string serial     = read_pi_serial();
     const std::string dev_name   = serial.empty() ? configured_name : serial;
     const std::string iface      = cfg.get_str("wifi.interface", "wlan0");
@@ -364,6 +400,7 @@ int main(int argc, char** argv) {
     const std::string eth_default_ip = cfg.get_str("ethernet.ip", "192.168.4.1");
     const int eth_default_range_start = cfg.get_int("ethernet.dhcp_range_start", 2);
     const int eth_default_range_end   = cfg.get_int("ethernet.dhcp_range_end", 200);
+    const int sta_boot_timeout_secs = cfg.get_int("wifi.connect_timeout_secs", 20);
     const int max_scan_results   = cfg.get_int("scan.max_results", 10);
     const auto relays = relayctl::load_relays(cfg_path);
 
@@ -371,46 +408,34 @@ int main(int argc, char** argv) {
     // before any thread that might read it starts, so every later
     // relay_port_mu[port] lookup below only ever finds an existing key
     // and never triggers a concurrent std::map insert/rehash. Keyed per
-    // port (not one mutex for every relay) so a manual on/off command
-    // to one relay is never blocked behind a slow or stuck query against
-    // a completely different one -- see relays_json/do_relay below for
-    // why a lock is needed here at all.
+    // port (not one mutex for every relay) so a request against one
+    // relay is never blocked behind a slow or stuck query against a
+    // completely different one -- see relays_json/do_relay for why a
+    // lock is needed here at all.
     std::map<int, std::mutex> relay_port_mu;
     for (const auto& r : relays) relay_port_mu[r.port];
     const int victron_ctrl_port = cfg.get_int("victron.ctrl_port", 8562);
 
-    // Relays/Victron's "read" (on_read below) only actually runs once,
-    // at PicoTransport::start() (seeding the Pico's initial cache -- see
-    // pico_transport.hpp) -- every later update instead comes from
-    // do_relay/the periodic poll threads below calling notify() with an
-    // already-computed value. This cache exists so those two paths share
-    // one "last known good" value rather than the periodic thread's own
-    // fresh query racing a concurrent seed read against
-    // pi-relay-control-alpine/victron-ve-direct-alpine (each with its own
-    // up-to-2s timeout). Originally this also kept a slow query from
-    // blocking BlueZ's single-threaded D-Bus dispatch loop for seconds at
-    // exactly the moment a client first connected, which looked exactly
-    // like a real disconnect regardless of which Bluetooth adapter was in
-    // use -- moot now that the BLE peripheral role lives on the Pico
-    // instead (see pico_transport.hpp), but the caching itself is still
-    // worth keeping for the reason above.
-    // radio-level to begin with. These caches, kept warm by do_relay/the
-    // periodic poll threads below (which already do this same query off
-    // the dispatch thread), let a "read" just return the latest known
-    // value instantly instead of blocking on the network itself.
-    std::mutex relays_cache_mu;
-    std::string relays_cache_json = "[]";
-    std::mutex victron_cache_mu;
-    std::string victron_cache_json = "{\"connected\":false}";
-    std::cerr << "[Config] pico     : " << serial_port << "\n"
-              << "[Config] device   : " << dev_name << (serial.empty() ? " (configured)" : " (hardware serial)") << "\n"
+    // The AP's own subnet -- deliberately distinct from eth0's default
+    // gateway (192.168.4.1) so the two can never collide if a client
+    // happens to be on both eth0 and the AP at once (unusual, but not
+    // impossible: a laptop with both a USB-C dock and its own WiFi, say).
+    const std::string ap_ip = cfg.get_str("ap.ip", "192.168.5.1");
+    const int ap_range_start = cfg.get_int("ap.dhcp_range_start", 2);
+    const int ap_range_end   = cfg.get_int("ap.dhcp_range_end", 200);
+    const int http_port      = cfg.get_int("http.port", 8080);
+
+    std::cerr << "[Config] device   : " << dev_name << (serial.empty() ? " (configured)" : " (hardware serial)") << "\n"
               << "[Config] wifi if  : " << iface << "\n"
               << "[Config] eth if   : " << eth_iface << "\n"
+              << "[Config] ap ip    : " << ap_ip << "\n"
+              << "[Config] http port: " << http_port << "\n"
               << "[Config] relays   : " << relays.size() << " configured\n"
               << "[Config] victron  : ctrl_port " << victron_ctrl_port << "\n";
 
     WifiControl wifi(iface);
     ethctl::EthControl eth(eth_iface);
+    apctl::ApControl ap(iface, ap_ip, ap_range_start, ap_range_end);
 
     // eth0 is meant to always be a usable gateway, not something the app
     // has to configure first -- reapply its static IP/range (whatever
@@ -432,144 +457,112 @@ int main(int argc, char** argv) {
         }
     }).detach();
 
-    picoserv::PicoTransport server(serial_port);
+    // Tries to join whatever's already configured -- wpa_supplicant,
+    // already started by OpenRC before this daemon (see its own
+    // depend()), attempts this entirely on its own; this just waits to
+    // see whether it succeeds within a bounded time. Covers both "wrong
+    // password/network out of range" and "nothing configured at all yet"
+    // the same way: either one just fails to reach CONNECTED before the
+    // timeout, falling through to AP mode below.
+    bool sta_ok = false;
+    for (int i = 0; i < sta_boot_timeout_secs * 2; ++i) {
+        if (wifi.get_status().state == WifiStatus::CONNECTED) { sta_ok = true; break; }
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    }
 
-    std::mutex staged_mu;
-    std::string staged_ssid, staged_psk, staged_eth_ip;
+    if (sta_ok) {
+        std::cerr << "[Wifi] joined " << wifi.get_status().ssid << " on boot\n";
+    } else {
+        std::cerr << "[Wifi] no configured network joined within " << sta_boot_timeout_secs
+                   << "s -- starting AP mode\n";
+        std::string ap_err;
+        if (!ap.start(dev_name, ap_err)) {
+            std::cerr << "[AP] failed to start: " << ap_err << "\n";
+        }
+    }
+
+    httpsrv::HttpServer server;
 
     std::mutex scan_mu;
     std::string last_scan_json = "[]";
 
-    server.add_characteristic(SSID_UUID, {"write"}, nullptr,
-        [&](const std::vector<uint8_t>& v) {
-            std::lock_guard<std::mutex> lk(staged_mu);
-            staged_ssid.assign(v.begin(), v.end());
-        });
-
-    server.add_characteristic(PSK_UUID, {"write"}, nullptr,
-        [&](const std::vector<uint8_t>& v) {
-            std::lock_guard<std::mutex> lk(staged_mu);
-            staged_psk.assign(v.begin(), v.end());
-        });
-
-    picoserv::Characteristic* eth_ip_char = server.add_characteristic(
-        ETH_IP_UUID, {"read", "write", "notify"},
-        [&]() -> std::vector<uint8_t> { return to_bytes(eth_config_csv(eth)); },
-        [&](const std::vector<uint8_t>& v) {
-            std::lock_guard<std::mutex> lk(staged_mu);
-            staged_eth_ip.assign(v.begin(), v.end());
-        });
-
-    picoserv::Characteristic* leases_char = server.add_characteristic(
-        LEASES_UUID, {"read", "notify"},
-        [&]() -> std::vector<uint8_t> { return to_bytes(leases_json(eth.get_leases())); },
-        nullptr);
-
-    // Relays are no part of the setup wizard -- they only ever report
-    // real state once the Pi has actually finished setup (MARKER_FILE
-    // exists), the same point at which the app's details screen starts
-    // showing WiFi/network stats and, alongside them, relay controls.
-    // Before that, this reports an empty list rather than querying
-    // pi-relay-control-alpine at all -- that daemon's own start_pre()
-    // gate (see its README, "Requires device provisioning") means
-    // there's nothing listening on those ports yet anyway.
-    // The slow part (relays_json's per-port TCP queries) still runs here,
-    // synchronously, on whichever thread calls this -- do_relay and the
-    // periodic poll thread below, never the D-Bus dispatch thread itself
-    // (see relays_cache_json's comment). Updating the cache here, as a
-    // side effect of every call, is what keeps relays_char's actual
-    // "read" callback fast regardless of which caller triggered this.
-    auto current_relays_json = [&]() -> std::string {
-        std::string json = marker_exists(MARKER_FILE) ? relays_json(relays, relay_port_mu) : "[]";
-        std::lock_guard<std::mutex> lk(relays_cache_mu);
-        relays_cache_json = json;
-        return json;
-    };
-
-    picoserv::Characteristic* relays_char = server.add_characteristic(
-        RELAYS_UUID, {"read", "notify"},
-        [&]() -> std::vector<uint8_t> {
-            std::lock_guard<std::mutex> lk(relays_cache_mu);
-            return to_bytes(relays_cache_json);
-        },
-        nullptr);
-
-    // Unlike Relays, Victron telemetry is read-only and isn't gated by
-    // MARKER_FILE -- there's no action to hold back before setup
-    // finishes, just a reading to report (or not, if nothing's
-    // reachable yet). The app chooses to surface it on the same
-    // post-setup screen as WiFi/network stats and relays; this
-    // characteristic itself is live from the moment BLE comes up.
-    picoserv::Characteristic* victron_char = server.add_characteristic(
-        VICTRON_UUID, {"read", "notify"},
-        [&]() -> std::vector<uint8_t> {
-            std::lock_guard<std::mutex> lk(victron_cache_mu);
-            return to_bytes(victron_cache_json);
-        },
-        nullptr);
-
-    picoserv::Characteristic* status_char = server.add_characteristic(
-        STATUS_UUID, {"read", "notify"},
-        [&]() -> std::vector<uint8_t> { return to_bytes(status_json(wifi.get_status(), marker_exists(MARKER_FILE))); },
-        nullptr);
-
-    picoserv::Characteristic* scan_char = server.add_characteristic(
-        SCAN_UUID, {"read", "notify"},
-        [&]() -> std::vector<uint8_t> {
-            std::lock_guard<std::mutex> lk(scan_mu);
-            return to_bytes(last_scan_json);
-        },
-        nullptr);
-
     auto do_scan = [&]() {
         auto results = wifi.scan(max_scan_results);
-        std::string json;
-        {
-            std::lock_guard<std::mutex> lk(scan_mu);
-            last_scan_json = scan_json(results);
-            json = last_scan_json;
-        }
-        server.notify(scan_char, to_bytes(json));
+        std::lock_guard<std::mutex> lk(scan_mu);
+        last_scan_json = scan_json(results);
     };
 
-    // Joining WiFi no longer reboots by itself -- the wizard has one
-    // more step after this (local network configuration), and the whole
-    // thing only concludes, and reboots, once "finish" is sent. See
-    // do_finish below.
-    auto do_connect = [&](std::string ssid, std::string psk) {
-        wifi.connect(ssid, psk);
-        server.notify(status_char, to_bytes(status_json(wifi.get_status(), marker_exists(MARKER_FILE))));
+    // The one action with genuinely different behavior depending on
+    // whether AP mode is currently active, because of a hard hardware
+    // constraint: this radio can't run AP and station mode at once, so
+    // submitting real credentials while AP mode is active necessarily
+    // means the phone's own connection to this daemon (reached via the
+    // AP) is about to be severed the moment wlan0 switches over --
+    // there's no way to keep serving that same phone a "did it work"
+    // answer afterward. So in that case, this treats a successful join
+    // as automatically finished too (marking MARKER_FILE and rebooting
+    // immediately, same as POST /finish normally would) rather than
+    // waiting for a separate finish step nothing could ever reach; and
+    // on failure, it restarts the AP so the phone (which will have
+    // noticed its connection drop either way) has something to
+    // reconnect to and retry against.
+    //
+    // If AP mode was NOT active (this Pi is already on a real network --
+    // wlan0 stays in station mode throughout, nothing about the phone's
+    // own connection to this daemon changes), this behaves exactly like
+    // the old BLE-era flow: joins the network, but leaves marking
+    // MARKER_FILE/rebooting to a separate POST /finish, so local network
+    // (Ethernet) settings can still be adjusted first if needed.
+    auto do_connect = [&](const std::string& ssid, const std::string& psk) {
+        bool was_ap = ap.is_running();
+        if (was_ap) {
+            std::string ap_err;
+            if (!ap.stop(ap_err)) std::cerr << "[AP] failed to stop cleanly: " << ap_err << "\n";
+        }
+
+        bool ok = wifi.connect(ssid, psk);
+
+        if (!was_ap) return; // old, unchanged behavior -- see comment above
+
+        if (ok) {
+            std::ofstream(MARKER_FILE).close();
+            std::cerr << "[Wifi] joined " << ssid << " from AP mode -- finishing and rebooting\n";
+            reboot_after_delay();
+        } else {
+            std::cerr << "[Wifi] failed to join " << ssid << " from AP mode -- restarting AP\n";
+            std::string ap_err;
+            if (!ap.start(dev_name, ap_err)) std::cerr << "[AP] failed to restart: " << ap_err << "\n";
+        }
     };
 
     auto do_forget = [&]() {
         wifi.forget();
-        server.notify(status_char, to_bytes(status_json(wifi.get_status(), false)));
         std::remove(MARKER_FILE);
         reboot_after_delay();
     };
 
-    // The end of the wizard: only meaningful once WiFi is actually
-    // connected, since finishing before that would reboot into a Pi
-    // that isn't actually configured. Marks success on disk and reboots
-    // into the Pi's normal role rather than staying up to be managed
-    // further.
+    // The end of the wizard when it didn't start from AP mode (see
+    // do_connect) -- only meaningful once WiFi is actually connected,
+    // since finishing before that would reboot into a Pi that isn't
+    // actually configured. Marks success on disk and reboots into the
+    // Pi's normal role rather than staying up to be managed further.
     auto do_finish = [&]() {
         if (wifi.get_status().state != WifiStatus::CONNECTED) {
             std::cerr << "[Finish] ignoring: WiFi is not connected\n";
             return;
         }
         std::ofstream(MARKER_FILE).close();
-        server.notify(status_char, to_bytes(status_json(wifi.get_status(), true)));
         reboot_after_delay();
     };
 
     // Ethernet direct-connect is only reconfigurable until the wizard
     // finishes (MARKER_FILE doesn't exist yet) -- that includes the
-    // window right after WiFi connects but before "finish" is sent.
-    // Once finished, eth0's gateway config is left as-is and the app
-    // switches to a read-only display of it. Applied immediately when
-    // allowed, no reboot needed (see file header comment).
-    auto do_set_ethernet = [&](std::string ip, int range_start, int range_end) {
+    // whole time AP mode is active, and the window after WiFi connects
+    // but before "finish"/an AP-mode connect concludes things. Once
+    // finished, eth0's gateway config is left as-is and the app switches
+    // to a read-only display of it. Applied immediately when allowed, no
+    // reboot needed (see file header comment).
+    auto do_set_ethernet = [&](const std::string& ip, int range_start, int range_end) {
         if (marker_exists(MARKER_FILE)) {
             std::cerr << "[Ethernet] ignoring set_ethernet: setup has already finished\n";
             return;
@@ -578,7 +571,6 @@ int main(int argc, char** argv) {
         if (!eth.set_static_ip(ip, range_start, range_end, ip_err)) {
             std::cerr << "[Ethernet] failed to set static IP " << ip << ": " << ip_err << "\n";
         }
-        server.notify(eth_ip_char, to_bytes(eth_config_csv(eth)));
     };
 
     // Relays are no part of the setup wizard -- they're only meaningful
@@ -591,36 +583,35 @@ int main(int argc, char** argv) {
     // there's no relay daemon on the other end of the socket to command
     // in the first place.
     //
-    // Forwards "relay <port> on|off" to whichever relay
-    // pi-relay-control-alpine has listening on that TCP port (see
-    // relay_control.hpp) and pushes the refreshed Relays state back to
-    // the client either way -- including on failure (state comes back
-    // "unknown"), so the UI reflects reality rather than optimistically
-    // assuming the write worked.
-    auto do_relay = [&](int port, const std::string& action) {
+    // Forwards on/off to whichever relay pi-relay-control-alpine has
+    // listening on that TCP port (see relay_control.hpp) and returns the
+    // refreshed relay list either way -- including on failure (state
+    // comes back "unknown"), so the response reflects reality rather
+    // than optimistically assuming the write worked.
+    auto do_relay = [&](int port, const std::string& action) -> bool {
         if (!marker_exists(MARKER_FILE)) {
             std::cerr << "[Relay] ignoring relay command: setup has not finished yet\n";
-            return;
+            return false;
         }
         // relay_port_mu is pre-populated once at startup with exactly the
         // configured ports (see its declaration above) so every lookup
         // below is a plain read on an existing key, never a concurrent
-        // std::map insert racing the periodic poll thread's own lookups.
-        // port comes straight from the client's write, unvalidated, so
-        // that guarantee only holds if an unconfigured port is rejected
-        // here first, before ever touching the map.
+        // std::map insert racing another request's own lookup. port
+        // comes straight from the client's request, unvalidated, so that
+        // guarantee only holds if an unconfigured port is rejected here
+        // first, before ever touching the map.
         bool configured = std::any_of(relays.begin(), relays.end(),
                                        [&](const relayctl::RelayConfig& r) { return r.port == port; });
         if (!configured) {
             std::cerr << "[Relay] ignoring relay command for unconfigured port " << port << "\n";
-            return;
+            return false;
         }
         // Retries until pi-relay-control-alpine actually confirms the
         // change ("OK RELAY=ON"/"OK RELAY=OFF") rather than accepting the
         // first attempt regardless of outcome -- a transient failure
         // (relay busy, a dropped connection, etc.) would otherwise
-        // silently leave the relay unchanged with only a log line to show
-        // for it. Bounded by both an attempt count and a wall-clock
+        // silently leave the relay unchanged with only a log line to
+        // show for it. Bounded by both an attempt count and a wall-clock
         // budget so a persistently unreachable relay still gives up
         // rather than retrying forever.
         constexpr int max_attempts = 5;
@@ -633,17 +624,6 @@ int main(int argc, char** argv) {
         int attempt = 0;
         while (!confirmed && ++attempt <= max_attempts && std::chrono::steady_clock::now() < deadline) {
             {
-                // Locked only around the command itself, on just this
-                // port's mutex -- not across the current_relays_json()
-                // call below, which locks each port (including this one)
-                // again itself. Holding it across both would self-deadlock
-                // on this thread re-locking a non-recursive mutex it
-                // already owns. The write has already fully applied by
-                // the time this unlocks, so any query that lands after --
-                // from that call or the periodic poll thread -- sees the
-                // real post-command state regardless; there's no
-                // staleness window left to protect against once the
-                // command itself has finished.
                 std::lock_guard<std::mutex> lk(relay_port_mu[port]);
                 resp = relayctl::send_command(port, action, err);
             }
@@ -665,175 +645,99 @@ int main(int argc, char** argv) {
             std::cerr << "[Relay] port " << port << " " << action << " gave up after " << attempt
                        << " attempts, last response: " << resp << "\n";
         }
-        server.notify(relays_char, to_bytes(current_relays_json()));
+        return confirmed;
     };
 
-    server.add_characteristic(COMMAND_UUID, {"write"}, nullptr,
-        [&](const std::vector<uint8_t>& v) {
-            std::string cmd = trim(std::string(v.begin(), v.end()));
-            // Unconditional, logged before any parsing/dispatch below --
-            // every well-formed command otherwise only logs deep inside
-            // its own handler (e.g. do_relay), so a write that reaches
-            // this callback but somehow never gets this far would
-            // otherwise leave no trace at all. If this line is ever
-            // missing for a command the client believes it sent, the
-            // write never reached the Pico (or the Pico never forwarded
-            // it over serial) -- not a bug in any of the handlers below.
-            std::cerr << "[Command] received: \"" << cmd << "\"\n";
+    server.route("GET", "/status", [&](const httpsrv::Request&) {
+        std::string relays_str = marker_exists(MARKER_FILE) ? relays_json(relays, relay_port_mu) : "[]";
+        std::string scan_str;
+        {
+            std::lock_guard<std::mutex> lk(scan_mu);
+            scan_str = last_scan_json;
+        }
+        std::ostringstream o;
+        o << "{\"wifi\":" << status_json(wifi.get_status(), marker_exists(MARKER_FILE)) << ","
+          << "\"apActive\":" << (ap.is_running() ? "true" : "false") << ","
+          << "\"eth\":" << eth_config_json(eth) << ","
+          << "\"leases\":" << leases_json(eth.get_leases()) << ","
+          << "\"relays\":" << relays_str << ","
+          << "\"victron\":" << victron_json(victronctl::query_status(victron_ctrl_port)) << ","
+          << "\"scan\":" << scan_str << "}";
+        return httpsrv::Response::json(o.str());
+    });
 
-            if (cmd == "scan") {
-                std::thread([&]() { InflightGuard guard; do_scan(); }).detach();
+    server.route("POST", "/scan", [&](const httpsrv::Request&) {
+        std::thread([&]() { InflightGuard guard; do_scan(); }).detach();
+        return httpsrv::Response::json("{\"ok\":true}");
+    });
 
-            } else if (cmd == "connect") {
-                std::string ssid, psk;
-                {
-                    std::lock_guard<std::mutex> lk(staged_mu);
-                    ssid = staged_ssid;
-                    psk = staged_psk;
-                    std::fill(staged_psk.begin(), staged_psk.end(), '\0');
-                    staged_psk.clear();
-                }
-                std::thread([&, ssid, psk]() { InflightGuard guard; do_connect(ssid, psk); }).detach();
+    server.route("POST", "/connect", [&](const httpsrv::Request& req) {
+        std::string ssid = json_get_string(req.body, "ssid");
+        std::string psk = json_get_string(req.body, "password");
+        if (ssid.empty()) return httpsrv::Response::error(400, "ssid is required");
+        std::cerr << "[Command] connect requested: \"" << ssid << "\"\n";
+        std::thread([&, ssid, psk]() { InflightGuard guard; do_connect(ssid, psk); }).detach();
+        return httpsrv::Response::json("{\"ok\":true}");
+    });
 
-            } else if (cmd == "forget") {
-                do_forget();
+    server.route("POST", "/forget", [&](const httpsrv::Request&) {
+        std::cerr << "[Command] forget requested\n";
+        std::thread([&]() { InflightGuard guard; do_forget(); }).detach();
+        return httpsrv::Response::json("{\"ok\":true}");
+    });
 
-            } else if (cmd == "finish") {
-                do_finish();
+    server.route("POST", "/finish", [&](const httpsrv::Request&) {
+        std::cerr << "[Command] finish requested\n";
+        std::thread([&]() { InflightGuard guard; do_finish(); }).detach();
+        return httpsrv::Response::json("{\"ok\":true}");
+    });
 
-            } else if (cmd == "set_ethernet") {
-                std::string csv;
-                {
-                    std::lock_guard<std::mutex> lk(staged_mu);
-                    csv = staged_eth_ip;
-                }
-                std::string ip;
-                int range_start, range_end;
-                if (!parse_eth_csv(csv, ip, range_start, range_end)) {
-                    std::cerr << "[Ethernet] malformed set_ethernet payload: " << csv << "\n";
-                } else {
-                    std::thread([&, ip, range_start, range_end]() {
-                        InflightGuard guard;
-                        do_set_ethernet(ip, range_start, range_end);
-                    }).detach();
-                }
+    server.route("GET", "/ethernet", [&](const httpsrv::Request&) {
+        return httpsrv::Response::json(eth_config_json(eth));
+    });
 
-            } else if (cmd.rfind("relay ", 0) == 0) {
-                std::istringstream iss(cmd.substr(6));
-                int port = 0;
-                std::string action;
-                if (!(iss >> port >> action) || (action != "on" && action != "off")) {
-                    std::cerr << "[Relay] malformed command, expected: relay <port> on|off (" << cmd << ")\n";
-                } else {
-                    std::thread([&, port, action]() { InflightGuard guard; do_relay(port, action); }).detach();
-                }
+    server.route("POST", "/ethernet", [&](const httpsrv::Request& req) {
+        std::string ip = json_get_string(req.body, "ip");
+        long range_start = json_get_int(req.body, "rangeStart", -1);
+        long range_end = json_get_int(req.body, "rangeEnd", -1);
+        if (ip.empty() || range_start < 0 || range_end < 0) {
+            return httpsrv::Response::error(400, "ip, rangeStart and rangeEnd are required");
+        }
+        std::cerr << "[Command] set_ethernet requested: " << ip << "," << range_start << "," << range_end << "\n";
+        std::thread([&, ip, range_start, range_end]() {
+            InflightGuard guard;
+            do_set_ethernet(ip, static_cast<int>(range_start), static_cast<int>(range_end));
+        }).detach();
+        return httpsrv::Response::json("{\"ok\":true}");
+    });
 
-            } else {
-                std::cerr << "[Command] unrecognised command: " << cmd << "\n";
-            }
-        });
+    server.route("POST", "/relay", [&](const httpsrv::Request& req) {
+        long port = json_get_int(req.body, "port", -1);
+        std::string action = json_get_string(req.body, "state");
+        if (port < 0 || (action != "on" && action != "off")) {
+            return httpsrv::Response::error(400, "port and state (\"on\"|\"off\") are required");
+        }
+        std::cerr << "[Command] relay " << port << " " << action << " requested\n";
+        bool ok = do_relay(static_cast<int>(port), action);
+        std::ostringstream o;
+        o << "{\"ok\":" << (ok ? "true" : "false") << ","
+          << "\"relays\":" << relays_json(relays, relay_port_mu) << "}";
+        return httpsrv::Response::json(o.str());
+    });
 
-    std::string start_err;
-    if (!server.start(start_err)) {
-        std::cerr << "[Pico] failed to start: " << start_err << "\n";
+    std::string http_err;
+    if (!server.start(http_port, http_err)) {
+        std::cerr << "[HTTP] failed to start: " << http_err << "\n";
         return 1;
     }
-    std::cerr << "[Pico] bridge ready on " << serial_port << ", service " << SERVICE_UUID << "\n";
-
-    // Polls Status the same way leases/relays/victron below are polled --
-    // status_char otherwise only notifies from do_connect/do_forget/
-    // do_finish, and a client's very first read of it (right after
-    // connecting, deciding wizard vs. the finished-details screen) has no
-    // retry of its own. If that one read is lost -- the same BLE
-    // unreliability the relay write retries above exist for -- nothing
-    // would ever correct it for the rest of that connection, leaving an
-    // already-fully-set-up Pi stuck showing the wizard's network scan
-    // indefinitely. This closes that gap the same way the others do: a
-    // fresh value within 5s regardless of whether the initial read made
-    // it.
-    std::thread([&]() {
-        std::string last;
-        while (g_running) {
-            std::string json = status_json(wifi.get_status(), marker_exists(MARKER_FILE));
-            if (json != last) {
-                last = json;
-                server.notify(status_char, to_bytes(json));
-            }
-            std::this_thread::sleep_for(std::chrono::seconds(5));
-        }
-    }).detach();
-
-    // Polls dnsmasq's leases file for changes so a connected client's
-    // "allocated IPs" view updates on its own as devices join/leave
-    // eth0, without needing to re-open the app to see it.
-    std::thread([&]() {
-        std::string last;
-        while (g_running) {
-            std::string json = leases_json(eth.get_leases());
-            if (json != last) {
-                last = json;
-                server.notify(leases_char, to_bytes(json));
-            }
-            std::this_thread::sleep_for(std::chrono::seconds(5));
-        }
-    }).detach();
-
-    // Polls each configured relay's live state so a connected client
-    // sees changes made from elsewhere (another client, always_on
-    // resuming after pi-relay-control-alpine restarts, etc.) without
-    // having to trigger a write itself first. Skipped entirely when no
-    // relays are configured, since current_relays_json() would never
-    // change either way. Before setup finishes, current_relays_json()
-    // reports "[]" without touching the network -- see relays_char above
-    // -- so this doesn't start hammering pi-relay-control-alpine (which
-    // isn't even running yet) until there's an actual reason to.
-    if (!relays.empty()) {
-        std::thread([&]() {
-            std::string last;
-            while (g_running) {
-                // current_relays_json() -> relays_json() locks each port
-                // individually around its own query -- no outer lock
-                // needed here, and one would only add cross-port blocking
-                // this loop doesn't need (see relay_port_mu's comment).
-                std::string json = current_relays_json();
-                if (json != last) {
-                    last = json;
-                    server.notify(relays_char, to_bytes(json));
-                }
-                std::this_thread::sleep_for(std::chrono::seconds(5));
-            }
-        }).detach();
-    }
-
-    // Polls victron-ve-direct-alpine's status port for the latest
-    // telemetry frame so a connected client's Solar/Battery view
-    // updates on its own -- same pattern as the leases/relays polling
-    // above. Harmless when victron-ve-direct-alpine isn't installed:
-    // each attempt just fails to connect (see victron_control.hpp),
-    // which only ever notifies once (the initial "connected":false),
-    // not repeatedly, since this only notifies on change.
-    std::thread([&]() {
-        std::string last;
-        while (g_running) {
-            std::string json = victron_json(victronctl::query_status(victron_ctrl_port));
-            {
-                std::lock_guard<std::mutex> lk(victron_cache_mu);
-                victron_cache_json = json;
-            }
-            if (json != last) {
-                last = json;
-                server.notify(victron_char, to_bytes(json));
-            }
-            std::this_thread::sleep_for(std::chrono::seconds(5));
-        }
-    }).detach();
+    std::cerr << "[HTTP] listening on :" << http_port << " as \"" << dev_name << "\"\n";
 
     std::signal(SIGINT, on_signal);
     std::signal(SIGTERM, on_signal);
 
-    // PicoTransport runs its own reader thread (see pico_transport.hpp)
-    // -- unlike the old BlueZ path, there's no shared dispatch loop this
-    // thread needs to keep pumping, just a wait for a shutdown signal.
+    // http_server.hpp runs its own accept-loop and per-connection threads
+    // -- nothing here needs to keep pumping anything, just wait for a
+    // shutdown signal.
     while (g_running) {
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
     }
