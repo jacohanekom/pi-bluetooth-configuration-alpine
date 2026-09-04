@@ -9,8 +9,11 @@
  * own); if that doesn't succeed within a bounded time -- including the
  * common case of nothing being configured at all yet -- wlan0 switches
  * into its own access point (see ap_control.hpp) that a phone can join
- * directly, reaching this daemon's HTTP API (see http_server.hpp) at a
- * fixed local address to submit real credentials.
+ * directly, reaching this daemon's HTTP API (see http_server.hpp) to
+ * submit real credentials -- found automatically via mDNS/Bonjour (see
+ * mdns_responder.hpp) rather than requiring its address to be typed in,
+ * on whichever network (the fallback AP, or a real one once joined) the
+ * phone happens to be on.
  *
  * This replaces two earlier designs entirely (see git history): a
  * direct BlueZ/D-Bus GATT peripheral, and -- after BlueZ's own built-in
@@ -121,6 +124,7 @@
 #include "config.hpp"
 #include "eth_control.hpp"
 #include "http_server.hpp"
+#include "mdns_responder.hpp"
 #include "relay_control.hpp"
 #include "victron_control.hpp"
 #include "wifi_control.hpp"
@@ -437,6 +441,23 @@ int main(int argc, char** argv) {
     ethctl::EthControl eth(eth_iface);
     apctl::ApControl ap(iface, ap_ip, ap_range_start, ap_range_end);
 
+    // Advertised as soon as possible, independent of WiFi's own
+    // station-vs-AP boot sequence below -- it adapts to whichever
+    // interfaces/addresses actually come and go on its own (see
+    // mdns_responder.hpp's periodic refresh), so there's no need to
+    // sequence this after that decision is made. Lets the client app
+    // find this Pi automatically (Bonjour/NWBrowser on iOS) instead of
+    // requiring its address to be typed in.
+    mdns::MdnsResponder mdns_responder(dev_name, static_cast<uint16_t>(http_port));
+    {
+        std::string mdns_err;
+        if (!mdns_responder.start(mdns_err)) {
+            std::cerr << "[mDNS] failed to start: " << mdns_err << " -- the app will need the Pi's address entered manually\n";
+        } else {
+            std::cerr << "[mDNS] advertising " << dev_name << "." << mdns::SERVICE_TYPE << "\n";
+        }
+    }
+
     // eth0 is meant to always be a usable gateway, not something the app
     // has to configure first -- reapply its static IP/range (whatever
     // was last chosen, or the configured defaults on a fresh install)
@@ -744,6 +765,8 @@ int main(int argc, char** argv) {
 
     std::cerr << "[Main] shutting down, waiting for in-flight scan/connect work...\n";
     while (g_inflight.load() > 0) std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+    mdns_responder.stop();
 
     return 0;
 }

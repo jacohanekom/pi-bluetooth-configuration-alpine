@@ -14,9 +14,11 @@ WiFi station mode is driven through `wpa_cli` (wpa_supplicant's control
 interface) and `dhcpcd`; the fallback access point is driven through
 `hostapd` plus a dedicated `dnsmasq` DHCP scope. The HTTP API itself is a
 minimal, dependency-free server over plain POSIX sockets (no framework),
-thread-per-connection. No Bluetooth, no D-Bus, no BlueZ anywhere in this
-design -- see git history if you're looking for the earlier BLE-based
-revision this replaced.
+thread-per-connection. The Pi advertises itself over mDNS/Bonjour (see
+"Discovery" below) so the client app can find it automatically instead
+of requiring its address to be typed in. No Bluetooth, no D-Bus, no
+BlueZ anywhere in this design -- see git history if you're looking for
+the earlier BLE-based revision this replaced.
 
 This is a one-shot provisioning flow, not a managed session. Submitting
 credentials while the fallback AP is active necessarily ends that AP (the
@@ -359,6 +361,50 @@ hasn't synced a frame from the VE.Direct device yet, this just reports
 `{"connected":false}` -- it never blocks or crashes the HTTP server over
 it. Each TCP round-trip is capped at a 2-second timeout, same as relay
 control.
+
+## Discovery (mDNS/Bonjour)
+
+This daemon advertises itself over multicast DNS (RFC 6762/6763 -- the
+protocol Apple calls Bonjour) as `<serial>._aipicam._tcp.local.`, where
+`<serial>` is this Pi's own hardware serial number, same as the fallback
+AP's own SSID (see "One-shot provisioning and reboot behavior" above) --
+so a client app can find it automatically (iOS's `NWBrowser`, or any
+other mDNS-aware client) instead of requiring its address to be typed
+in, on whichever network (the fallback AP, or a real one once joined) it
+happens to be reachable on.
+
+Hand-rolled over a plain UDP multicast socket (`src/mdns_responder.hpp`)
+rather than using [Avahi](https://avahi.org/), the standard tool for
+this on Linux: Avahi hard-depends on the `dbus` package in Alpine
+(`avahi-openrc` requires it), which would reintroduce exactly the extra
+daemon/service-management surface this project spent real effort
+removing when BLE/BlueZ went away (see git history). This implementation
+covers only what's needed to advertise this one fixed service and
+answer queries for it -- it's not a general mDNS stack, and this daemon
+never itself browses or resolves anything else on the network.
+
+Advertised on every active network interface (normally both `wlan0` and
+`eth0` at once -- see "Ethernet direct-connect" above), re-announcing
+automatically whenever this Pi's own set of IPv4 addresses changes
+(WiFi joining/leaving, the fallback AP starting/stopping, Ethernet being
+plugged in) so a client already browsing notices without needing to
+requery. No pairing/encryption here either -- same trust model as
+everything else in this daemon (see Security model above): anyone on
+the network can see this Pi advertised and resolve its address.
+
+**Verification**: the DNS message encoding itself (`write_name`,
+`parse_questions`, `build_full_response`, etc. in `mdns_responder.hpp`)
+was checked directly against Apple's own `dns-sd` command-line tool (the
+same underlying stack iOS's `NWBrowser` uses) on a Mac before being
+wired into the Linux-only multicast socket layer that actually ships --
+`dns-sd -B _aipicam._tcp local.` (browse), `dns-sd -L <serial>
+_aipicam._tcp local.` (resolve to host:port), and `dns-sd -B
+_services._dns-sd._udp local.` (the generic "what services exist here"
+meta-query) all round-tripped correctly. The socket layer itself (which
+interfaces to join on, `IP_PKTINFO`-based per-interface replies) is
+Linux-specific and, like the rest of this daemon's networking code
+(`ap_control.hpp`, `hostapd`), can only be exercised at runtime on
+actual Pi hardware -- CI only proves it compiles.
 
 ## HTTP API
 

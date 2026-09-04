@@ -21,7 +21,11 @@ builddir="$srcdir"
 # entirely over the Pi's own onboard WiFi radio -- station mode to join
 # a real network, hostapd-driven AP mode as the fallback when that
 # fails or nothing's configured yet (see ap_control.hpp) -- with a
-# plain HTTP API (http_server.hpp) for a phone to talk to either way.
+# plain HTTP API (http_server.hpp) for a phone to talk to either way,
+# discoverable via a hand-rolled mDNS responder (mdns_responder.hpp)
+# rather than Avahi -- Avahi hard-depends on the `dbus` package in
+# Alpine, which would reintroduce exactly the daemon/service-management
+# surface removed above.
 prepare() {
 	default_prepare
 	cp "$startdir"/../src/main.cpp "$srcdir"/main.cpp
@@ -29,6 +33,7 @@ prepare() {
 	cp "$startdir"/../src/ap_control.hpp "$srcdir"/ap_control.hpp
 	cp "$startdir"/../src/eth_control.hpp "$srcdir"/eth_control.hpp
 	cp "$startdir"/../src/http_server.hpp "$srcdir"/http_server.hpp
+	cp "$startdir"/../src/mdns_responder.hpp "$srcdir"/mdns_responder.hpp
 	cp "$startdir"/../src/relay_control.hpp "$srcdir"/relay_control.hpp
 	cp "$startdir"/../src/victron_control.hpp "$srcdir"/victron_control.hpp
 	cp "$startdir"/../src/wifi_control.hpp "$srcdir"/wifi_control.hpp
