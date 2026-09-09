@@ -767,6 +767,7 @@ int main(int argc, char** argv) {
     while (g_inflight.load() > 0) std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
     mdns_responder.stop();
+    server.stop();
 
     return 0;
 }

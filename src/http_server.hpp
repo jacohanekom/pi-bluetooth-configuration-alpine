@@ -108,6 +108,28 @@ public:
         return true;
     }
 
+    // Closing listen_fd_ from another thread reliably unblocks a
+    // TCP-listener accept() call on Linux (it returns with EBADF) --
+    // the same technique mdns_responder.hpp uses to interrupt its own
+    // blocked recvmsg(). Without this, destroying an HttpServer that
+    // was actually started leaves accept_thread_ joinable, and
+    // std::thread's destructor calls std::terminate() in that case --
+    // exactly what surfaced as "terminate called without an active
+    // exception" right after every graceful shutdown (main.cpp calling
+    // this, or not, changes whether that crash happens -- it's harmless
+    // during an actual `reboot`, since the whole system is already going
+    // down by then, but not calling this at all could otherwise mask a
+    // real crash location during any future graceful-exit path).
+    void stop() {
+        running_ = false;
+        if (listen_fd_ >= 0) {
+            shutdown(listen_fd_, SHUT_RDWR);
+            close(listen_fd_);
+            listen_fd_ = -1;
+        }
+        if (accept_thread_.joinable()) accept_thread_.join();
+    }
+
 private:
     void accept_loop() {
         while (running_) {
