@@ -29,7 +29,6 @@
  * Safety note on why each block is scoped to exactly one interface).
  */
 #include <fstream>
-#include <iostream>
 #include <sstream>
 #include <string>
 
@@ -52,39 +51,24 @@ public:
     // old BLE-advertised name used) so multiple units are distinguishable
     // in a phone's WiFi network list, same reasoning as before.
     bool start(const std::string& ssid, std::string& err) {
-        // TEMPORARY diagnostic instrumentation: ap.start() reliably dies
-        // silently, with zero output, right after main.cpp logs "starting
-        // AP mode" -- but only when launched via supervise-daemon, not
-        // when run directly in the foreground. Every step below is now
-        // individually logged (flushed immediately) so the very next
-        // occurrence pinpoints exactly which command it dies on/in,
-        // without needing strace (no internet on-device to install it
-        // right now). Remove once the actual cause is found.
-        auto log_step = [](const std::string& s) { std::cerr << "[AP] step: " << s << std::endl; };
-
-        log_step("stop wpa_supplicant");
         // wpa_supplicant and hostapd can't both hold the radio -- get the
         // former out of the way first. Harmless if it wasn't running
         // (e.g. a fresh boot with nothing configured at all, where it
-        // may have already given up and exited on its own).
+        // may have already given up and exited on its own). This only
+        // works because our own init script declares `after
+        // wpa_supplicant`, not `need` -- see that file's own depend()
+        // comment for the OpenRC deadlock a `need` declaration causes
+        // here (confirmed live: this call reliably hung forever under
+        // supervise-daemon until that dependency was downgraded).
         run_command({"rc-service", "wpa_supplicant", "stop"}, 15);
-        log_step("stopped wpa_supplicant");
 
-        log_step("flush addr");
         run_command({"ip", "addr", "flush", "dev", iface_});
-        log_step("flushed addr");
-
-        log_step("add addr");
         auto add = run_command({"ip", "addr", "add", ip_ + "/24", "dev", iface_});
-        log_step("added addr, exit_code=" + std::to_string(add.exit_code));
         if (add.exit_code != 0) {
             err = "failed to assign AP address: " + add.output;
             return false;
         }
-
-        log_step("link up");
         run_command({"ip", "link", "set", iface_, "up"});
-        log_step("link is up");
 
         std::ostringstream hostapd_conf;
         hostapd_conf << "interface=" << iface_ << "\n"
@@ -94,7 +78,6 @@ public:
                      << "channel=6\n"
                      << "auth_algs=1\n"
                      << "wmm_enabled=0\n";
-        log_step("writing hostapd.conf");
         {
             std::ofstream out(HOSTAPD_CONF, std::ios::trunc);
             if (!out.is_open()) {
@@ -103,7 +86,6 @@ public:
             }
             out << hostapd_conf.str();
         }
-        log_step("wrote hostapd.conf");
 
         std::string prefix = ethctl::network_prefix24(ip_);
         std::ostringstream dnsmasq_block;
@@ -113,9 +95,7 @@ public:
                       << "dhcp-range=" << prefix << "." << range_start_ << ","
                       << prefix << "." << range_end_ << ",255.255.255.0,1h\n"
                       << "dhcp-option=option:dns-server," << ip_ << "\n";
-        log_step("writing dnsmasq block");
         ethctl::replace_marker_block(DNSMASQ_CONF, dnsmasq_block.str(), BEGIN_MARKER, END_MARKER);
-        log_step("wrote dnsmasq block");
 
         // Deliberately NOT `rc-update add`-ed into the default runlevel:
         // hostapd's lifecycle is entirely this daemon's own decision
@@ -124,32 +104,21 @@ public:
         // Leaving hostapd there would mean it starts automatically on
         // every *future* boot too, racing this daemon's own wlan0 setup
         // regardless of whether AP mode is actually needed that time.
-        log_step("stop hostapd");
         run_command({"rc-service", "hostapd", "stop"});
-        log_step("stopped hostapd");
-
-        log_step("start hostapd");
         auto hostapd_start = run_command({"rc-service", "hostapd", "start"}, 20);
-        log_step("hostapd start returned, exit_code=" + std::to_string(hostapd_start.exit_code));
         if (hostapd_start.exit_code != 0) {
             err = "hostapd failed to start: " + hostapd_start.output;
             return false;
         }
 
-        log_step("rc-update add dnsmasq");
         run_command({"rc-update", "add", "dnsmasq", "default"});
-        log_step("rc-update add dnsmasq done");
-
-        log_step("restart dnsmasq");
         auto dnsmasq_restart = run_command({"rc-service", "dnsmasq", "restart"}, 20);
-        log_step("dnsmasq restart returned, exit_code=" + std::to_string(dnsmasq_restart.exit_code));
         if (dnsmasq_restart.exit_code != 0) {
             err = "dnsmasq failed to restart: " + dnsmasq_restart.output;
             return false;
         }
 
         running_ = true;
-        log_step("done");
         return true;
     }
 
