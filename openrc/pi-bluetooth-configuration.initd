@@ -20,11 +20,25 @@ depend() {
     # Pi's own onboard WiFi radio (see src/ap_control.hpp/main.cpp's
     # boot sequence), not BLE. wpa_supplicant is what actually attempts
     # to join a configured network on its own; this daemon just waits to
-    # see whether that succeeds before falling back to AP mode, so it
-    # needs to already be running first. hostapd is deliberately NOT
-    # listed here -- it's started/stopped dynamically by this daemon
-    # itself as AP mode is entered/left (ap_control.hpp), not run as an
-    # always-on OpenRC service.
-    need wpa_supplicant
+    # see whether that succeeds before falling back to AP mode. hostapd
+    # is deliberately NOT listed here at all -- it's started/stopped
+    # dynamically by this daemon itself as AP mode is entered/left
+    # (ap_control.hpp), not run as an always-on OpenRC service.
+    #
+    # Deliberately "after", NOT "need": ap_control.hpp's own start()
+    # calls `rc-service wpa_supplicant stop` directly (to free the radio
+    # for hostapd) from within this already-running, supervise-daemon-
+    # supervised process. With a `need` dependency declared here, that
+    # nested call deadlocks -- OpenRC's stop logic for wpa_supplicant
+    # first looks up what depends on it, finds this service, and tries
+    # to cascade-stop *this process* first, which means waiting for it
+    # to exit -- but this process is the one blocked waiting for that
+    # same `rc-service wpa_supplicant stop` call to return. `after` keeps
+    # the boot-ordering preference (start once wpa_supplicant has already
+    # been dealt with, if it's starting in the same runlevel transition)
+    # without registering the dependency edge that triggers that cascade.
+    # The 20s station-connect timeout in main.cpp's own boot sequence
+    # already tolerates wpa_supplicant not being up yet regardless.
+    after wpa_supplicant
     after firewall
 }
