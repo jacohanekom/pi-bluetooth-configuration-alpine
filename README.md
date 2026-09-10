@@ -80,31 +80,41 @@ This daemon isn't meant to stay up managing an active WiFi connection --
 its only job is to get the Pi onto a network (or off one) and then get
 out of the way. `POST /connect`'s exact behavior depends on whether the
 fallback AP is currently active, because of a hard hardware constraint:
-this radio can't run AP and station mode at once, so submitting real
-credentials while the AP is active necessarily severs the phone's own
-connection to this daemon (reached via the AP) the moment the radio
-switches over -- there's no way to keep serving that same phone a
-"did it work" answer afterward.
+this radio can't run AP and station mode at once, so *attempting* a join
+while the AP is active would sever the phone's own connection to this
+daemon (reached via the AP) the moment the radio switched over -- before
+a response could even be sent back, and with no way to continue the
+wizard's remaining steps afterward either.
 
 - **If the fallback AP is active** (fresh setup, or the previously
-  configured network couldn't be joined): `POST /connect` acknowledges
-  the request immediately, then on a background thread tears the AP
-  down and attempts to join the given network. On success, this
-  immediately creates `/.successfully-initialized` and reboots -- there's
-  no separate `finish` step in this path, since by the time the outcome
-  is known the AP (and the phone's only path to this daemon) is already
-  gone. On failure, the AP is restarted so the phone has something to
-  reconnect to and retry against.
+  configured network couldn't be joined): `POST /connect` does *not*
+  attempt the join at all -- it stages the credentials directly into
+  `wpa_supplicant.conf` (a plain file write, no live `wpa_supplicant`
+  process involved, since AP mode has it stopped entirely) and returns
+  immediately, without touching the radio or the AP. The phone's
+  connection to the daemon is never disrupted, so the wizard continues
+  normally: `POST /ethernet` stays available for the local network
+  configuration step, then the client sends `POST /finish`, which is
+  what actually reboots the Pi. The join itself is only attempted
+  *after* that reboot, via the same station-then-AP-fallback logic that
+  already runs on every startup -- so a wrong password or an
+  out-of-range network just falls back into AP mode again automatically,
+  the same way "nothing configured" does today, and the phone (having
+  lost the AP at that point regardless, once the Pi reboots) needs to
+  search again to find out which way it went.
 - **If the AP is *not* active** (already on a real network, e.g.
-  reconfiguring): `POST /connect` joins the given network without
-  marking setup finished or rebooting -- `POST /ethernet` stays available
-  for one more optional step (customizing `eth0`'s local network
-  configuration) before the client sends `POST /finish`.
-- **`POST /finish`**: only takes effect if WiFi is actually connected (a
-  no-op, logged, otherwise). Creates `/.successfully-initialized` (an
-  empty marker file at the filesystem root), waits 3 seconds (enough
-  time for the HTTP response to actually reach the client before the
-  connection drops), then reboots the Pi.
+  reconfiguring): `POST /connect` joins the given network directly and
+  synchronously (unchanged from before) without marking setup finished
+  or rebooting -- `POST /ethernet` stays available for one more optional
+  step before the client sends `POST /finish`.
+- **`POST /finish`**: allowed in either of two states -- WiFi is already
+  actually connected (the direct-join path above), or credentials were
+  staged while the fallback AP was active (the previous bullet); rejected
+  (a no-op, logged) if neither is true, since rebooting then would land
+  on a Pi that isn't actually configured at all. Creates
+  `/.successfully-initialized` (an empty marker file at the filesystem
+  root), waits 3 seconds (enough time for the HTTP response to actually
+  reach the client before the connection drops), then reboots the Pi.
 - **`POST /forget`**: removes `/.successfully-initialized` if present,
   then reboots the same way (also after the 3-second delay).
 
@@ -417,9 +427,9 @@ these routes need.
 |---|---|---|
 | `GET /status` | -- | Combined snapshot: `wifi`, `apActive`, `eth`, `leases`, `relays`, `victron`, `scan` -- see "Status JSON" below. No server push (no BLE-style notify): poll this periodically instead. |
 | `POST /scan` | -- | `{"ok":true}` immediately; triggers a background scan (~4s). Poll `GET /status`'s `scan` field for results. |
-| `POST /connect` | `{"ssid":...,"password":...}` (omit/empty password for an open network) | `{"ok":true}` immediately; see "One-shot provisioning and reboot behavior" above for what happens next, which differs depending on whether the fallback AP is currently active. |
+| `POST /connect` | `{"ssid":...,"password":...}` (omit/empty password for an open network) | `{"ok":true}`; see "One-shot provisioning and reboot behavior" above -- while the fallback AP is active this only *stages* the credentials (no join attempted, no reboot yet) so the wizard can continue; otherwise it joins directly and synchronously, same as before. |
 | `POST /forget` | -- | `{"ok":true}` immediately; forgets the configured network and reboots a few seconds later. |
-| `POST /finish` | -- | `{"ok":true}` immediately; only takes effect if WiFi is connected and the fallback AP isn't active (see above) -- concludes setup and reboots. |
+| `POST /finish` | -- | `{"ok":true}` immediately; allowed if WiFi is connected *or* credentials were staged via `POST /connect` from AP mode (see above) -- concludes setup and reboots. |
 | `GET /ethernet` | -- | `{"ip":...,"rangeStart":...,"rangeEnd":...}` -- eth0's current gateway config. |
 | `POST /ethernet` | `{"ip":...,"rangeStart":...,"rangeEnd":...}` | `{"ok":true}`; see "Ethernet direct-connect" (rejected once setup has finished). |
 | `POST /relay` | `{"port":...,"state":"on"\|"off"}` | `{"ok":bool,"relays":[...]}` -- see "Relay control" (rejected until setup has finished). |
@@ -430,18 +440,23 @@ these routes need.
    password) if it's advertising one, or otherwise reach the Pi on
    whatever network it's already on.
 2. Optionally `POST /scan`, wait ~5s, then check `GET /status`'s `scan`
-   field for a picklist.
-3. `POST /connect` with the chosen `ssid`/`password`.
-4. Poll `GET /status` until `wifi.state` is `connected` or `failed`.
-   What happens next depends on `apActive` at the time `/connect` was
-   called -- see "One-shot provisioning and reboot behavior" above. If
-   the AP was active, expect to lose the connection to the Pi entirely
-   at this point (the AP goes away as part of joining the real network) --
-   there is no further polling to do from this same network path.
-5. If the AP was *not* active (already on a real network, reconfiguring):
-   optionally customize the local network with `POST /ethernet`, then
-   `POST /finish` to conclude setup -- expect the Pi to reboot a few
-   seconds later.
+   field for a picklist. While the fallback AP is active, this only ever
+   reflects a scan taken *before* switching into AP mode (see "Status
+   JSON" below) -- `wpa_supplicant` is stopped entirely at that point, so
+   a live scan has nothing to talk to.
+3. `POST /connect` with the chosen `ssid`/`password`. If `apActive` was
+   `true` at this point, this only stages the credentials -- no join is
+   attempted yet, and the connection to the Pi is not disrupted. If it
+   was `false` (already on a real network, reconfiguring), this joins
+   directly and synchronously instead -- poll `GET /status` until
+   `wifi.state` is `connected` or `failed` before continuing.
+4. Optionally customize the local network with `POST /ethernet`.
+5. `POST /finish` to conclude setup -- expect the Pi to reboot a few
+   seconds later. If setup started from the fallback AP, this is also
+   the point the staged credentials are actually attempted, *after* the
+   reboot -- expect to lose the connection to the Pi at this point
+   either way (the AP goes away, whether or not the join succeeds), with
+   no further polling to do from this same network path.
 
 ### Status JSON
 

@@ -17,6 +17,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
+#include <fstream>
 #include <iostream>
 #include <mutex>
 #include <sstream>
@@ -27,6 +28,8 @@
 #include <openssl/evp.h>
 
 #include "subprocess.hpp"
+
+constexpr const char* WPA_SUPPLICANT_CONF = "/etc/wpa_supplicant/wpa_supplicant.conf";
 
 struct ScanResult {
     std::string ssid;
@@ -310,6 +313,76 @@ public:
         remove_all_networks();
         run_command({"wpa_cli", "-i", iface_, "save_config"});
         set_status(WifiStatus{});
+    }
+
+    // Saves ssid/psk directly into wpa_supplicant.conf's own text,
+    // *without* needing wpa_supplicant itself to be running -- unlike
+    // connect() above (which drives a live wpa_supplicant process via
+    // wpa_cli), this only edits the config file. Needed specifically for
+    // staging credentials while the fallback AP is active: wpa_supplicant
+    // is stopped entirely in that state (see ap_control.hpp), so there's
+    // no live control socket for wpa_cli to talk to at all, yet the
+    // wizard still needs a way to save what the user just entered without
+    // disrupting the AP itself (see main.cpp's do_connect for why that
+    // matters). Takes effect the next time wpa_supplicant (re)starts and
+    // reads this file -- normally this daemon's own next reboot.
+    //
+    // Replaces every network{} block already in the file with exactly
+    // one new one (same "single active network" model as connect()
+    // above), using the same hex-encoding scheme wpa_cli itself accepts
+    // on the wire (see this file's own header comment) so there is
+    // nothing to escape regardless of what bytes the SSID/passphrase
+    // contain -- confirmed against wpa_supplicant.conf's own documented
+    // format (an unquoted `ssid=<hex>` line is a first-class alternative
+    // to a quoted string, not a hack).
+    bool stage(const std::string& ssid, const std::string& psk, std::string& err) {
+        using namespace wifi_detail;
+
+        std::ifstream in(WPA_SUPPLICANT_CONF);
+        if (!in.is_open()) {
+            err = "could not open " + std::string(WPA_SUPPLICANT_CONF);
+            return false;
+        }
+        std::ostringstream kept;
+        std::string line;
+        int depth = 0;
+        while (std::getline(in, line)) {
+            if (depth == 0) {
+                std::string t = trim(line);
+                if (t.rfind("network", 0) == 0 && t.find('{') != std::string::npos) {
+                    for (char c : line) {
+                        if (c == '{') ++depth;
+                        else if (c == '}') --depth;
+                    }
+                    continue; // entering a network{} block -- drop this line, and every
+                              // line until its matching close, replaced by our own below
+                }
+                kept << line << "\n";
+            } else {
+                for (char c : line) {
+                    if (c == '{') ++depth;
+                    else if (c == '}') --depth;
+                }
+            }
+        }
+        in.close();
+
+        std::ofstream out(WPA_SUPPLICANT_CONF, std::ios::trunc);
+        if (!out.is_open()) {
+            err = "could not write " + std::string(WPA_SUPPLICANT_CONF);
+            return false;
+        }
+        out << kept.str();
+        out << "network={\n"
+            << "\tssid=" << to_hex(ssid) << "\n";
+        if (!psk.empty()) {
+            out << "\tpsk=" << derive_psk_hex(ssid, psk) << "\n"
+                << "\tkey_mgmt=WPA-PSK\n";
+        } else {
+            out << "\tkey_mgmt=NONE\n";
+        }
+        out << "}\n";
+        return true;
     }
 
 private:

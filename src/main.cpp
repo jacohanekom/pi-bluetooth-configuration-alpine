@@ -36,12 +36,21 @@
  *                   design needed.
  *   POST /scan      triggers a background WiFi scan; poll GET /status
  *                   for results once it finishes (a few seconds later).
- *   POST /connect   {"ssid":...,"password":...} -- see do_connect's own
- *                   comment for why this behaves differently depending
- *                   on whether AP mode is currently active.
+ *   POST /connect   {"ssid":...,"password":...} -- see the route
+ *                   registration's own comment for why this behaves
+ *                   differently depending on whether AP mode is
+ *                   currently active: while it's active, this only
+ *                   stages the credentials (WifiControl::stage) rather
+ *                   than attempting the join immediately, specifically
+ *                   so it doesn't tear down the very AP connection this
+ *                   request arrived over.
  *   POST /forget    forgets the configured network, reboots.
- *   POST /finish    concludes setup (only meaningful when NOT starting
- *                   from AP mode -- see do_connect).
+ *   POST /finish    concludes setup and reboots -- allowed either once
+ *                   WiFi is actually connected (reconfiguring an
+ *                   already-networked Pi), or once credentials have been
+ *                   staged via POST /connect from AP mode (see
+ *                   do_finish); the actual join in the latter case only
+ *                   happens after this reboot.
  *   GET  /ethernet  current eth0 gateway IP + DHCP range.
  *   POST /ethernet  {"ip":...,"rangeStart":...,"rangeEnd":...} -- stage
  *                   eth0's local network config; see eth_control.hpp.
@@ -91,9 +100,9 @@
  * phone's WiFi network list instead of all showing the same name.
  *
  * This is a one-shot provisioning flow, not a managed session: a
- * successful "finish" (or a "connect" that started from AP mode -- see
- * do_connect) creates MARKER_FILE and reboots the Pi a few seconds
- * later; a "forget" removes MARKER_FILE and reboots the same way. There
+ * successful "finish" creates MARKER_FILE and reboots the Pi a few
+ * seconds later; a "forget" removes MARKER_FILE and reboots the same
+ * way. There
  * is deliberately no ongoing management interface beyond this same HTTP
  * API -- once WiFi is set up, the expectation is that the Pi reboots
  * into its normal role, and this daemon (and the API) stay available on
@@ -485,6 +494,14 @@ int main(int argc, char** argv) {
     std::mutex scan_mu;
     std::string last_scan_json = "[]";
 
+    // True once credentials have been staged into wpa_supplicant.conf
+    // directly (see WifiControl::stage and the POST /connect route
+    // below) while the fallback AP was active. do_finish checks this to
+    // allow concluding the wizard even though wifi.state was never
+    // actually driven to CONNECTED -- the join itself only happens after
+    // the reboot POST /finish triggers, not before.
+    bool staged_network = false;
+
     // Tries to join whatever's already configured -- wpa_supplicant,
     // already started by OpenRC before this daemon (see its own
     // depend()), attempts this entirely on its own; this just waits to
@@ -546,62 +563,16 @@ int main(int argc, char** argv) {
         last_scan_json = scan_json(results);
     };
 
-    // The one action with genuinely different behavior depending on
-    // whether AP mode is currently active, because of a hard hardware
-    // constraint: this radio can't run AP and station mode at once, so
-    // submitting real credentials while AP mode is active necessarily
-    // means the phone's own connection to this daemon (reached via the
-    // AP) is about to be severed the moment wlan0 switches over --
-    // there's no way to keep serving that same phone a "did it work"
-    // answer afterward. So in that case, this treats a successful join
-    // as automatically finished too (marking MARKER_FILE and rebooting
-    // immediately, same as POST /finish normally would) rather than
-    // waiting for a separate finish step nothing could ever reach; and
-    // on failure, it restarts the AP so the phone (which will have
-    // noticed its connection drop either way) has something to
-    // reconnect to and retry against.
-    //
-    // If AP mode was NOT active (this Pi is already on a real network --
-    // wlan0 stays in station mode throughout, nothing about the phone's
-    // own connection to this daemon changes), this behaves exactly like
-    // the old BLE-era flow: joins the network, but leaves marking
-    // MARKER_FILE/rebooting to a separate POST /finish, so local network
-    // (Ethernet) settings can still be adjusted first if needed.
-    auto do_connect = [&](const std::string& ssid, const std::string& psk) {
-        bool was_ap = ap.is_running();
-        if (was_ap) {
-            std::string ap_err;
-            if (!ap.stop(ap_err)) std::cerr << "[AP] failed to stop cleanly: " << ap_err << "\n";
-        }
-
-        bool ok = wifi.connect(ssid, psk);
-
-        if (!was_ap) return; // old, unchanged behavior -- see comment above
-
-        if (ok) {
-            std::ofstream(MARKER_FILE).close();
-            std::cerr << "[Wifi] joined " << ssid << " from AP mode -- finishing and rebooting\n";
-            reboot_after_delay();
-        } else {
-            std::cerr << "[Wifi] failed to join " << ssid << " from AP mode -- restarting AP\n";
-
-            // Same reasoning as the boot sequence's own pre-AP scan: the
-            // radio is briefly back in station mode right here (ap.stop()
-            // above restarted wpa_supplicant so wifi.connect() could even
-            // attempt this join), so this is the last chance to refresh
-            // the picker's results before AP mode makes scanning
-            // impossible again -- worth doing since the user is about to
-            // retry with a different network after this failure.
-            auto results = wifi.scan(max_scan_results);
-            {
-                std::lock_guard<std::mutex> lk(scan_mu);
-                last_scan_json = scan_json(results);
-            }
-
-            std::string ap_err;
-            if (!ap.start(dev_name, ap_err)) std::cerr << "[AP] failed to restart: " << ap_err << "\n";
-        }
-    };
+    // Only ever reached when the fallback AP is NOT active (this Pi is
+    // already on a real network, reconfiguring) -- see the POST /connect
+    // route registration below for the AP-active case, which stages
+    // credentials into wpa_supplicant.conf directly instead of calling
+    // this at all. wlan0 stays in station mode throughout here, so
+    // nothing about the phone's own connection to this daemon changes;
+    // joins the network but leaves marking MARKER_FILE/rebooting to a
+    // separate POST /finish, so local network (Ethernet) settings can
+    // still be adjusted first if needed.
+    auto do_connect = [&](const std::string& ssid, const std::string& psk) { wifi.connect(ssid, psk); };
 
     auto do_forget = [&]() {
         wifi.forget();
@@ -609,14 +580,22 @@ int main(int argc, char** argv) {
         reboot_after_delay();
     };
 
-    // The end of the wizard when it didn't start from AP mode (see
-    // do_connect) -- only meaningful once WiFi is actually connected,
-    // since finishing before that would reboot into a Pi that isn't
-    // actually configured. Marks success on disk and reboots into the
-    // Pi's normal role rather than staying up to be managed further.
+    // The end of the wizard -- marks success on disk and reboots into
+    // the Pi's normal role rather than staying up to be managed further.
+    // Allowed in either of two states: WiFi is already actually
+    // connected (the do_connect path above, reconfiguring an
+    // already-networked Pi), or credentials were staged while the
+    // fallback AP was active (see POST /connect below) -- in the latter
+    // case wifi.state is *not* "connected" yet at all, since nothing has
+    // actually been attempted; the join itself only happens after this
+    // reboot, via the same station-then-AP-fallback boot sequence that
+    // already runs on every startup. Rejecting both would reboot into a
+    // Pi that isn't actually configured at all, which finishing is
+    // specifically meant to prevent.
     auto do_finish = [&]() {
-        if (wifi.get_status().state != WifiStatus::CONNECTED) {
-            std::cerr << "[Finish] ignoring: WiFi is not connected\n";
+        bool staged_via_ap = ap.is_running() && staged_network;
+        if (!staged_via_ap && wifi.get_status().state != WifiStatus::CONNECTED) {
+            std::cerr << "[Finish] ignoring: WiFi is not connected and nothing has been staged\n";
             return;
         }
         std::ofstream(MARKER_FILE).close();
@@ -744,6 +723,33 @@ int main(int argc, char** argv) {
         std::string psk = json_get_string(req.body, "password");
         if (ssid.empty()) return httpsrv::Response::error(400, "ssid is required");
         std::cerr << "[Command] connect requested: \"" << ssid << "\"\n";
+
+        if (ap.is_running()) {
+            // This radio can't run AP and station mode at once, so
+            // actually attempting this join would tear the fallback AP
+            // down immediately -- severing the very connection this
+            // request arrived over, before a response could even be
+            // sent, with no way to continue the wizard's remaining steps
+            // afterward either. Staging is a plain file write (see
+            // WifiControl::stage), fast enough to do synchronously and
+            // report the real outcome immediately, instead of the usual
+            // fire-and-forget pattern other routes use for slower,
+            // backgrounded work. The actual join is attempted fresh after
+            // the reboot POST /finish triggers, via the same
+            // station-then-AP-fallback logic that already runs on every
+            // boot -- so a wrong password/out-of-range network falls back
+            // into the AP again automatically, same as "nothing
+            // configured" does today.
+            std::string stage_err;
+            if (!wifi.stage(ssid, psk, stage_err)) {
+                std::cerr << "[Wifi] failed to stage \"" << ssid << "\": " << stage_err << "\n";
+                return httpsrv::Response::error(500, stage_err);
+            }
+            staged_network = true;
+            std::cerr << "[Wifi] staged \"" << ssid << "\" -- will attempt on next reboot\n";
+            return httpsrv::Response::json("{\"ok\":true}");
+        }
+
         std::thread([&, ssid, psk]() { InflightGuard guard; do_connect(ssid, psk); }).detach();
         return httpsrv::Response::json("{\"ok\":true}");
     });
