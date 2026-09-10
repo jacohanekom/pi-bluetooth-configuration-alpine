@@ -478,6 +478,13 @@ int main(int argc, char** argv) {
         }
     }).detach();
 
+    // Declared before the boot sequence below (not just before route
+    // registration, where do_scan itself is defined) specifically so
+    // that sequence can seed this cache with one real scan taken while
+    // the radio is still in station mode -- see its own comment for why.
+    std::mutex scan_mu;
+    std::string last_scan_json = "[]";
+
     // Tries to join whatever's already configured -- wpa_supplicant,
     // already started by OpenRC before this daemon (see its own
     // depend()), attempts this entirely on its own; this just waits to
@@ -496,6 +503,25 @@ int main(int argc, char** argv) {
     } else {
         std::cerr << "[Wifi] no configured network joined within " << sta_boot_timeout_secs
                    << "s -- starting AP mode\n";
+
+        // Scan *before* switching to AP mode, not after: ap.start() stops
+        // wpa_supplicant entirely to free the radio for hostapd, and this
+        // hardware can't run AP and station mode at once (see the
+        // README's "Known limitations") -- once AP mode is active,
+        // there's no wpa_supplicant left for a scan command to talk to at
+        // all, so POST /scan during the wizard would always come back
+        // empty. Caching one real scan here, taken while the radio is
+        // still capable of it, is what the wizard's network picker
+        // actually shows once the phone joins the fallback AP; see
+        // do_scan below (and its own POST /scan route) for why it
+        // deliberately becomes a no-op rather than a broken live scan
+        // once AP mode is running.
+        auto results = wifi.scan(max_scan_results);
+        {
+            std::lock_guard<std::mutex> lk(scan_mu);
+            last_scan_json = scan_json(results);
+        }
+
         std::string ap_err;
         if (!ap.start(dev_name, ap_err)) {
             std::cerr << "[AP] failed to start: " << ap_err << "\n";
@@ -504,10 +530,17 @@ int main(int argc, char** argv) {
 
     httpsrv::HttpServer server;
 
-    std::mutex scan_mu;
-    std::string last_scan_json = "[]";
-
+    // Only takes a real, live scan when the radio is actually in station
+    // mode (wpa_supplicant attached to it) -- while AP mode is active,
+    // wpa_supplicant has been stopped entirely (see ap_control.hpp), so
+    // there is nothing for a scan command to talk to; attempting one
+    // would just overwrite the perfectly good boot-time snapshot above
+    // with an empty result. The client's own "Rescan" button stays
+    // harmless either way -- it just re-serves that same snapshot while
+    // AP mode is active, rather than discovering anything new until the
+    // radio is back in station mode.
     auto do_scan = [&]() {
+        if (ap.is_running()) return;
         auto results = wifi.scan(max_scan_results);
         std::lock_guard<std::mutex> lk(scan_mu);
         last_scan_json = scan_json(results);
@@ -551,6 +584,20 @@ int main(int argc, char** argv) {
             reboot_after_delay();
         } else {
             std::cerr << "[Wifi] failed to join " << ssid << " from AP mode -- restarting AP\n";
+
+            // Same reasoning as the boot sequence's own pre-AP scan: the
+            // radio is briefly back in station mode right here (ap.stop()
+            // above restarted wpa_supplicant so wifi.connect() could even
+            // attempt this join), so this is the last chance to refresh
+            // the picker's results before AP mode makes scanning
+            // impossible again -- worth doing since the user is about to
+            // retry with a different network after this failure.
+            auto results = wifi.scan(max_scan_results);
+            {
+                std::lock_guard<std::mutex> lk(scan_mu);
+                last_scan_json = scan_json(results);
+            }
+
             std::string ap_err;
             if (!ap.start(dev_name, ap_err)) std::cerr << "[AP] failed to restart: " << ap_err << "\n";
         }

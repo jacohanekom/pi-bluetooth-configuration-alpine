@@ -487,6 +487,21 @@ running (see "One-shot provisioning and reboot behavior" above).
 are omitted since there's nothing to show for them. Starts as `[]` until
 the first `POST /scan` completes.
 
+**Only ever a live scan while the radio is in station mode.** This
+hardware can't run AP and station mode at once (see "Known limitations"
+below), and `wpa_supplicant` is stopped entirely while the fallback AP
+is active (see `ap_control.hpp`) -- so there's nothing for `POST /scan`
+to talk to at that point. To make the wizard's network picker still
+useful from inside the fallback AP, the daemon takes one real scan
+*just before* switching into AP mode (both on the initial boot-time
+fallback, and again if a `POST /connect` attempt started from AP mode
+fails and it falls back into AP mode a second time) and caches that
+snapshot; `POST /scan` while AP mode is active is a deliberate no-op
+that just re-serves it, rather than a broken live scan that would
+always come back empty. It reflects whatever was visible at that
+moment, not real-time -- if the network you want isn't listed, use
+**Enter Network Manually** rather than waiting on Rescan to find it.
+
 `eth` and `leases` are documented in "Ethernet direct-connect" above,
 `relays` in "Relay control", `victron` in "Victron solar/battery
 telemetry" -- all computed fresh on every `GET /status` call (no
