@@ -28,9 +28,11 @@
  * coexist in the same file without conflict (see eth_control.hpp's own
  * Safety note on why each block is scoped to exactly one interface).
  */
+#include <chrono>
 #include <fstream>
 #include <sstream>
 #include <string>
+#include <thread>
 
 #include "eth_control.hpp" // reuses network_prefix24/replace_marker_block
 #include "subprocess.hpp"
@@ -131,9 +133,36 @@ public:
         run_command({"ip", "addr", "flush", "dev", iface_});
 
         auto start = run_command({"rc-service", "wpa_supplicant", "start"}, 15);
-        running_ = false;
         if (start.exit_code != 0) {
+            running_ = false;
             err = "wpa_supplicant failed to restart: " + start.output;
+            return false;
+        }
+
+        // rc-service/supervise-daemon returning success only means the
+        // process was launched, not that its control interface is ready
+        // yet -- wpa_supplicant needs a moment to reopen the radio and
+        // rebind its ctrl_interface socket after hostapd just had
+        // exclusive use of it. Callers of this function (main.cpp's
+        // do_connect) invoke wpa_cli-driven WifiControl::connect()
+        // immediately afterward; without this wait, that fails with
+        // "could not parse network id from wpa_cli" -- confirmed live --
+        // since there's nothing yet listening on the control socket.
+        // wpa_cli status succeeds (exit 0) the moment that socket exists,
+        // regardless of which wpa_state it reports, so it's a reliable
+        // readiness check independent of whether anything is configured.
+        bool ready = false;
+        for (int i = 0; i < 20; ++i) { // ~5s
+            if (run_command({"wpa_cli", "-i", iface_, "status"}).exit_code == 0) {
+                ready = true;
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(250));
+        }
+
+        running_ = false;
+        if (!ready) {
+            err = "wpa_supplicant restarted but its control interface never became ready";
             return false;
         }
         return true;
