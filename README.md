@@ -207,35 +207,61 @@ device on `eth0` gets an address and (via "Internet sharing" below) a
 route to the internet, but domain names don't resolve -- exactly the
 symptom this fixes.
 
-**Safety**: `dnsmasq` is configured with `interface=eth0` and
+**Safety**: `dnsmasq` is configured with `interface=<bridge>` (see
+"Bridging a second wired interface" below for what that bridge is) and
 `bind-interfaces` specifically so it only ever answers DHCP *and DNS*
-requests on `eth0` -- it must never be allowed to also serve WiFi/
-upstream LAN traffic, which would hand out conflicting addresses (DHCP)
-or expose an open resolver (DNS) on a network this daemon doesn't own.
-If you inspect or hand-edit `/etc/dnsmasq.conf`/`/etc/dhcpcd.conf`, the
+requests there -- it must never be allowed to also serve WiFi/upstream
+LAN traffic, which would hand out conflicting addresses (DHCP) or
+expose an open resolver (DNS) on a network this daemon doesn't own. If
+you inspect or hand-edit `/etc/dnsmasq.conf`/`/etc/dhcpcd.conf`, the
 daemon's own config lives in a `# BEGIN pi-bluetooth-configuration eth0
 static` / `# END ...` delimited block that's rewritten idempotently on
 every `set_ethernet` call -- anything outside that block is left
 untouched.
 
-**Internet sharing**: a device plugged into `eth0` gets real internet
-access, not just a link to the Pi -- the daemon enables IPv4 forwarding
-and NATs (`iptables`/`MASQUERADE`) `eth0`'s traffic out through the WiFi
+**Bridging a second wired interface**: if this Pi has a second wired
+port (e.g. a USB-Ethernet dongle, commonly showing up as `eth1`),
+setting `ethernet.interface2` in `config.ini` bridges it together with
+`eth0` into one local network, using a Linux bridge device
+(`br-pi-bluetooth-configuration`) rather than giving each interface its
+own address. This is the only correct way to put two physical ports on
+the same logical network: two interfaces can't share one IP address
+directly, and giving them separate addresses in the same subnet
+*without* a bridge would leave a device on one port with no actual path
+to a device on the other -- they'd be on the same numeric subnet but
+different physical/broadcast domains, which Linux doesn't automatically
+bridge just because the addresses happen to overlap. The gateway IP,
+DHCP scope, and DNS above are all applied to the bridge once a second
+interface is configured, not to either physical interface -- `GET
+/ethernet` and `GET /status`'s `eth` field reflect the bridge's address
+either way, with or without a second interface actually present. Safe
+to set even on a Pi that doesn't have the second interface at all
+(checked for real at startup, not just configured) -- the bridge still
+exists with `eth0` as its only member in that case, one code path
+either way. Leave `ethernet.interface2` blank (the default) if there's
+only one wired port.
+
+**Internet sharing**: a device plugged into `eth0` (or the second
+interface, once bridged) gets real internet access, not just a link to
+the Pi -- the daemon enables IPv4 forwarding and NATs
+(`iptables`/`MASQUERADE`) the bridge's traffic out through the WiFi
 interface, which is what actually holds the internet connection here.
-Applied once at startup, right after `eth0`'s static IP -- see
+Applied once at startup, right after the bridge's static IP -- see
 "Internet sharing (eth0 -> WiFi)" below for details.
 
 ## Internet sharing (eth0 -> WiFi)
 
-`eth0` is a dead-end network of its own (see "Ethernet direct-connect"
-above) unless something routes its traffic somewhere with actual
-internet access -- which, on this Pi, is WiFi. At startup, right after
-applying `eth0`'s static IP, the daemon:
+`eth0` (and the bridge it's part of, if a second wired interface is
+configured -- see "Bridging a second wired interface" above) is a
+dead-end network of its own otherwise, unless something routes its
+traffic somewhere with actual internet access -- which, on this Pi, is
+WiFi. At startup, right after applying the bridge's static IP, the
+daemon:
 
 1. Enables `net.ipv4.ip_forward` (both live, via `/proc/sys/...`, and
    persisted for the next boot via a drop-in in `/etc/sysctl.d/`).
-2. Adds `iptables` rules NATing traffic from `eth0` out through the WiFi
-   interface (`iptables -t nat -A POSTROUTING -o <wifi_iface> -j
+2. Adds `iptables` rules NATing traffic from the bridge out through the
+   WiFi interface (`iptables -t nat -A POSTROUTING -o <wifi_iface> -j
    MASQUERADE`) plus the matching `FORWARD` rules to actually let that
    traffic across between the two interfaces.
 
@@ -655,6 +681,7 @@ dhcp_range_end   = 200
 
 [ethernet]
 interface        = eth0
+interface2       = ; optional -- e.g. eth1, bridged with `interface` -- see "Bridging a second wired interface"
 ip               = 192.168.4.1
 dhcp_range_start = 2
 dhcp_range_end   = 200

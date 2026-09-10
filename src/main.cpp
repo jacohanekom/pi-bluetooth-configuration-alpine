@@ -410,6 +410,12 @@ int main(int argc, char** argv) {
     const std::string dev_name   = serial.empty() ? configured_name : serial;
     const std::string iface      = cfg.get_str("wifi.interface", "wlan0");
     const std::string eth_iface  = cfg.get_str("ethernet.interface", "eth0");
+    // Optional -- a second wired interface (e.g. a USB-Ethernet dongle)
+    // to bridge with eth_iface onto the same local network. Empty means
+    // there isn't one; if it's set but not actually present on this
+    // particular Pi, EthControl still bridges eth_iface alone -- see
+    // eth_control.hpp's own header comment.
+    const std::string eth_iface2 = cfg.get_str("ethernet.interface2", "");
     const std::string eth_default_ip = cfg.get_str("ethernet.ip", "192.168.4.1");
     const int eth_default_range_start = cfg.get_int("ethernet.dhcp_range_start", 2);
     const int eth_default_range_end   = cfg.get_int("ethernet.dhcp_range_end", 200);
@@ -440,14 +446,14 @@ int main(int argc, char** argv) {
 
     std::cerr << "[Config] device   : " << dev_name << (serial.empty() ? " (configured)" : " (hardware serial)") << "\n"
               << "[Config] wifi if  : " << iface << "\n"
-              << "[Config] eth if   : " << eth_iface << "\n"
+              << "[Config] eth if   : " << eth_iface << (eth_iface2.empty() ? "" : " + " + eth_iface2) << "\n"
               << "[Config] ap ip    : " << ap_ip << "\n"
               << "[Config] http port: " << http_port << "\n"
               << "[Config] relays   : " << relays.size() << " configured\n"
               << "[Config] victron  : ctrl_port " << victron_ctrl_port << "\n";
 
     WifiControl wifi(iface);
-    ethctl::EthControl eth(eth_iface);
+    ethctl::EthControl eth(eth_iface, eth_iface2);
     apctl::ApControl ap(iface, ap_ip, ap_range_start, ap_range_end);
 
     // Advertised as soon as possible, independent of WiFi's own
@@ -467,23 +473,26 @@ int main(int argc, char** argv) {
         }
     }
 
-    // eth0 is meant to always be a usable gateway, not something the app
-    // has to configure first -- reapply its static IP/range (whatever
-    // was last chosen, or the configured defaults on a fresh install)
-    // on every startup, since `ip addr add` doesn't survive a reboot.
-    // Once that's in place, NAT eth0's traffic out through WiFi (see
-    // eth_control.hpp's enable_internet_sharing) so a device plugged
-    // into eth0 gets real internet access, not just a link to the Pi
-    // itself -- WiFi is what actually has the internet connection here.
-    std::thread([&eth, eth_default_ip, eth_default_range_start, eth_default_range_end, eth_iface, iface]() {
+    // eth0 (bridged with eth_iface2 if configured and present -- see
+    // eth_control.hpp) is meant to always be a usable gateway, not
+    // something the app has to configure first -- reapply its static
+    // IP/range (whatever was last chosen, or the configured defaults on
+    // a fresh install) on every startup, since `ip addr add` doesn't
+    // survive a reboot. Once that's in place, NAT the bridge's traffic
+    // out through WiFi (see eth_control.hpp's enable_internet_sharing)
+    // so a device plugged into either wired port gets real internet
+    // access, not just a link to the Pi itself -- WiFi is what actually
+    // has the internet connection here.
+    std::thread([&eth, eth_default_ip, eth_default_range_start, eth_default_range_end, iface]() {
         InflightGuard guard;
         std::string ip_err;
         if (!eth.ensure_static_ip(eth_default_ip, eth_default_range_start, eth_default_range_end, ip_err)) {
             std::cerr << "[Ethernet] failed to apply gateway IP: " << ip_err << "\n";
         }
         std::string nat_err;
-        if (!ethctl::enable_internet_sharing(eth_iface, iface, nat_err)) {
-            std::cerr << "[Ethernet] failed to enable internet sharing (" << eth_iface << " -> " << iface << "): " << nat_err << "\n";
+        std::string lan_iface = ethctl::EthControl::lan_interface();
+        if (!ethctl::enable_internet_sharing(lan_iface, iface, nat_err)) {
+            std::cerr << "[Ethernet] failed to enable internet sharing (" << lan_iface << " -> " << iface << "): " << nat_err << "\n";
         }
     }).detach();
 
