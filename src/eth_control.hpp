@@ -301,6 +301,17 @@ public:
                 return false;
             }
         }
+        // Linux bridges run Spanning Tree Protocol by default, which
+        // puts every newly-enslaved port through a "listening"/
+        // "learning" delay (15s each phase by default, so up to ~30s)
+        // before it actually forwards any traffic at all -- including
+        // DHCP broadcasts. STP exists to prevent loops across multiple
+        // *interconnected* bridges/switches; with exactly one bridge and
+        // two leaf interfaces here, there's no loop to protect against,
+        // so this disables it entirely rather than just shortening the
+        // delay -- a DHCP client shouldn't have to wait out a forwarding
+        // delay at all for something this simple.
+        run_command({"ip", "link", "set", BRIDGE_NAME, "type", "bridge", "stp_state", "0"});
         run_command({"ip", "link", "set", iface_, "up"});
         run_command({"ip", "link", "set", iface_, "master", BRIDGE_NAME});
         if (have_iface2) {
