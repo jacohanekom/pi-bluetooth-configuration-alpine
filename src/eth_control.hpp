@@ -101,9 +101,15 @@ constexpr const char* END_MARKER   = "# END pi-bluetooth-configuration eth0 stat
 // Bridges eth0 with a second wired interface (if configured and
 // present) into one local network -- see this file's own header
 // comment for why a bridge, not separate addresses, is required for
-// that. Named distinctly from any bridge a user might set up themselves
-// for other purposes.
-constexpr const char* BRIDGE_NAME  = "br-pi-bluetooth-configuration";
+// that. Linux network interface names are hard-capped at 15 characters
+// (the kernel's IFNAMSIZ limit) -- confirmed live: an earlier, longer
+// name here made `ip link add` fail silently (its exit code went
+// unchecked), which cascaded into every subsequent bridge-dependent
+// step failing with confusing, once-removed errors ("Cannot find
+// device ..."). "br-lan" is short enough to leave real margin under
+// that limit while still being distinct from any bridge a user might
+// set up themselves for other purposes.
+constexpr const char* BRIDGE_NAME  = "br-lan";
 
 struct Config {
     std::string ip;
@@ -283,8 +289,18 @@ public:
         // is required for that. `ip link add` on a bridge that already
         // exists fails harmlessly (EEXIST) -- this runs on every startup
         // (see ensure_static_ip), so it has to be idempotent rather than
-        // erroring out on the second and subsequent boots.
-        run_command({"ip", "link", "add", "name", BRIDGE_NAME, "type", "bridge"});
+        // erroring out on the second and subsequent boots. Checked
+        // explicitly (unlike most other steps here) specifically because
+        // a *silent* failure here previously cascaded into every
+        // subsequent step failing with a confusing, once-removed error
+        // ("Cannot find device ...") instead of the real cause.
+        if (!interface_exists(BRIDGE_NAME)) {
+            auto bridge_add = run_command({"ip", "link", "add", "name", BRIDGE_NAME, "type", "bridge"});
+            if (bridge_add.exit_code != 0) {
+                err = "failed to create bridge " + std::string(BRIDGE_NAME) + ": " + bridge_add.output;
+                return false;
+            }
+        }
         run_command({"ip", "link", "set", iface_, "up"});
         run_command({"ip", "link", "set", iface_, "master", BRIDGE_NAME});
         if (have_iface2) {

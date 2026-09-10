@@ -223,7 +223,7 @@ untouched.
 port (e.g. a USB-Ethernet dongle, commonly showing up as `eth1`),
 setting `ethernet.interface2` in `config.ini` bridges it together with
 `eth0` into one local network, using a Linux bridge device
-(`br-pi-bluetooth-configuration`) rather than giving each interface its
+(`br-lan`) rather than giving each interface its
 own address. This is the only correct way to put two physical ports on
 the same logical network: two interfaces can't share one IP address
 directly, and giving them separate addresses in the same subnet
