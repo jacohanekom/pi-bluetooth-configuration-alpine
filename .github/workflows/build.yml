@@ -123,3 +123,102 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: pi-bluetooth-configuration-aarch64.apk
+
+  build-armhf:
+    # Pi Zero / Zero W (original) -- ARMv6, 32-bit, no aarch64 support at
+    # all. GitHub Actions has no native ARMv6 runner, so this cross-builds
+    # under QEMU on a normal x86_64 runner instead of running natively
+    # like the aarch64 `build` job above.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm
+
+      - name: Build in Alpine container (armhf via QEMU)
+        run: |
+          docker run --rm --platform linux/arm/v6 -v "$PWD":/work -w /work alpine:3.20 sh -c '
+            set -e
+            apk add --no-cache build-base openssl-dev pkgconf
+
+            make
+
+            mkdir -p dist
+            cp pi-bluetooth-configuration dist/
+            cp config.ini dist/
+            cp openrc/pi-bluetooth-configuration.initd dist/
+          '
+
+      - name: Package artifact
+        run: |
+          mkdir -p pi-bluetooth-configuration-alpine-armhf
+          cp dist/* pi-bluetooth-configuration-alpine-armhf/
+          tar czf pi-bluetooth-configuration-alpine-armhf.tar.gz pi-bluetooth-configuration-alpine-armhf
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pi-bluetooth-configuration-alpine-armhf
+          path: pi-bluetooth-configuration-alpine-armhf.tar.gz
+
+      - name: Create release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: pi-bluetooth-configuration-alpine-armhf.tar.gz
+
+  apk-armhf:
+    # Same .apk packaging as the `apk` job above, but cross-built for
+    # armhf under QEMU (see build-armhf) since abuild's arch= now lists
+    # both aarch64 and armhf.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm
+
+      - name: Build .apk in Alpine container (armhf via QEMU)
+        run: |
+          mkdir -p apk-dist apk-home
+          docker run --rm --platform linux/arm/v6 -v "$PWD":/work -w /work/alpine \
+            -e HOME=/work/apk-home -e REPODEST=/work/apk-dist \
+            alpine:3.20 sh -c '
+              set -e
+              apk update
+              apk add alpine-sdk doas
+              echo "permit nopass builder" > /etc/doas.conf
+              chmod 0400 /etc/doas.conf
+
+              adduser -D builder
+              addgroup builder abuild
+              mkdir -p "$HOME"
+              chown -R builder:builder /work/alpine "$HOME" "$REPODEST"
+
+              su builder -c "
+                set -e
+                abuild-keygen -a -i -n
+                cd /work/alpine
+                abuild checksum
+                abuild -r
+              "
+            '
+
+      - name: Collect .apk artifact
+        run: |
+          APK_PATH="$(find apk-dist -name '*.apk' | head -n1)"
+          test -n "$APK_PATH"
+          cp "$APK_PATH" pi-bluetooth-configuration-armhf.apk
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pi-bluetooth-configuration-apk-armhf
+          path: pi-bluetooth-configuration-armhf.apk
+
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: pi-bluetooth-configuration-armhf.apk

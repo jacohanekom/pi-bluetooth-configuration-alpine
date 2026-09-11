@@ -2,9 +2,14 @@
 pkgname=pi-bluetooth-configuration
 pkgver=1.0.0
 pkgrel=0
-pkgdesc="Configure WiFi over a fallback access point (Alpine/OpenRC, Raspberry Pi 3)"
+pkgdesc="Configure WiFi over a fallback access point (Alpine/OpenRC, Raspberry Pi 3/Zero)"
 url="https://github.com/jacohanekom/pi-bluetooth-configuration-alpine"
-arch="aarch64"
+# aarch64: Pi 3 and other 64-bit-capable boards. armhf: Pi Zero/Zero W
+# (original) -- ARMv6, 32-bit, no aarch64 support at all. Both verified
+# to actually build via Docker's --platform linux/arm/v6 (armhf has no
+# native GitHub Actions runner, so CI builds it under QEMU emulation --
+# see build.yml's build-armhf/apk-armhf jobs).
+arch="aarch64 armhf"
 license="custom"
 makedepends="openssl-dev pkgconf"
 depends="libcrypto3 wpa_supplicant wpa_supplicant-openrc dhcpcd dhcpcd-openrc iproute2 dnsmasq dnsmasq-openrc iptables hostapd hostapd-openrc"

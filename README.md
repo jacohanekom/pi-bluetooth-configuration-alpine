@@ -1,14 +1,15 @@
 # pi-bluetooth-configuration-alpine
 
-Configure a Raspberry Pi 3's WiFi using only its own onboard WiFi radio --
+Configure a Raspberry Pi's WiFi using only its own onboard WiFi radio --
 no SSH, no keyboard, no display, no second board, no Bluetooth. On
 startup this daemon tries to join whatever network is already
 configured; if that fails -- including the common case of nothing being
 configured yet -- it switches the radio into its own access point that a
 phone can join directly, reaching a plain HTTP/JSON API to submit real
 credentials. This is the same shape ESP8266/ESP32 "WiFiManager"-style
-devices use for headless setup. For Raspberry Pi 3 running Alpine Linux
-(aarch64).
+devices use for headless setup. For a Raspberry Pi running Alpine Linux,
+either a Pi 3 or other 64-bit-capable board (`aarch64`) or an original
+Pi Zero/Zero W (`armhf`).
 
 WiFi station mode is driven through `wpa_cli` (wpa_supplicant's control
 interface) and `dhcpcd`; the fallback access point is driven through
@@ -598,26 +599,33 @@ hardware.
 
 ## Install the .apk (recommended)
 
-Every push builds `pi-bluetooth-configuration-aarch64.apk` (GitHub
-Actions artifact; tagged `v*` pushes also attach it to a GitHub Release),
-built via `abuild` from [`alpine/APKBUILD`](alpine/APKBUILD). It installs
-cleanly with `apk`, pulling in `wpa_supplicant`, `dhcpcd`, `dnsmasq`,
-`iptables`, and `hostapd` (plus their OpenRC services, where applicable)
-automatically. `dnsmasq` is started automatically the first time the
-daemon applies `eth0`'s default gateway IP (see "Ethernet
-direct-connect") -- no need to enable it manually. `hostapd` is
-deliberately *not* enabled at boot -- this daemon starts/stops it itself,
-dynamically, as it enters/leaves fallback-AP mode (see "One-shot
-provisioning and reboot behavior" above). `iptables` needs no service of
-its own; the daemon applies its NAT rules itself at startup (see
-"Internet sharing (eth0 -> WiFi)").
+Every push builds both `pi-bluetooth-configuration-aarch64.apk` (Pi 3 and
+other 64-bit-capable boards) and `pi-bluetooth-configuration-armhf.apk`
+(original Pi Zero/Zero W -- ARMv6, 32-bit) as separate GitHub Actions
+artifacts; tagged `v*` pushes also attach both to a GitHub Release. Both
+are built via `abuild` from the same [`alpine/APKBUILD`](alpine/APKBUILD)
+(`arch="aarch64 armhf"`) -- the armhf one is cross-built under QEMU in CI
+since GitHub Actions has no native ARMv6 runner. Grab whichever one
+matches your board. It installs cleanly with `apk`, pulling in
+`wpa_supplicant`, `dhcpcd`, `dnsmasq`, `iptables`, and `hostapd` (plus
+their OpenRC services, where applicable) automatically. `dnsmasq` is
+started automatically the first time the daemon applies `eth0`'s default
+gateway IP (see "Ethernet direct-connect") -- no need to enable it
+manually. `hostapd` is deliberately *not* enabled at boot -- this daemon
+starts/stops it itself, dynamically, as it enters/leaves fallback-AP mode
+(see "One-shot provisioning and reboot behavior" above). `iptables` needs
+no service of its own; the daemon applies its NAT rules itself at startup
+(see "Internet sharing (eth0 -> WiFi)").
 
 It's signed with a throwaway key generated fresh in CI each run (there's
 no distributed repo to establish trust for), so install with
 `--allow-untrusted`:
 
 ```sh
+# Pi 3 / other aarch64 boards:
 apk add --allow-untrusted ./pi-bluetooth-configuration-aarch64.apk
+# Pi Zero / Zero W (original):
+apk add --allow-untrusted ./pi-bluetooth-configuration-armhf.apk
 
 rc-update add wpa_supplicant default
 rc-update add pi-bluetooth-configuration default
@@ -630,13 +638,14 @@ Uninstall with `apk del pi-bluetooth-configuration`.
 
 ## Install from the release tarball
 
-Every push builds `pi-bluetooth-configuration-alpine-aarch64.tar.gz`
-(GitHub Actions artifact; tagged `v*` pushes also attach it to a GitHub
-Release).
+Every push builds `pi-bluetooth-configuration-alpine-aarch64.tar.gz` and
+`pi-bluetooth-configuration-alpine-armhf.tar.gz` (GitHub Actions
+artifacts; tagged `v*` pushes also attach both to a GitHub Release).
 
 ```sh
 apk add wpa_supplicant wpa_supplicant-openrc dhcpcd dhcpcd-openrc iproute2 dnsmasq dnsmasq-openrc iptables hostapd hostapd-openrc
 
+# substitute -armhf for -aarch64 above on a Pi Zero / Zero W
 tar xzf pi-bluetooth-configuration-alpine-aarch64.tar.gz
 cd pi-bluetooth-configuration-alpine-aarch64
 
