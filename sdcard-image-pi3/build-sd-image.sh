@@ -102,6 +102,16 @@ docker run --rm -v "$PWD/work:/work" -e BOOT_SIZE_MB="$BOOT_SIZE_MB" -e IMG_SIZE
 	'
 
 mv work/final.img "$OUT_IMG"
+
+# work/bootfs/* (copied out of the root-context rootfs-build container
+# via cp -a) is root-owned on genuine Linux Docker, where bind mounts
+# preserve real UID mapping -- a plain host-side `rm -rf work` then
+# fails with Permission denied for this unprivileged user (confirmed on
+# GitHub Actions' ubuntu-24.04-arm runner). macOS Docker Desktop's
+# virtiofs quietly maps container-root writes back to the invoking host
+# user instead, which is why this never surfaced building locally.
+# Clean up via the same root-context container that created them.
+docker run --rm -v "$PWD/work:/work" alpine:"$ALPINE_VERSION" sh -c 'rm -rf /work/*'
 rm -rf work
 
 echo "==> Done: $OUT_IMG ($(du -h "$OUT_IMG" | cut -f1))"
