@@ -97,11 +97,53 @@ cat > /etc/fstab <<'EOF'
 /dev/mmcblk0p1  /boot  vfat  rw,relatime  0  2
 EOF
 
+# wpa_supplicant's own OpenRC start_pre() (see /etc/init.d/wpa_supplicant's
+# find_wireless()) scans /sys/class/net/*/wireless exactly once, at start
+# time, with no retry -- if it finds nothing it logs "Could not find a
+# wireless interface" and starts with no interface bound at all, and
+# never retries even once the interface shows up moments later. The
+# onboard SDIO WiFi chip's driver (brcmfmac) measurably lags behind the
+# rest of a minimal Alpine boot (bus probe + firmware upload before
+# wlan0 is registered), so wpa_supplicant routinely loses this race.
+# This service just waits (bounded, 15s) for a wireless-capable
+# interface to appear before continuing -- placed in the "boot"
+# runlevel, which always fully completes before "default" (where
+# wpa_supplicant lives), so no explicit before/after dependency on
+# wpa_supplicant itself is needed, just correct runlevel placement.
+cat > /etc/init.d/wait-for-wlan <<'EOF'
+#!/sbin/openrc-run
+name="wait-for-wlan"
+description="Waits for the onboard WiFi interface to appear before wpa_supplicant starts"
+
+depend() {
+	after modules
+}
+
+start() {
+	ebegin "Waiting for a wireless interface"
+	local i=0
+	while [ "$i" -lt 30 ]; do
+		for iface in /sys/class/net/*; do
+			if [ -e "$iface/wireless" ] || [ -e "$iface/phy80211" ]; then
+				eend 0
+				return 0
+			fi
+		done
+		i=$((i + 1))
+		sleep 0.5
+	done
+	ewarn "No wireless interface appeared after 15s -- continuing anyway"
+	eend 0
+}
+EOF
+chmod +x /etc/init.d/wait-for-wlan
+
 rc-update add devfs sysinit
 rc-update add dmesg sysinit
 rc-update add mdev sysinit
 rc-update add hwclock boot
 rc-update add modules boot
+rc-update add wait-for-wlan boot
 rc-update add sysctl boot
 rc-update add hostname boot
 rc-update add bootmisc boot
