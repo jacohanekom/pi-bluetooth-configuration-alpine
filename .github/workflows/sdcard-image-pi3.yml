@@ -1,0 +1,81 @@
+name: Build SD card image (Pi 3 / aarch64)
+
+# Manual only -- unlike the package build.yml jobs, this isn't something
+# you want firing on every push: it depends on the *other* two repos'
+# latest artifacts too (not just this one), and produces a ~1GB image
+# that's slow-ish to build and would otherwise pile up in Actions
+# storage. Run it from this repo's Actions tab, or `gh workflow run
+# sdcard-image-pi3.yml -R jacohanekom/pi-bluetooth-configuration-alpine`.
+on:
+  workflow_dispatch:
+    inputs:
+      hostname:
+        description: "Hostname to bake into the image"
+        required: false
+        default: "aipicam"
+
+jobs:
+  build-image:
+    # Genuinely aarch64 hardware (no QEMU) -- matches sdcard-image-pi3's
+    # own local-build design (see build-sd-image.sh's comments): Docker
+    # on this runner is native arm64, so `docker run --platform
+    # linux/arm64` is a native container build, not emulated.
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@v4
+
+      # This repo's own latest .apk: same-repo Actions artifacts are
+      # readable with the default GITHUB_TOKEN (declared above), no PAT
+      # needed. The other two repos' artifacts below aren't -- a
+      # workflow's GITHUB_TOKEN is scoped to its own repo only.
+      - name: Fetch this repo's latest aarch64 .apk
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p sdcard-image-pi3/artifacts
+          RUN_ID="$(gh run list -R "${{ github.repository }}" --workflow=build.yml --status=success -L 1 --json databaseId -q '.[0].databaseId')"
+          test -n "$RUN_ID"
+          gh run download "$RUN_ID" -R "${{ github.repository }}" \
+            -n pi-bluetooth-configuration-apk-aarch64 -D sdcard-image-pi3/artifacts
+
+      # Cross-repo artifact downloads need a token with actions:read on
+      # those repos -- see README.md's "CI image build" section for how
+      # to mint the fine-grained PAT this expects in
+      # secrets.CROSS_REPO_GH_TOKEN.
+      - name: Fetch pi-relay-control-alpine's latest aarch64 .apk
+        env:
+          GH_TOKEN: ${{ secrets.CROSS_REPO_GH_TOKEN }}
+        run: |
+          RUN_ID="$(gh run list -R jacohanekom/pi-relay-control-alpine --workflow=build.yml --status=success -L 1 --json databaseId -q '.[0].databaseId')"
+          test -n "$RUN_ID"
+          gh run download "$RUN_ID" -R jacohanekom/pi-relay-control-alpine \
+            -n pi-relay-control-apk-aarch64 -D sdcard-image-pi3/artifacts
+
+      - name: Fetch victron-ve-direct-alpine's latest aarch64 .apk
+        env:
+          GH_TOKEN: ${{ secrets.CROSS_REPO_GH_TOKEN }}
+        run: |
+          RUN_ID="$(gh run list -R jacohanekom/victron-ve-direct-alpine --workflow=build.yml --status=success -L 1 --json databaseId -q '.[0].databaseId')"
+          test -n "$RUN_ID"
+          gh run download "$RUN_ID" -R jacohanekom/victron-ve-direct-alpine \
+            -n victron-ve-direct-apk-aarch64 -D sdcard-image-pi3/artifacts
+
+      - name: Build the SD card image
+        env:
+          ROOT_PASSWORD: ${{ secrets.SDCARD_ROOT_PASSWORD }}
+          PI_HOSTNAME: ${{ inputs.hostname }}
+        run: |
+          cd sdcard-image-pi3
+          ./build-sd-image.sh
+
+      # Short retention -- this is a ~1GB build artifact, not source; no
+      # need to let it sit in Actions storage for the default 90 days.
+      - name: Upload image artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pi-bluetooth-configuration-sdcard-aarch64
+          path: sdcard-image-pi3/pi-bluetooth-configuration-sdcard-aarch64.img
+          retention-days: 14
