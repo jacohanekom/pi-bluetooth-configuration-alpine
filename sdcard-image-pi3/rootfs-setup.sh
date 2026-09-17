@@ -141,6 +141,19 @@ chmod +x /etc/init.d/wait-for-wlan
 rc-update add devfs sysinit
 rc-update add dmesg sysinit
 rc-update add mdev sysinit
+# cmdline.txt has no explicit "rw", so the kernel mounts / read-only by
+# default -- fsck/root/localmount are what check it, remount it
+# read-write, and mount /boot (and anything else in fstab). Without
+# these, root stays read-only for the whole boot: the first-boot
+# script's ssh-keygen -A can't write /etc/ssh ("unable to initialize
+# ssh key" -- a read-only filesystem, not a keygen problem), nor can
+# anything else that writes to disk (logs, service state, the
+# firstboot-done marker itself). OpenRC resolves start order from each
+# service's own depend() (fsck -> root -> localmount) regardless of the
+# order they're added here.
+rc-update add fsck boot
+rc-update add root boot
+rc-update add localmount boot
 rc-update add hwclock boot
 rc-update add modules boot
 rc-update add wait-for-wlan boot
