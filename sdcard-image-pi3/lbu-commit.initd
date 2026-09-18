@@ -1,0 +1,30 @@
+#!/sbin/openrc-run
+# Diskless mode's root is tmpfs -- nothing survives a reboot unless it's
+# explicitly captured back into the apkovl on the boot partition. This
+# runs `lbu commit` (Alpine's own diskless config-persistence tool)
+# during a clean shutdown/reboot, so whatever changed under the paths
+# listed in /etc/apk/protected_paths.d/lbu.list (see build-image.sh --
+# /etc wholesale, and the provisioning marker file) survives into the
+# next boot. Without this, WiFi credentials saved by
+# WifiControl::connect()/stage(), SSH host keys, and
+# /.successfully-initialized (which pi-relay-control's own start_pre()
+# refuses to start without) would all silently reset on every single
+# reboot -- found on a real hardware test.
+#
+# Shutdown-runlevel services run their start() (not stop()) as the
+# system goes down -- same convention as Alpine's own mount-ro/
+# killprocs/savecache, which this deliberately runs before, so the boot
+# media is still mounted read-write and nothing's been killed out from
+# under `lbu commit` yet.
+name="lbu-commit"
+description="Persists /etc (and the provisioning marker) to the boot media on shutdown"
+
+depend() {
+	before mount-ro killprocs savecache
+}
+
+start() {
+	ebegin "Committing config to boot media"
+	lbu commit mmcblk0p1 -q
+	eend $?
+}

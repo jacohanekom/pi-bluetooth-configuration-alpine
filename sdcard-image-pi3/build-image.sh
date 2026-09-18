@@ -123,13 +123,15 @@ REPO_KEY=$(basename work/repo/*.rsa.pub)
 # way it would be on a disk-resident install).
 echo "==> Building the apkovl overlay"
 OVL=work/apkovl
-mkdir -p "$OVL"/etc/apk/keys "$OVL"/etc/runlevels/boot "$OVL"/etc/runlevels/default \
+mkdir -p "$OVL"/etc/apk/keys "$OVL"/etc/apk/protected_paths.d \
+	"$OVL"/etc/runlevels/boot "$OVL"/etc/runlevels/default "$OVL"/etc/runlevels/shutdown \
 	"$OVL"/etc/init.d "$OVL"/etc/local.d "$OVL"/var/lib
 
 cp "work/repo/$REPO_KEY" "$OVL/etc/apk/keys/"
 
 cat > "$OVL/etc/apk/world" <<-EOF
 	alpine-base
+	alpine-conf
 	pi-bluetooth-configuration
 	pi-relay-control
 	victron-ve-direct
@@ -144,6 +146,18 @@ cat > "$OVL/etc/apk/world" <<-EOF
 	openssh-server
 	linux-firmware-brcm
 	wireless-regdb
+EOF
+
+# Everything lbu commit (see lbu-commit.initd) captures back into the
+# apkovl on shutdown -- /etc wholesale (SSH host keys, wpa_supplicant's
+# saved credentials, sshd_config, shadow, our own runlevels/local.d/
+# apk state, all of it) plus the root-level provisioning marker
+# pi-relay-control's own start_pre() refuses to start without. Without
+# this, none of it would survive a reboot -- diskless mode's root is
+# tmpfs, rebuilt from scratch (this same apkovl) every single boot.
+cat > "$OVL/etc/apk/protected_paths.d/lbu.list" <<-EOF
+	+etc
+	+.successfully-initialized
 EOF
 
 # Matches the SD card's actual device name once mounted at runtime (the
@@ -177,6 +191,13 @@ EOF
 cp wait-for-wlan.initd "$OVL/etc/init.d/wait-for-wlan"
 chmod +x "$OVL/etc/init.d/wait-for-wlan"
 ln -sf /etc/init.d/wait-for-wlan "$OVL/etc/runlevels/boot/wait-for-wlan"
+
+# See lbu-commit.initd's own header comment for why this exists at all
+# -- without it, nothing (WiFi credentials, SSH host keys, the
+# provisioning marker) survives a reboot in diskless mode.
+cp lbu-commit.initd "$OVL/etc/init.d/lbu-commit"
+chmod +x "$OVL/etc/init.d/lbu-commit"
+ln -sf /etc/init.d/lbu-commit "$OVL/etc/runlevels/shutdown/lbu-commit"
 
 ln -sf /etc/init.d/local "$OVL/etc/runlevels/default/local"
 for svc in wpa_supplicant dhcpcd chronyd sshd dbus avahi-daemon \
@@ -224,7 +245,19 @@ chmod +x "$OVL/etc/local.d/aipicam-setup.start"
 # The target directory is pre-created on the boot partition below.
 ln -sf /media/mmcblk0p1/relay-state "$OVL/var/lib/relay_control"
 
-( cd "$OVL" && tar czf "../../work/$PI_HOSTNAME.apkovl.tar.gz" --numeric-owner etc var )
+# COPYFILE_DISABLE=1 stops macOS's tar from polluting the archive with
+# a ._<name> AppleDouble sidecar file for every single entry (its way
+# of representing extended attributes in plain POSIX tar) -- harmless
+# to what actually mattered so far (OpenRC's own scripts use specific
+# globs like *.start, not a raw directory scan, so these were never
+# actually being executed as bogus services) but still real pollution
+# worth not shipping. --owner=0 --group=0 forces genuine root:root
+# ownership instead of --numeric-owner preserving whatever this Mac
+# account's own uid/gid happens to be -- a real device's own `lbu
+# commit` (running as root) would naturally produce root:root, and nothing
+# here needs to be owned by anyone else.
+( cd "$OVL" && COPYFILE_DISABLE=1 tar czf "../../work/$PI_HOSTNAME.apkovl.tar.gz" \
+	--owner=0 --group=0 etc var )
 
 # ── 4. Assemble the boot media contents ─────────────────────────────────────
 echo "==> Assembling boot media contents"

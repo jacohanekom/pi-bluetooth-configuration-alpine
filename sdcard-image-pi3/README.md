@@ -78,30 +78,36 @@ fully different config-persistence model -- see below.
 ## Config persistence across reboots
 
 Diskless mode rebuilds the entire system from the local apk repo fresh
-on **every** boot -- nothing persists unless explicitly arranged for:
+on **every** boot -- root is tmpfs, so by default nothing survives a
+reboot at all. This image handles that with two different mechanisms
+for two different classes of state:
 
-- **SSH host keys** regenerate on every boot (not just the first). This
-  is normal, expected diskless behavior -- it just means the host key
-  fingerprint changes every reboot. Not a functional problem, but worth
-  knowing before you get a "REMOTE HOST IDENTIFICATION HAS CHANGED"
-  warning from your SSH client.
-- **Relay on/off state** (`pi-relay-control`'s whole "resume last
-  position after reboot" feature) is made to survive by symlinking
-  `/var/lib/relay_control` to `/media/mmcblk0p1/relay-state` -- a
-  directory pre-created on the boot partition itself, which *is*
-  genuinely persistent (it's the actual SD card content, mounted
-  read-write for the whole time the system runs).
-- Everything else config-wise (hostname, world file, runlevels, the
-  password hash) is baked into the `apkovl` at build time, so it's
-  consistent every boot by construction, not because anything was
-  "saved" at runtime.
+- **`/etc` and the provisioning marker** (`/.successfully-initialized`
+  -- `pi-relay-control`'s own `start_pre()` refuses to start without
+  it) are committed back to the boot partition automatically on every
+  clean shutdown/reboot, via a custom `lbu-commit` OpenRC service (see
+  `lbu-commit.initd`) that runs Alpine's own `lbu commit` -- the same
+  tool `setup-alpine`'s interactive wizard would normally wire up for
+  you, just invoked without ever running that wizard. This is what
+  makes **WiFi credentials** (`pi-bluetooth-configuration` writes them
+  into `/etc/wpa_supplicant/wpa_supplicant.conf`), **SSH host keys**,
+  and the provisioning marker all survive a reboot -- found missing
+  during a real hardware test; without it, a device would silently
+  fall back to its fallback AP on every single boot, forever, even
+  after a successful setup.
+- **Relay on/off state** (`pi-relay-control`'s "resume last position
+  after reboot" feature) lives under `/var`, which isn't covered by
+  the `/etc`-only `lbu` tracking above -- it's made to survive instead
+  by symlinking `/var/lib/relay_control` to
+  `/media/mmcblk0p1/relay-state`, a directory pre-created directly on
+  the boot partition (the actual SD card content, mounted read-write
+  for the whole time the system runs).
 
-If you want runtime changes (e.g. WiFi credentials
-`pi-bluetooth-configuration` saves after setup) to survive a reboot
-too, that's Alpine's standard `lbu commit` mechanism -- run it on the
-device once you're happy with its state, and it'll regenerate
-`aipicam.apkovl.tar.gz` on the boot partition with the current running
-config, which the next boot will then pick up automatically.
+An **unclean** power loss (pulling power rather than a normal reboot/
+shutdown) skips the `lbu-commit` service entirely, same as it would
+skip any other shutdown-runlevel service -- whatever changed since the
+last clean shutdown won't be captured. Not fixable in general for a
+diskless system without a UPS or similar; just worth knowing.
 
 ## Prerequisites
 
@@ -224,9 +230,10 @@ section. That means, for however long the Pi is in fallback-AP mode,
 anyone in range can also reach its SSH port over that same open network.
 Change `ROOT_PASSWORD` to something you're comfortable with before
 building, and consider switching to key-based auth once you're on the
-device (note: `/etc/ssh/sshd_config` changes made directly on a running
-device won't survive a reboot unless you `lbu commit` -- see above --
-or edit `build-image.sh`'s `aipicam-setup.start` template instead).
+device -- `/etc/ssh/sshd_config` changes made directly on a running
+device now *do* survive a clean reboot (see "Config persistence across
+reboots" above), so this can be done live rather than only by editing
+`build-image.sh`'s `aipicam-setup.start` template and rebuilding.
 
 Also note `victron-ve-direct`'s `allow_set = true` default in its
 `config.ini` lets anyone who can reach its status port (`:8562`) change
