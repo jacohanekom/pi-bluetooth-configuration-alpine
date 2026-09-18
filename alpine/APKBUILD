@@ -44,6 +44,7 @@ prepare() {
 	cp "$startdir"/../src/wifi_control.hpp "$srcdir"/wifi_control.hpp
 	cp "$startdir"/../src/subprocess.hpp "$srcdir"/subprocess.hpp
 	cp "$startdir"/../config.ini "$srcdir"/config.ini
+	cp "$startdir"/../wpa_supplicant.conf "$srcdir"/wpa_supplicant.conf
 	cp "$startdir"/../openrc/pi-bluetooth-configuration.initd "$srcdir"/pi-bluetooth-configuration.initd
 }
 
@@ -58,4 +59,10 @@ package() {
 	install -Dm755 pi-bluetooth-configuration "$pkgdir"/usr/bin/pi-bluetooth-configuration
 	install -Dm644 config.ini "$pkgdir"/etc/pi-bluetooth-configuration/config.ini
 	install -Dm755 pi-bluetooth-configuration.initd "$pkgdir"/etc/init.d/pi-bluetooth-configuration
+	# apk's own upgrade logic already preserves this if it's been
+	# modified on disk since install (e.g. real network{} blocks saved
+	# by WifiControl::connect()/stage()) -- no need to guard that here.
+	# See wpa_supplicant.conf's own header comment for why this needs to
+	# ship at all.
+	install -Dm600 wpa_supplicant.conf "$pkgdir"/etc/wpa_supplicant/wpa_supplicant.conf
 }
