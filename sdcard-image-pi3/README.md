@@ -84,17 +84,20 @@ for two different classes of state:
 
 - **`/etc` and the provisioning marker** (`/.successfully-initialized`
   -- `pi-relay-control`'s own `start_pre()` refuses to start without
-  it) are committed back to the boot partition automatically on every
-  clean shutdown/reboot, via a custom `lbu-commit` OpenRC service (see
-  `lbu-commit.initd`) that runs Alpine's own `lbu commit` -- the same
-  tool `setup-alpine`'s interactive wizard would normally wire up for
-  you, just invoked without ever running that wizard. This is what
-  makes **WiFi credentials** (`pi-bluetooth-configuration` writes them
-  into `/etc/wpa_supplicant/wpa_supplicant.conf`), **SSH host keys**,
-  and the provisioning marker all survive a reboot -- found missing
-  during a real hardware test; without it, a device would silently
-  fall back to its fallback AP on every single boot, forever, even
-  after a successful setup.
+  it) are committed back to the boot partition by `pi-bluetooth-
+  configuration` itself, calling `lbu commit mmcblk0p1` (Alpine's own
+  diskless config-persistence tool -- the same one `setup-alpine`'s
+  interactive wizard would normally wire up for you) right before it
+  reboots at the end of a successful setup (see main.cpp's
+  `reboot_after_delay()`). This is what makes **WiFi credentials**
+  (written into `/etc/wpa_supplicant/wpa_supplicant.conf`), **SSH host
+  keys**, and the provisioning marker all survive a reboot -- an
+  earlier version tried this via a generic OpenRC shutdown-runlevel
+  service instead, which turned out to fail on real hardware for
+  reasons not fully root-caused; triggering it explicitly at the one
+  moment the app actually knows a reboot is imminent is both simpler
+  and more reliable. `/etc/apk/protected_paths.d/lbu.list` (baked into
+  the apkovl at build time) is what tells `lbu` which paths to track.
 - **Relay on/off state** (`pi-relay-control`'s "resume last position
   after reboot" feature) lives under `/var`, which isn't covered by
   the `/etc`-only `lbu` tracking above -- it's made to survive instead
@@ -103,11 +106,11 @@ for two different classes of state:
   the boot partition (the actual SD card content, mounted read-write
   for the whole time the system runs).
 
-An **unclean** power loss (pulling power rather than a normal reboot/
-shutdown) skips the `lbu-commit` service entirely, same as it would
-skip any other shutdown-runlevel service -- whatever changed since the
-last clean shutdown won't be captured. Not fixable in general for a
-diskless system without a UPS or similar; just worth knowing.
+An **unclean** power loss (pulling power rather than the app's own
+controlled reboot) skips the commit entirely -- whatever changed since
+the last successful setup/forget cycle won't be captured. Not fixable
+in general for a diskless system without a UPS or similar; just worth
+knowing.
 
 ## Prerequisites
 

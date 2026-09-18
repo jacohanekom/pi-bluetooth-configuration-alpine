@@ -383,9 +383,25 @@ std::string read_pi_serial() {
 // reboots. Fire-and-forget: once the reboot command is issued, the
 // whole system (including this process) is going down regardless of
 // what run_command reports back.
+//
+// On Alpine diskless installs (see sdcard-image-pi3), root is tmpfs --
+// nothing here (WiFi credentials just saved into wpa_supplicant.conf,
+// MARKER_FILE, SSH host keys, etc.) would survive this reboot at all
+// otherwise. An earlier attempt handled this via a generic OpenRC
+// shutdown-runlevel service instead of here, relying on it always
+// running before the actual reboot; that turned out to fail on real
+// hardware for reasons not fully root-caused, so this commits
+// explicitly at the one moment this process actually knows a reboot is
+// about to happen, rather than depending on shutdown-sequence
+// ordering. `lbu` doesn't exist on non-diskless installs (disk-
+// resident images, plain dev boxes) -- run_command() fails via a
+// normal execvp()+_exit(127), not an exception, so this is safe to
+// call unconditionally and just quietly does nothing useful there.
 void reboot_after_delay() {
     std::thread([]() {
         std::this_thread::sleep_for(std::chrono::seconds(REBOOT_DELAY_SECS));
+        auto commit = run_command({"lbu", "commit", "mmcblk0p1"});
+        std::cerr << "[Main] lbu commit before reboot: " << trim(commit.output) << "\n";
         std::cerr << "[Main] rebooting now\n";
         run_command({"reboot"});
     }).detach();

@@ -148,13 +148,21 @@ cat > "$OVL/etc/apk/world" <<-EOF
 	wireless-regdb
 EOF
 
-# Everything lbu commit (see lbu-commit.initd) captures back into the
-# apkovl on shutdown -- /etc wholesale (SSH host keys, wpa_supplicant's
-# saved credentials, sshd_config, shadow, our own runlevels/local.d/
-# apk state, all of it) plus the root-level provisioning marker
-# pi-relay-control's own start_pre() refuses to start without. Without
-# this, none of it would survive a reboot -- diskless mode's root is
-# tmpfs, rebuilt from scratch (this same apkovl) every single boot.
+# What `lbu commit mmcblk0p1` (called by pi-bluetooth-configuration
+# itself, right before it reboots at the end of a successful setup --
+# see main.cpp's reboot_after_delay()) captures back into the apkovl:
+# /etc wholesale (SSH host keys, wpa_supplicant's saved credentials,
+# sshd_config, shadow, our own runlevels/local.d/apk state, all of it)
+# plus the root-level provisioning marker pi-relay-control's own
+# start_pre() refuses to start without. Without this, none of it would
+# survive a reboot -- diskless mode's root is tmpfs, rebuilt from
+# scratch (this same apkovl) every single boot.
+#
+# An earlier version of this ran the commit from a generic OpenRC
+# shutdown-runlevel service instead, relying on it always running
+# before the actual reboot; that failed on real hardware for reasons
+# not fully root-caused, so it's now triggered explicitly by the one
+# process that actually knows a reboot is about to happen, instead.
 cat > "$OVL/etc/apk/protected_paths.d/lbu.list" <<-EOF
 	+etc
 	+.successfully-initialized
@@ -191,13 +199,6 @@ EOF
 cp wait-for-wlan.initd "$OVL/etc/init.d/wait-for-wlan"
 chmod +x "$OVL/etc/init.d/wait-for-wlan"
 ln -sf /etc/init.d/wait-for-wlan "$OVL/etc/runlevels/boot/wait-for-wlan"
-
-# See lbu-commit.initd's own header comment for why this exists at all
-# -- without it, nothing (WiFi credentials, SSH host keys, the
-# provisioning marker) survives a reboot in diskless mode.
-cp lbu-commit.initd "$OVL/etc/init.d/lbu-commit"
-chmod +x "$OVL/etc/init.d/lbu-commit"
-ln -sf /etc/init.d/lbu-commit "$OVL/etc/runlevels/shutdown/lbu-commit"
 
 ln -sf /etc/init.d/local "$OVL/etc/runlevels/default/local"
 for svc in wpa_supplicant dhcpcd chronyd sshd dbus avahi-daemon \
