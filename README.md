@@ -24,7 +24,7 @@ the earlier BLE-based revision this replaced.
 This is a one-shot provisioning flow, not a managed session. Submitting
 credentials while the fallback AP is active necessarily ends that AP (the
 radio can't run station and AP mode at once), so a successful join in
-that case immediately creates `/.successfully-initialized` and reboots
+that case immediately creates `/etc/successfully-initialized` and reboots
 the Pi a few seconds later; a `forget` removes that file and reboots the
 same way. There is no ongoing management interface beyond this same HTTP
 API -- once WiFi is set up (or torn down), the Pi reboots into its normal
@@ -113,14 +113,16 @@ wizard's remaining steps afterward either.
   staged while the fallback AP was active (the previous bullet); rejected
   (a no-op, logged) if neither is true, since rebooting then would land
   on a Pi that isn't actually configured at all. Creates
-  `/.successfully-initialized` (an empty marker file at the filesystem
-  root), waits 3 seconds (enough time for the HTTP response to actually
-  reach the client before the connection drops), then reboots the Pi.
-- **`POST /forget`**: removes `/.successfully-initialized` if present,
+  `/etc/successfully-initialized` (an empty marker file -- under `/etc`
+  specifically so diskless installs' config-persistence mechanism
+  actually picks it up on reboot, see sdcard-image-pi3's own README),
+  waits 3 seconds (enough time for the HTTP response to actually reach
+  the client before the connection drops), then reboots the Pi.
+- **`POST /forget`**: removes `/etc/successfully-initialized` if present,
   then reboots the same way (also after the 3-second delay).
 
-`/.successfully-initialized` is meant for other boot-time scripts/units
-on the Pi to check (`test -f /.successfully-initialized`) to know
+`/etc/successfully-initialized` is meant for other boot-time scripts/units
+on the Pi to check (`test -f /etc/successfully-initialized`) to know
 whether WiFi provisioning has ever completed successfully -- this daemon
 itself doesn't read it back.
 
@@ -300,7 +302,7 @@ whichever port pi-relay-control-alpine has that relay listening on
 README), and reports the result back over HTTP.
 
 Relay control is no part of the provisioning wizard -- it only works
-once setup has actually finished (`/.successfully-initialized` exists).
+once setup has actually finished (`/etc/successfully-initialized` exists).
 Before that, `POST /relay` is rejected (logged, no-op, `ok:false`) and
 the `relays` field of `GET /status` reports an empty list, without even
 querying pi-relay-control-alpine: that daemon's own `start_pre()` gate
@@ -501,7 +503,7 @@ these routes need.
 }
 ```
 
-`wifi.finished` reflects whether `/.successfully-initialized` exists --
+`wifi.finished` reflects whether `/etc/successfully-initialized` exists --
 i.e. whether setup has already completed. A client should use this, not
 just `wifi.state`, to decide whether to show the setup wizard or the
 final read-only details screen: a Pi that's mid-wizard (WiFi just

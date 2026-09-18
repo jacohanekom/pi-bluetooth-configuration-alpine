@@ -82,7 +82,7 @@ on **every** boot -- root is tmpfs, so by default nothing survives a
 reboot at all. This image handles that with two different mechanisms
 for two different classes of state:
 
-- **`/etc` and the provisioning marker** (`/.successfully-initialized`
+- **`/etc` and the provisioning marker** (`/etc/successfully-initialized`
   -- `pi-relay-control`'s own `start_pre()` refuses to start without
   it) are committed back to the boot partition by `pi-bluetooth-
   configuration` itself, calling `lbu commit mmcblk0p1` (Alpine's own
@@ -97,7 +97,16 @@ for two different classes of state:
   reasons not fully root-caused; triggering it explicitly at the one
   moment the app actually knows a reboot is imminent is both simpler
   and more reliable. `/etc/apk/protected_paths.d/lbu.list` (baked into
-  the apkovl at build time) is what tells `lbu` which paths to track.
+  the apkovl at build time) is what tells `lbu` which paths to track --
+  just `/etc` itself; the marker file lives *under* `/etc` specifically
+  (not bare at the filesystem root, where it used to live) because
+  `lbu commit` actually works via `apk audit --backup`, which reliably
+  tracks new/changed files *within* a protected directory but --
+  confirmed directly with a real test, not assumed -- silently never
+  picks up a bare top-level file no matter how it's listed in
+  `lbu.list`. Found on real hardware: WiFi credentials correctly
+  survived a reboot while the marker (still at the old bare-root path
+  at the time) silently didn't.
 - **Relay on/off state** (`pi-relay-control`'s "resume last position
   after reboot" feature) lives under `/var`, which isn't covered by
   the `/etc`-only `lbu` tracking above -- it's made to survive instead

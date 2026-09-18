@@ -151,10 +151,16 @@ EOF
 # What `lbu commit mmcblk0p1` (called by pi-bluetooth-configuration
 # itself, right before it reboots at the end of a successful setup --
 # see main.cpp's reboot_after_delay()) captures back into the apkovl:
-# /etc wholesale (SSH host keys, wpa_supplicant's saved credentials,
-# sshd_config, shadow, our own runlevels/local.d/apk state, all of it)
-# plus the root-level provisioning marker pi-relay-control's own
-# start_pre() refuses to start without. Without this, none of it would
+# /etc wholesale -- SSH host keys, wpa_supplicant's saved credentials,
+# sshd_config, shadow, our own runlevels/local.d/apk state, AND the
+# provisioning marker pi-relay-control's own start_pre() refuses to
+# start without (pi-bluetooth-configuration's MARKER_FILE lives at
+# /etc/successfully-initialized specifically, not bare at "/", for
+# exactly this reason -- see that repo's own comment on MARKER_FILE:
+# `apk audit --backup`, what `lbu commit` uses under the hood,
+# reliably tracks new/changed files *within* a protected directory but
+# -- confirmed directly -- silently never picks up a bare top-level
+# file no matter how it's listed here). Without this, none of it would
 # survive a reboot -- diskless mode's root is tmpfs, rebuilt from
 # scratch (this same apkovl) every single boot.
 #
@@ -165,7 +171,6 @@ EOF
 # process that actually knows a reboot is about to happen, instead.
 cat > "$OVL/etc/apk/protected_paths.d/lbu.list" <<-EOF
 	+etc
-	+.successfully-initialized
 EOF
 
 # Matches the SD card's actual device name once mounted at runtime (the

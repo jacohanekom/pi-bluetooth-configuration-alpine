@@ -140,7 +140,15 @@
 
 namespace {
 
-constexpr const char* MARKER_FILE = "/.successfully-initialized";
+// Under /etc, not bare at the filesystem root -- diskless installs
+// (see sdcard-image-pi3) persist config via `apk audit --backup`
+// (what `lbu commit` actually uses under the hood), which reliably
+// tracks new/changed files *within* a protected directory like /etc
+// but -- confirmed directly, not assumed -- silently never picks up a
+// bare top-level file no matter how it's listed in
+// protected_paths.d/*.list. A marker under /etc survives a reboot
+// there; one at "/" silently wouldn't.
+constexpr const char* MARKER_FILE = "/etc/successfully-initialized";
 constexpr int REBOOT_DELAY_SECS = 3;
 
 std::atomic<bool> g_running{true};
