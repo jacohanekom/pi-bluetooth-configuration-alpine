@@ -2,7 +2,7 @@ name: Build SD card image (Pi 3 / aarch64)
 
 # Manual only -- unlike the package build.yml jobs, this isn't something
 # you want firing on every push: it depends on the *other* two repos'
-# latest artifacts too (not just this one), and produces a ~1GB image
+# latest artifacts too (not just this one), and produces a ~768MB image
 # that's slow-ish to build and would otherwise pile up in Actions
 # storage. Run it from this repo's Actions tab, or `gh workflow run
 # sdcard-image-pi3.yml -R jacohanekom/pi-bluetooth-configuration-alpine`.
@@ -17,8 +17,8 @@ on:
 jobs:
   build-image:
     # Genuinely aarch64 hardware (no QEMU) -- matches sdcard-image-pi3's
-    # own local-build design (see build-sd-image.sh's comments): Docker
-    # on this runner is native arm64, so `docker run --platform
+    # own local-build design (see build-image.sh's comments): Docker on
+    # this runner is native arm64, so `docker run --platform
     # linux/arm64` is a native container build, not emulated.
     runs-on: ubuntu-24.04-arm
     permissions:
@@ -69,13 +69,13 @@ jobs:
           PI_HOSTNAME: ${{ inputs.hostname }}
         run: |
           cd sdcard-image-pi3
-          ./build-sd-image.sh
+          ./build-image.sh
 
-      # Short retention -- this is a ~1GB build artifact, not source; no
-      # need to let it sit in Actions storage for the default 90 days.
+      # Short retention -- this is a ~768MB build artifact, not source;
+      # no need to let it sit in Actions storage for the default 90 days.
       - name: Upload image artifact
         uses: actions/upload-artifact@v4
         with:
-          name: pi-bluetooth-configuration-sdcard-aarch64
-          path: sdcard-image-pi3/pi-bluetooth-configuration-sdcard-aarch64.img
+          name: aipicam-pi3-diskless
+          path: sdcard-image-pi3/aipicam-pi3-diskless.img
           retention-days: 14
