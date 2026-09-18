@@ -190,6 +190,16 @@ done
 # README.md) so they can't just be static files here. This runs every
 # boot via OpenRC's "local" service instead, once those packages are
 # actually in place.
+#
+# "local" itself declares `depend() { after * }` -- it deliberately
+# runs after every other default-runlevel service, INCLUDING sshd.
+# sshd has therefore already started (with the stock, unmodified
+# sshd_config -- PermitRootLogin prohibit-password) by the time this
+# script edits the file on disk; a running sshd doesn't notice config
+# changes without being told to, so root+password logins were being
+# silently rejected despite the file ending up correct. `rc-service
+# sshd restart` (not just editing the file) is what actually makes the
+# new PermitRootLogin/PasswordAuthentication settings take effect.
 ROOT_HASH=$(docker run --rm --platform linux/arm64 alpine:"$ALPINE_VERSION" sh -c \
 	'apk add --no-cache openssl >/dev/null 2>&1; openssl passwd -6 "$1"' _ "$ROOT_PASSWORD")
 cat > "$OVL/etc/local.d/aipicam-setup.start" <<EOF
@@ -204,6 +214,7 @@ sed -i \\
 	/etc/ssh/sshd_config
 
 ssh-keygen -A
+rc-service sshd restart
 EOF
 chmod +x "$OVL/etc/local.d/aipicam-setup.start"
 
