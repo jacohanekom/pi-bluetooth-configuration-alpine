@@ -170,6 +170,93 @@ Optional: `PI_HOSTNAME=whatever` (defaults to `aipicam`). Output is
 hash (`openssl passwd -6`) baked into the `apkovl`; the plaintext itself
 is never written to disk or committed anywhere.
 
+## Remote access via Cloudflare Tunnel (optional)
+
+By default this Pi is only reachable over SSH while you're on the same
+LAN (or its own fallback AP). If you also want to reach it from
+anywhere -- e.g. it's deployed somewhere without you physically present
+-- `build-image.sh` can bake in a
+[Cloudflare Tunnel](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/)
+client (`cloudflared`) that makes an **outbound-only** connection to
+Cloudflare's edge, entirely opt-in. Unlike a self-hosted VPN, there's
+**no server for you to run or maintain** -- `cloudflared` only ever
+makes outbound HTTPS connections out to Cloudflare, so it works behind
+any NAT/firewall with no port forwarding anywhere, in either direction.
+The tradeoff is routing SSH traffic through Cloudflare's infrastructure
+instead of a box you control.
+
+A Cloudflare Tunnel identifies *itself*, not a specific device -- unlike
+SSH host keys, there's no automatic per-device identity. Two Pis
+sharing one tunnel token would both register as connectors for the
+*same* tunnel, with traffic load-balanced between them unpredictably --
+not a hard error, just no way to address one specifically. There are
+two ways to provide a token, matching the two situations that come up:
+
+### Reusing an existing tunnel (rebuilding the same device)
+
+```sh
+ROOT_PASSWORD='something-you-choose' \
+CLOUDFLARE_TUNNEL_TOKEN='<your tunnel token>' \
+./build-image.sh
+```
+
+**One-time setup**, free Cloudflare account required:
+
+1. [dash.teams.cloudflare.com](https://dash.teams.cloudflare.com) (or
+   the "Zero Trust" section of the regular Cloudflare dashboard) ->
+   **Networks -> Tunnels -> Create a tunnel** -> choose **Cloudflared**
+   as the connector.
+2. Name it (e.g. `aipicam-pi3`) and continue -- the next screen shows an
+   install command containing a long token (`cloudflared service
+   install <TOKEN>`). Copy just the `<TOKEN>` part; that's
+   `CLOUDFLARE_TUNNEL_TOKEN` above.
+3. Configure routing -- see "Reaching the Pi once connected" below.
+
+### Provisioning a new tunnel automatically (a new device)
+
+```sh
+ROOT_PASSWORD='something-you-choose' \
+CLOUDFLARE_API_TOKEN='<a Cloudflare API token>' \
+CLOUDFLARE_ACCOUNT_ID='<your account ID>' \
+./build-image.sh
+```
+
+`build-image.sh` calls the Cloudflare API to create a brand new tunnel
+(named `aipicam-<hostname>-<timestamp>`) for this specific build and
+bakes in its token automatically -- same reasoning as SSH host keys/the
+WireGuard keypair being generated fresh per device, just done at build
+time instead of on first boot, since a tunnel has no equivalent
+first-boot self-provisioning of its own.
+
+**One-time setup**: [dash.cloudflare.com/profile/api-tokens](https://dash.cloudflare.com/profile/api-tokens)
+-> **Create Token** -> custom token with **Cloudflare Tunnel: Edit**
+permission, scoped to your account. Find `CLOUDFLARE_ACCOUNT_ID` on the
+right sidebar of any zone's Overview page in the regular Cloudflare
+dashboard, or via `Account Home`.
+
+After the build, the new tunnel exists but has **no routing configured
+yet** -- see below, same one-time step as the manual path.
+
+### Reaching the Pi once connected
+
+Either way, the tunnel itself needs to be told how to route to this Pi,
+once, in the dashboard -- easiest is **Private Network** routing (no
+public hostname/domain needed at all): under the tunnel's own settings,
+add a Private Network route covering whatever address you want to reach
+it at (e.g. a `/32` for a single made-up address, since this Pi has no
+fixed LAN IP of its own to route to). Then install the
+[WARP client](https://developers.cloudflare.com/cloudflare-one/connections/connect-devices/warp/)
+on whatever machine you'll SSH *from*, enrol it in the same Zero Trust
+account, and enable Private Network routing there too.
+`ssh root@<the address you routed>` then reaches the Pi through the
+tunnel from anywhere your WARP client is connected.
+
+(Alternative: a **Public Hostname** route instead, if you'd rather use a
+domain you already have in Cloudflare -- point it at
+`ssh://localhost:22`, then `cloudflared access ssh --hostname
+<that-hostname>` from the client side instead of installing WARP. Either
+works; Private Network avoids needing a domain at all.)
+
 ## 3. Write it to an SD card
 
 **Double-check the device path before running `dd` -- writing to the
@@ -194,7 +281,7 @@ the exact same script on a genuine aarch64 GitHub-hosted runner
 all three repos' latest artifacts, not just this one, and produces a
 build artifact you don't want piling up on every commit.
 
-One-time setup, two repo secrets on **pi-bluetooth-configuration-alpine**
+One-time setup, repo secrets on **pi-bluetooth-configuration-alpine**
 (Settings -> Secrets and variables -> Actions):
 
 - `SDCARD_ROOT_PASSWORD` -- same meaning as the local `ROOT_PASSWORD`
@@ -205,6 +292,13 @@ One-time setup, two repo secrets on **pi-bluetooth-configuration-alpine**
   fine-grained PAT (https://github.com/settings/personal-access-tokens)
   scoped to just `pi-relay-control-alpine` and `victron-ve-direct-alpine`,
   with **Actions: Read-only** repository permission, and save it here.
+- `SDCARD_CLOUDFLARE_TUNNEL_TOKEN`, or `SDCARD_CLOUDFLARE_API_TOKEN` +
+  `SDCARD_CLOUDFLARE_ACCOUNT_ID` (all optional) -- same meaning as the
+  matching local env vars above (the `SDCARD_` prefix is just to avoid
+  colliding with Cloudflare's own commonly-used bare `CLOUDFLARE_*`
+  secret names). Leave all unset to skip Cloudflare Tunnel entirely,
+  same as locally. Secrets rather than `workflow_dispatch` inputs since
+  these are real credentials, not a cosmetic setting like `hostname`.
 
 Then trigger it from the Actions tab, or:
 
@@ -262,3 +356,15 @@ down.
   board using the same `bcm2710`/`bcm2837`-family SoC); a Pi 4/5 would
   need its own verification even though the same aarch64 `.apk`s would
   technically install.
+- Cloudflare Tunnel support: `cloudflared` itself was verified directly
+  (confirmed statically linked, confirmed it actually runs inside an
+  aarch64 Alpine container), and the generated `apkovl` contents
+  (binary, token file, `cloudflared` OpenRC service, runlevel wiring)
+  were verified by inspecting a real build's output. The
+  `CLOUDFLARE_API_TOKEN` auto-provisioning path's request/response
+  handling was checked against Cloudflare's real API for both endpoints
+  (confirmed they exist and return the documented error shape when
+  called with a fake token) and its JSON parsing verified against
+  Cloudflare's documented success-response shape, but not yet exercised
+  against a real authenticated account -- and the tunnel itself, either
+  way, hasn't been tested against real hardware yet.

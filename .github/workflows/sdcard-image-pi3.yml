@@ -67,6 +67,17 @@ jobs:
         env:
           ROOT_PASSWORD: ${{ secrets.SDCARD_ROOT_PASSWORD }}
           PI_HOSTNAME: ${{ inputs.hostname }}
+          # Repo secrets, not workflow_dispatch inputs -- these are real
+          # credentials, unlike hostname, and secrets aren't settable
+          # per-dispatch anyway. Leave all three unset to skip Cloudflare
+          # Tunnel entirely -- see sdcard-image-pi3/README.md, "Remote
+          # access via Cloudflare Tunnel" for the two ways to use this
+          # (reuse one tunnel token across rebuilds of the same device,
+          # or auto-provision a fresh tunnel per build via the API token
+          # + account ID -- CLOUDFLARE_TUNNEL_TOKEN wins if both are set).
+          CLOUDFLARE_TUNNEL_TOKEN: ${{ secrets.SDCARD_CLOUDFLARE_TUNNEL_TOKEN }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.SDCARD_CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.SDCARD_CLOUDFLARE_ACCOUNT_ID }}
         run: |
           cd sdcard-image-pi3
           ./build-image.sh
