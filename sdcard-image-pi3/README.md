@@ -85,24 +85,37 @@ for two different classes of state:
 - **`/etc` and the provisioning marker** (`/etc/successfully-initialized`
   -- `pi-relay-control`'s own `start_pre()` refuses to start without
   it) are committed back to the boot partition by `pi-bluetooth-
-  configuration` itself, calling `lbu commit mmcblk0p1` (Alpine's own
+  configuration` itself, calling `lbu commit -d mmcblk0p1` (Alpine's own
   diskless config-persistence tool -- the same one `setup-alpine`'s
   interactive wizard would normally wire up for you) right before it
   reboots at the end of a successful setup (see main.cpp's
-  `reboot_after_delay()`). This is what makes **WiFi credentials**
-  (written into `/etc/wpa_supplicant/wpa_supplicant.conf`), **SSH host
-  keys**, and the provisioning marker all survive a reboot -- an
-  earlier version tried this via a generic OpenRC shutdown-runlevel
-  service instead, which turned out to fail on real hardware for
-  reasons not fully root-caused; triggering it explicitly at the one
-  moment the app actually knows a reboot is imminent is both simpler
-  and more reliable. `/etc/apk/protected_paths.d/lbu.list` (baked into
-  the apkovl at build time) is what tells `lbu` which paths to track --
-  just `/etc` itself; the marker file lives *under* `/etc` specifically
-  (not bare at the filesystem root, where it used to live) because
-  `lbu commit` actually works via `apk audit --backup`, which reliably
-  tracks new/changed files *within* a protected directory but --
-  confirmed directly with a real test, not assumed -- silently never
+  `reboot_after_delay()`), and also right after `POST /user` (see that
+  route). This is what makes **WiFi credentials** (written into
+  `/etc/wpa_supplicant/wpa_supplicant.conf`), **SSH host keys**, and the
+  provisioning marker all survive a reboot -- an earlier version tried
+  this via a generic OpenRC shutdown-runlevel service instead, which
+  turned out to fail on real hardware for reasons not fully root-caused;
+  triggering it explicitly at the one moment the app actually knows a
+  reboot is imminent is both simpler and more reliable.
+  `-d` is load-bearing, not cosmetic: `lbu commit`'s own target filename
+  is `$(hostname).apkovl.tar.gz`, computed from the *current* hostname
+  at commit time (confirmed by reading `alpine-conf`'s own `lbu.in`) --
+  but this daemon sets the live hostname to this device's hardware
+  serial on every startup (see `set_hostname_from_serial()`), which no
+  longer matches the image's build-time hostname (e.g. `aipicam`)
+  already sitting on the boot partition. Without `-d`, `lbu commit`
+  finds that mismatch and refuses outright ("more than one apkovl
+  file(s) were found ... Please use -d to replace") rather than doing
+  anything useful -- meaning every commit failed silently-to-the-user
+  (though logged), losing WiFi credentials and the marker both.
+  Reproduced exactly against real Alpine tooling (not just inferred
+  from source) before fixing. `/etc/apk/protected_paths.d/lbu.list`
+  (baked into the apkovl at build time) is what tells `lbu` which paths
+  to track -- just `/etc` itself; the marker file lives *under* `/etc`
+  specifically (not bare at the filesystem root, where it used to live)
+  because `lbu commit` actually works via `apk audit --backup`, which
+  reliably tracks new/changed files *within* a protected directory but
+  -- confirmed directly with a real test, not assumed -- silently never
   picks up a bare top-level file no matter how it's listed in
   `lbu.list`. Found on real hardware: WiFi credentials correctly
   survived a reboot while the marker (still at the old bare-root path

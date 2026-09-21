@@ -475,10 +475,25 @@ void set_hostname_from_serial(const std::string& serial) {
 // resident images, plain dev boxes) -- run_command() fails via a
 // normal execvp()+_exit(127), not an exception, so this is safe to
 // call unconditionally and just quietly does nothing useful there.
+//
+// -d is load-bearing, not cosmetic: `lbu commit`'s own target filename
+// is "$(hostname).apkovl.tar.gz" (confirmed by reading alpine-conf's
+// lbu.in directly), computed from the CURRENT hostname at commit time
+// -- but set_hostname_from_serial() above already renamed the live
+// hostname away from the image's build-time one (e.g. "aipicam") by
+// the time this ever runs. Without -d, lbu commit finds that mismatch
+// (the existing on-disk apkovl was named after the OLD hostname) and
+// refuses outright ("more than one apkovl file(s) were found ...
+// Please use -d to replace"), rather than silently doing nothing --
+// meaning every commit was failing outright, losing WiFi credentials
+// and MARKER_FILE both, confirmed against a real device. -d tells it
+// to just replace whatever apkovl(s) already exist with the current
+// one, which is exactly what a single-owner device wants regardless of
+// what its hostname was at build time vs. now.
 void reboot_after_delay() {
     std::thread([]() {
         std::this_thread::sleep_for(std::chrono::seconds(REBOOT_DELAY_SECS));
-        auto commit = run_command({"lbu", "commit", "mmcblk0p1"});
+        auto commit = run_command({"lbu", "commit", "-d", "mmcblk0p1"});
         std::cerr << "[Main] lbu commit before reboot: " << trim(commit.output) << "\n";
         std::cerr << "[Main] rebooting now\n";
         run_command({"reboot"});
@@ -843,7 +858,9 @@ int main(int argc, char** argv) {
         std::string email = json_get_string(req.body, "email");
         if (name.empty() && email.empty()) return httpsrv::Response::error(400, "name or email is required");
         write_camera_user(name, email);
-        auto commit = run_command({"lbu", "commit", "mmcblk0p1"});
+        // -d: see reboot_after_delay()'s own comment on this flag --
+        // load-bearing here too, for the same reason.
+        auto commit = run_command({"lbu", "commit", "-d", "mmcblk0p1"});
         std::cerr << "[Command] user set: " << (name.empty() ? "(no name)" : name)
                    << (email.empty() ? "" : " <" + email + ">") << "\n";
         std::cerr << "[Main] lbu commit after user update: " << trim(commit.output) << "\n";
