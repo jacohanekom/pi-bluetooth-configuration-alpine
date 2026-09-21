@@ -829,13 +829,24 @@ int main(int argc, char** argv) {
     // Apple ID's very first authorization for this app -- the client
     // is expected to have cached them from then, but this route
     // doesn't assume either field is present).
+    //
+    // Unlike WiFi credentials/MARKER_FILE/SSH host keys, this write
+    // isn't followed by reboot_after_delay() -- nothing else on this
+    // path reboots the device -- so on a diskless install (see
+    // sdcard-image-pi3) it would otherwise only ever land in tmpfs and
+    // vanish on the next reboot that isn't itself a /finish or /forget.
+    // `lbu` doesn't exist on non-diskless installs; run_command() fails
+    // safely there (a normal execvp()+_exit(127), not an exception), so
+    // this is safe to call unconditionally.
     server.route("POST", "/user", [&](const httpsrv::Request& req) {
         std::string name = json_get_string(req.body, "name");
         std::string email = json_get_string(req.body, "email");
         if (name.empty() && email.empty()) return httpsrv::Response::error(400, "name or email is required");
         write_camera_user(name, email);
+        auto commit = run_command({"lbu", "commit", "mmcblk0p1"});
         std::cerr << "[Command] user set: " << (name.empty() ? "(no name)" : name)
                    << (email.empty() ? "" : " <" + email + ">") << "\n";
+        std::cerr << "[Main] lbu commit after user update: " << trim(commit.output) << "\n";
         return httpsrv::Response::json("{\"ok\":true}");
     });
 

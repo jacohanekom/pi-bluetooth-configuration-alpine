@@ -468,7 +468,7 @@ these routes need.
 | `GET /ethernet` | -- | `{"ip":...,"rangeStart":...,"rangeEnd":...}` -- eth0's current gateway config. |
 | `POST /ethernet` | `{"ip":...,"rangeStart":...,"rangeEnd":...}` | `{"ok":true}`; see "Ethernet direct-connect" (rejected once setup has finished). |
 | `POST /relay` | `{"port":...,"state":"on"\|"off"}` | `{"ok":bool,"relays":[...]}` -- see "Relay control" (rejected until setup has finished). |
-| `POST /user` | `{"name":...,"email":...}` (either may be omitted/empty, but not both) | `{"ok":true}`; purely informational -- labels this device with whoever signed in via the iOS app's Sign in with Apple, stored in `/etc/camera_user`. Not used for access control anywhere -- unlike `/etc/successfully-initialized`, nothing gates on this file existing. |
+| `POST /user` | `{"name":...,"email":...}` (either may be omitted/empty, but not both) | `{"ok":true}`; purely informational -- labels this device with whoever signed in via the iOS app's Sign in with Apple, stored in `/etc/camera_user`. Not used for access control anywhere -- unlike `/etc/successfully-initialized`, nothing gates on this file existing. Commits via `lbu` immediately (not deferred to a reboot, unlike WiFi credentials/the marker file) since nothing else on this path reboots the device -- see "Config persistence across reboots" in `sdcard-image-pi3/README.md`. |
 
 ### Protocol
 
