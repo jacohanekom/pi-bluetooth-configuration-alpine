@@ -55,6 +55,11 @@
  *   POST /ethernet  {"ip":...,"rangeStart":...,"rangeEnd":...} -- stage
  *                   eth0's local network config; see eth_control.hpp.
  *   POST /relay     {"port":...,"state":"on"|"off"} -- see relay_control.hpp.
+ *   POST /user      {"name":...,"email":...} -- purely informational,
+ *                   labels the device with whoever signed in via the
+ *                   iOS app's Sign in with Apple; stored in
+ *                   CAMERA_USER_FILE. Not used for access control
+ *                   anywhere.
  *
  * eth0 is always a working gateway: its static IP + DHCP server are
  * (re)applied directly at every startup -- independent of dhcpcd,
@@ -150,6 +155,14 @@ namespace {
 // there; one at "/" silently wouldn't.
 constexpr const char* MARKER_FILE = "/etc/successfully-initialized";
 constexpr int REBOOT_DELAY_SECS = 3;
+constexpr const char* HOSTNAME_FILE = "/etc/hostname";
+// Purely informational -- the iOS app's Sign in with Apple result
+// (name/email) gets POSTed here once and stored so the device's owner
+// is labeled somewhere, same /etc-not-bare-root reasoning as
+// MARKER_FILE above (diskless installs' lbu commit needs it there to
+// survive a reboot). Not used for access control -- nothing gates on
+// this file existing the way pi-relay-control gates on MARKER_FILE.
+constexpr const char* CAMERA_USER_FILE = "/etc/camera_user";
 
 std::atomic<bool> g_running{true};
 std::atomic<int> g_inflight{0};
@@ -365,6 +378,44 @@ std::string eth_config_json(const ethctl::EthControl& eth) {
     return o.str();
 }
 
+// Plain "key=value" lines, one per field -- same convention as this
+// project's own config.ini/pi-relay-control.conf rather than JSON,
+// since this is meant to be just as easy to read/edit by hand on the
+// device as those. Embedded newlines are stripped from each value
+// (not otherwise expected in a name/email, but a client sending one
+// shouldn't be able to inject a fake extra line into the file).
+void write_camera_user(const std::string& name, const std::string& email) {
+    auto sanitize = [](std::string v) {
+        v.erase(std::remove(v.begin(), v.end(), '\n'), v.end());
+        v.erase(std::remove(v.begin(), v.end(), '\r'), v.end());
+        return v;
+    };
+    std::ofstream f(CAMERA_USER_FILE);
+    f << "name=" << sanitize(name) << "\n";
+    f << "email=" << sanitize(email) << "\n";
+}
+
+// Returns null if CAMERA_USER_FILE doesn't exist yet (no one has ever
+// POSTed /user) rather than an object with empty fields, so the client
+// can tell "not set" apart from "set to blank".
+std::string camera_user_json() {
+    std::ifstream f(CAMERA_USER_FILE);
+    if (!f.is_open()) return "null";
+    std::string name, email, line;
+    while (std::getline(f, line)) {
+        auto eq = line.find('=');
+        if (eq == std::string::npos) continue;
+        std::string key = line.substr(0, eq);
+        std::string val = line.substr(eq + 1);
+        if (key == "name") name = val;
+        else if (key == "email") email = val;
+    }
+    std::ostringstream o;
+    o << "{\"name\":\"" << escape_json(name) << "\","
+      << "\"email\":\"" << escape_json(email) << "\"}";
+    return o.str();
+}
+
 // The board's hardware serial (from /proc/cpuinfo) rather than a fixed
 // configured name, so multiple aipicam units are distinguishable in a
 // phone's WiFi network list (the AP's own SSID -- see ap_control.hpp)
@@ -383,6 +434,25 @@ std::string read_pi_serial() {
         if (!serial.empty()) return serial;
     }
     return "";
+}
+
+// Sets the running hostname to the same hardware serial already used
+// for the AP SSID and device_id, so `ssh root@<serial>.local` matches
+// what a phone sees in its WiFi list and in mDNS -- rather than every
+// unit sharing one generic baked-in hostname. Idempotent (the serial
+// never changes), so this just runs unconditionally on every startup
+// instead of needing a "first boot only" marker. Also rewrites
+// /etc/hostname directly (`hostname` alone only changes the live
+// kernel value) so a diskless install's next `lbu commit` persists it
+// -- harmless no-op on a disk-resident install too.
+void set_hostname_from_serial(const std::string& serial) {
+    if (serial.empty()) return;
+    auto r = run_command({"hostname", serial});
+    if (r.exit_code != 0) {
+        std::cerr << "[Main] failed to set hostname to \"" << serial << "\": " << trim(r.output) << "\n";
+        return;
+    }
+    std::ofstream(HOSTNAME_FILE) << serial << "\n";
 }
 
 // Waits long enough for the just-sent HTTP response to actually reach
@@ -432,6 +502,7 @@ int main(int argc, char** argv) {
     const std::string configured_name = cfg.get_str("wifi.device_name", "pi-bluetooth-configuration");
     const std::string serial     = read_pi_serial();
     const std::string dev_name   = serial.empty() ? configured_name : serial;
+    set_hostname_from_serial(serial);
     const std::string iface      = cfg.get_str("wifi.interface", "wlan0");
     const std::string eth_iface  = cfg.get_str("ethernet.interface", "eth0");
     // Optional -- a second wired interface (e.g. a USB-Ethernet dongle)
@@ -742,12 +813,29 @@ int main(int argc, char** argv) {
           << "\"leases\":" << leases_json(eth.get_leases()) << ","
           << "\"relays\":" << relays_str << ","
           << "\"victron\":" << victron_json(victronctl::query_status(victron_ctrl_port)) << ","
-          << "\"scan\":" << scan_str << "}";
+          << "\"scan\":" << scan_str << ","
+          << "\"user\":" << camera_user_json() << "}";
         return httpsrv::Response::json(o.str());
     });
 
     server.route("POST", "/scan", [&](const httpsrv::Request&) {
         std::thread([&]() { InflightGuard guard; do_scan(); }).detach();
+        return httpsrv::Response::json("{\"ok\":true}");
+    });
+
+    // Purely informational -- see CAMERA_USER_FILE's own comment. The
+    // iOS app calls this once after a successful Sign in with Apple;
+    // name and/or email may be empty (Apple only returns them on that
+    // Apple ID's very first authorization for this app -- the client
+    // is expected to have cached them from then, but this route
+    // doesn't assume either field is present).
+    server.route("POST", "/user", [&](const httpsrv::Request& req) {
+        std::string name = json_get_string(req.body, "name");
+        std::string email = json_get_string(req.body, "email");
+        if (name.empty() && email.empty()) return httpsrv::Response::error(400, "name or email is required");
+        write_camera_user(name, email);
+        std::cerr << "[Command] user set: " << (name.empty() ? "(no name)" : name)
+                   << (email.empty() ? "" : " <" + email + ">") << "\n";
         return httpsrv::Response::json("{\"ok\":true}");
     });
 

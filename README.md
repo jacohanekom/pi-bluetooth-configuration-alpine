@@ -412,6 +412,12 @@ other mDNS-aware client) instead of requiring its address to be typed
 in, on whichever network (the fallback AP, or a real one once joined) it
 happens to be reachable on.
 
+The system hostname is set to this same serial on every startup (not
+just the first -- it's idempotent, since the serial never changes), so
+`ssh root@<serial>.local` matches what's advertised here and shown as
+the fallback AP's SSID, rather than every unit sharing one generic
+hostname.
+
 Hand-rolled over a plain UDP multicast socket (`src/mdns_responder.hpp`)
 rather than using [Avahi](https://avahi.org/), the standard tool for
 this on Linux: Avahi hard-depends on the `dbus` package in Alpine
@@ -462,6 +468,7 @@ these routes need.
 | `GET /ethernet` | -- | `{"ip":...,"rangeStart":...,"rangeEnd":...}` -- eth0's current gateway config. |
 | `POST /ethernet` | `{"ip":...,"rangeStart":...,"rangeEnd":...}` | `{"ok":true}`; see "Ethernet direct-connect" (rejected once setup has finished). |
 | `POST /relay` | `{"port":...,"state":"on"\|"off"}` | `{"ok":bool,"relays":[...]}` -- see "Relay control" (rejected until setup has finished). |
+| `POST /user` | `{"name":...,"email":...}` (either may be omitted/empty, but not both) | `{"ok":true}`; purely informational -- labels this device with whoever signed in via the iOS app's Sign in with Apple, stored in `/etc/camera_user`. Not used for access control anywhere -- unlike `/etc/successfully-initialized`, nothing gates on this file existing. |
 
 ### Protocol
 
@@ -499,9 +506,13 @@ these routes need.
   "leases": [{"ip":"192.168.4.55","mac":"...","hostname":"laptop"}],
   "relays": [{"port":7778,"label":"Camera","state":"on"}],
   "victron": {"connected": false},
-  "scan": [{"ssid":"MyWifi","rssi":-52,"security":"WPA2"}]
+  "scan": [{"ssid":"MyWifi","rssi":-52,"security":"WPA2"}],
+  "user": {"name":"Jane Appleseed","email":"jane@example.com"}
 }
 ```
+
+`user` is `null` until the first successful `POST /user` -- see that
+route's own table entry above.
 
 `wifi.finished` reflects whether `/etc/successfully-initialized` exists --
 i.e. whether setup has already completed. A client should use this, not
