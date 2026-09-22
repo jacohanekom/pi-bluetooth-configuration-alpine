@@ -36,6 +36,23 @@ VICTRON_APK="artifacts/victron-ve-direct-aarch64.apk"
 
 : "${ROOT_PASSWORD:?set ROOT_PASSWORD in the environment (used once, at build time, to hash into /etc/shadow -- never stored in plaintext or committed)}"
 
+# Optional: Tailscale, for reaching this Pi over SSH from outside its
+# own LAN with no self-hosted server and no inbound port forwarding
+# anywhere -- same outbound-only-connection shape as the WireGuard/
+# Cloudflare Tunnel approaches considered earlier, but simpler than
+# either: Alpine packages `tailscale`/`tailscale-openrc` directly (no
+# custom binary download, no hand-written OpenRC service), and per-
+# device identity is automatic -- a single *reusable* auth key baked
+# into the image lets every device built from it join the same tailnet,
+# each registering as its own distinct node the first time it actually
+# runs `tailscale up` (see provision-tailscale.sh, invoked by
+# pi-bluetooth-configuration itself once this device has internet
+# access -- same reasoning as hostname/AP SSID already being this
+# device's hardware serial, not something shared across a whole image).
+# Entirely opt-in -- leave TAILSCALE_AUTHKEY unset and none of this
+# gets added at all. See README.md, "Remote access via Tailscale".
+TAILSCALE_AUTHKEY="${TAILSCALE_AUTHKEY:-}"
+
 rm -rf work
 mkdir -p work/bootfs work/repo/aarch64 work/apkovl
 
@@ -63,6 +80,10 @@ tar -C work/bootfs -xzf "$OFFICIAL_TARBALL"
 # the .boot_repository marker file -- see README.md's "How it works".
 echo "==> Fetching additional packages (offline dependency closure)"
 cp work/bootfs/apks/aarch64/*.apk work/repo/aarch64/
+TAILSCALE_PACKAGES=""
+if [ -n "$TAILSCALE_AUTHKEY" ]; then
+	TAILSCALE_PACKAGES="tailscale tailscale-openrc"
+fi
 docker run --rm --platform linux/arm64 -v "$PWD/work/repo/aarch64":/out alpine:"$ALPINE_VERSION" sh -c '
 	set -e
 	apk update -q
@@ -74,7 +95,8 @@ docker run --rm --platform linux/arm64 -v "$PWD/work/repo/aarch64":/out alpine:"
 		avahi avahi-openrc \
 		dbus dbus-openrc \
 		linux-firmware-brcm wireless-regdb \
-		libgcc libstdc++
+		libgcc libstdc++ \
+		'"$TAILSCALE_PACKAGES"'
 '
 cp "$BT_APK" "$RELAY_APK" "$VICTRON_APK" work/repo/aarch64/
 
@@ -147,6 +169,12 @@ cat > "$OVL/etc/apk/world" <<-EOF
 	linux-firmware-brcm
 	wireless-regdb
 EOF
+if [ -n "$TAILSCALE_AUTHKEY" ]; then
+	{
+		echo "tailscale"
+		echo "tailscale-openrc"
+	} >> "$OVL/etc/apk/world"
+fi
 
 # What `lbu commit mmcblk0p1` (called by pi-bluetooth-configuration
 # itself, right before it reboots at the end of a successful setup --
@@ -205,11 +233,44 @@ cp wait-for-wlan.initd "$OVL/etc/init.d/wait-for-wlan"
 chmod +x "$OVL/etc/init.d/wait-for-wlan"
 ln -sf /etc/init.d/wait-for-wlan "$OVL/etc/runlevels/boot/wait-for-wlan"
 
+# Tailscale, for reaching this Pi remotely -- see the TAILSCALE_AUTHKEY
+# check near the top of this script and README.md's "Remote access via
+# Tailscale". tailscale-openrc's own package already provides a working
+# /etc/init.d/tailscale (it just starts tailscaled -- actually joining
+# the tailnet is a separate step, done below by
+# pi-bluetooth-configuration itself calling provision-tailscale.sh),
+# enabled unconditionally below alongside the other default-runlevel
+# services whenever TAILSCALE_AUTHKEY is set.
+if [ -n "$TAILSCALE_AUTHKEY" ]; then
+	# Kept in its own file (mode 600, read by provision-tailscale.sh),
+	# same treatment as the WiFi password and root's own hashed
+	# password elsewhere in this build -- and deleted by that script
+	# once this device has actually joined, since a reusable auth key
+	# is only ever needed for a device's initial join (see that
+	# script's own comment).
+	printf '%s' "$TAILSCALE_AUTHKEY" > "$OVL/etc/tailscale-authkey"
+	chmod 600 "$OVL/etc/tailscale-authkey"
+
+	cp provision-tailscale.sh "$OVL/etc/tailscale-provision.sh"
+	chmod +x "$OVL/etc/tailscale-provision.sh"
+
+	# Diskless mode resets /var to tmpfs every boot -- symlink
+	# Tailscale's own state directory (its node identity/keys, once
+	# `tailscale up` establishes them) onto the persistent boot media
+	# instead, same pattern as pi-relay-control's relay-state below.
+	# Without this, every reboot would show up as a brand new device in
+	# the tailnet admin console instead of the same one reconnecting.
+	ln -sf /media/mmcblk0p1/tailscale-state "$OVL/var/lib/tailscale"
+fi
+
 ln -sf /etc/init.d/local "$OVL/etc/runlevels/default/local"
 for svc in wpa_supplicant dhcpcd chronyd sshd dbus avahi-daemon \
 	pi-bluetooth-configuration pi-relay-control victron-ve-direct; do
 	ln -sf "/etc/init.d/$svc" "$OVL/etc/runlevels/default/$svc"
 done
+if [ -n "$TAILSCALE_AUTHKEY" ]; then
+	ln -sf /etc/init.d/tailscale "$OVL/etc/runlevels/default/tailscale"
+fi
 
 # alpine-baselayout's default /etc/shadow and openssh's default
 # sshd_config don't exist yet when this overlay is unpacked (that
@@ -273,6 +334,9 @@ cp "work/repo/$REPO_KEY" work/bootfs/apks/
 touch work/bootfs/apks/.boot_repository
 cp "work/$PI_HOSTNAME.apkovl.tar.gz" work/bootfs/
 mkdir -p work/bootfs/relay-state
+if [ -n "$TAILSCALE_AUTHKEY" ]; then
+	mkdir -p work/bootfs/tailscale-state
+fi
 
 # ── 5. Build the final single-partition .img ────────────────────────────────
 # Diskless mode needs only one FAT32 partition (kernel, apks/, apkovl --

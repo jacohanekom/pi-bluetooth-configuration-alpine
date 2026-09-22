@@ -500,6 +500,46 @@ void reboot_after_delay() {
     }).detach();
 }
 
+// Tailscale auto-join -- entirely optional and specific to
+// sdcard-image-pi3's TAILSCALE_AUTHKEY build path (see that image's
+// build-image.sh/README.md, "Remote access via Tailscale"). This
+// daemon has no Tailscale awareness beyond invoking this one fixed path
+// with this device's own hardware serial; the script itself owns every
+// Tailscale-specific detail (it doesn't exist at all on any other
+// deployment -- this daemon's own generic APKBUILD install, the
+// disk-resident Pi Zero image, a plain dev box).
+constexpr const char* TAILSCALE_PROVISION_SCRIPT = "/etc/tailscale-provision.sh";
+constexpr int TAILSCALE_PROVISION_MAX_ATTEMPTS = 20;
+constexpr int TAILSCALE_PROVISION_RETRY_SECS = 30;
+
+// Joining needs genuine internet reachability, which a boot-time OpenRC
+// service has no reliable way to wait for on a freshly unconfigured
+// device sitting in its own fallback AP with no internet uplink at all.
+// This daemon retries instead, roughly every 30s, up to
+// TAILSCALE_PROVISION_MAX_ATTEMPTS times per process lifetime -- giving
+// up for this boot rather than retrying forever, but naturally trying
+// again on the next boot/daemon restart regardless, since the script's
+// own idempotency (skip once already joined) makes that safe. The
+// existence check up front avoids spawning a pointless 10-minute retry
+// loop on every other deployment where this script was never shipped.
+void provision_tailscale_async(const std::string& serial) {
+    if (serial.empty()) return;
+    if (!std::ifstream(TAILSCALE_PROVISION_SCRIPT).good()) return;
+    std::thread([serial]() {
+        for (int attempt = 1; attempt <= TAILSCALE_PROVISION_MAX_ATTEMPTS; ++attempt) {
+            auto r = run_command({"sh", TAILSCALE_PROVISION_SCRIPT, serial}, 60);
+            if (r.exit_code == 0) {
+                if (!r.output.empty()) {
+                    std::cerr << "[Main] tailscale provisioning: " << trim(r.output) << "\n";
+                }
+                return;
+            }
+            std::cerr << "[Main] tailscale provisioning attempt " << attempt << " failed: " << trim(r.output) << "\n";
+            std::this_thread::sleep_for(std::chrono::seconds(TAILSCALE_PROVISION_RETRY_SECS));
+        }
+    }).detach();
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -518,6 +558,7 @@ int main(int argc, char** argv) {
     const std::string serial     = read_pi_serial();
     const std::string dev_name   = serial.empty() ? configured_name : serial;
     set_hostname_from_serial(serial);
+    provision_tailscale_async(serial);
     const std::string iface      = cfg.get_str("wifi.interface", "wlan0");
     const std::string eth_iface  = cfg.get_str("ethernet.interface", "eth0");
     // Optional -- a second wired interface (e.g. a USB-Ethernet dongle)

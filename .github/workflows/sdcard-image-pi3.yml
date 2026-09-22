@@ -67,6 +67,12 @@ jobs:
         env:
           ROOT_PASSWORD: ${{ secrets.SDCARD_ROOT_PASSWORD }}
           PI_HOSTNAME: ${{ inputs.hostname }}
+          # A repo secret, not a workflow_dispatch input -- this is a
+          # real credential, unlike hostname, and secrets aren't
+          # settable per-dispatch anyway. Leave unset to skip Tailscale
+          # entirely -- see sdcard-image-pi3/README.md, "Remote access
+          # via Tailscale".
+          TAILSCALE_AUTHKEY: ${{ secrets.SDCARD_TAILSCALE_AUTHKEY }}
         run: |
           cd sdcard-image-pi3
           ./build-image.sh

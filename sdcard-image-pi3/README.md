@@ -183,6 +183,89 @@ Optional: `PI_HOSTNAME=whatever` (defaults to `aipicam`). Output is
 hash (`openssl passwd -6`) baked into the `apkovl`; the plaintext itself
 is never written to disk or committed anywhere.
 
+## Remote access via Tailscale (optional)
+
+By default this Pi is only reachable over SSH while you're on the same
+LAN (or its own fallback AP). If you also want to reach it from
+anywhere -- e.g. it's deployed somewhere without you physically present
+-- `build-image.sh` can bake in [Tailscale](https://tailscale.com), a
+WireGuard-based mesh VPN with a managed coordination service handling
+NAT traversal/discovery, entirely opt-in:
+
+```sh
+ROOT_PASSWORD='something-you-choose' \
+TAILSCALE_AUTHKEY='<a reusable Tailscale auth key>' \
+./build-image.sh
+```
+
+Leave `TAILSCALE_AUTHKEY` unset (the default) and none of this applies
+-- no packages fetched, no service enabled, nothing changes about the
+image.
+
+Unlike a self-hosted VPN (e.g. plain WireGuard), there's **no server
+for you to run or maintain** -- like Cloudflare Tunnel, Tailscale only
+ever makes outbound connections, so it works behind any NAT/firewall
+with no port forwarding anywhere. Unlike Cloudflare Tunnel, per-device
+identity needs **no build-time or first-boot API orchestration at
+all**: a single *reusable* auth key baked into the image lets every
+device built from it join the same tailnet, each automatically
+registering as its own distinct node -- Alpine packages
+`tailscale`/`tailscale-openrc` directly (no custom binary download, no
+hand-written OpenRC service, unlike Cloudflare Tunnel's `cloudflared`).
+
+`pi-bluetooth-configuration` itself (see `src/main.cpp`,
+`provision_tailscale_async()`) invokes `tailscale up --authkey=...
+--hostname=<this device's hardware serial>` the first time the device
+has internet access -- same identity already used for its hostname and
+AP SSID. Retried roughly every 30s if it fails (most likely: no
+internet yet -- a freshly unconfigured device sits in its own fallback
+AP with no uplink at all until WiFi setup finishes), idempotent (skips
+entirely once already joined, checked via `tailscale status`'s own exit
+code -- confirmed directly it reliably reflects join state, not
+assumed). This is what makes the *same built image* flashable onto any
+number of physical Pis -- each joins as its own node automatically,
+with no per-build/per-device step on your end beyond flashing the card.
+
+Once joined, `ssh root@<serial>` works directly via
+[MagicDNS](https://tailscale.com/kb/1081/magicdns) from any other
+device on the same tailnet (enabled by default for new tailnets) -- no
+manual routing/DNS step needed, unlike Cloudflare Tunnel.
+
+**One-time setup**: [login.tailscale.com/admin/settings/keys](https://login.tailscale.com/admin/settings/keys)
+-> **Generate auth key** -> **Reusable** (so every device built from
+this image can use the same one) -> **Tagged**, e.g. `tag:aipicam`
+(strongly recommended, not just for scoping ACLs to these devices
+specifically rather than granting them whatever access your own user
+account has -- [confirmed directly against Tailscale's own
+docs](https://tailscale.com/docs/features/access-control/key-expiry),
+a device that authenticates using a *tagged* key has its own key expiry
+**disabled automatically and permanently**, regardless of the auth
+key's own expiration afterward). Copy the generated key (starts with
+`tskey-auth-`); that's `TAILSCALE_AUTHKEY` above.
+
+The auth key itself still expires after at most 90 days (a hard
+Tailscale platform limit, not configurable higher) -- but that only
+limits how much longer it can be used to onboard *additional new*
+devices; it has no effect on devices that already joined using it, and
+(because it was tagged) their own connections don't expire at all.
+Building more devices after the key expires just needs a fresh one,
+same steps as above -- already-deployed devices need nothing. Tagging
+has to happen at auth time via the key itself; tagging a device
+afterward through the admin console doesn't retroactively disable its
+expiry.
+
+#### Security note
+
+The auth key lives on the device's filesystem (`/etc/tailscale-authkey`,
+mode 600) only *until* this device successfully joins --
+`provision-tailscale.sh` deletes it once `tailscale up` succeeds, since
+a device with an established identity never needs to re-present it. A
+device compromised *before* its first successful join exposes a
+credential that can register new devices onto the tailnet (bounded by
+whatever tag/ACL/expiration it was created with); a device compromised
+*after* only exposes that one device's own node identity, not the
+ability to add others.
+
 ## 3. Write it to an SD card
 
 **Double-check the device path before running `dd` -- writing to the
@@ -207,7 +290,7 @@ the exact same script on a genuine aarch64 GitHub-hosted runner
 all three repos' latest artifacts, not just this one, and produces a
 build artifact you don't want piling up on every commit.
 
-One-time setup, two repo secrets on **pi-bluetooth-configuration-alpine**
+One-time setup, repo secrets on **pi-bluetooth-configuration-alpine**
 (Settings -> Secrets and variables -> Actions):
 
 - `SDCARD_ROOT_PASSWORD` -- same meaning as the local `ROOT_PASSWORD`
@@ -218,6 +301,11 @@ One-time setup, two repo secrets on **pi-bluetooth-configuration-alpine**
   fine-grained PAT (https://github.com/settings/personal-access-tokens)
   scoped to just `pi-relay-control-alpine` and `victron-ve-direct-alpine`,
   with **Actions: Read-only** repository permission, and save it here.
+- `SDCARD_TAILSCALE_AUTHKEY` (optional) -- same meaning as the local
+  `TAILSCALE_AUTHKEY` env var above. Leave unset to skip Tailscale
+  entirely, same as locally. A secret rather than a `workflow_dispatch`
+  input since it's a real credential, not a cosmetic setting like
+  `hostname`.
 
 Then trigger it from the Actions tab, or:
 
@@ -275,3 +363,12 @@ down.
   board using the same `bcm2710`/`bcm2837`-family SoC); a Pi 4/5 would
   need its own verification even though the same aarch64 `.apk`s would
   technically install.
+- Tailscale support: verified that Alpine actually packages
+  `tailscale`/`tailscale-openrc` (not assumed), that `tailscale status`
+  reliably reflects join state via its exit code (checked directly
+  against a real `tailscaled`, both before and after simulating a
+  join), and the generated `apkovl` contents (packages, auth key file,
+  provisioning script, `/var/lib/tailscale` symlink, runlevel wiring)
+  by inspecting a real build's output -- but joining a real tailnet
+  hasn't been exercised end-to-end, and neither this nor real hardware
+  has been tested yet.
