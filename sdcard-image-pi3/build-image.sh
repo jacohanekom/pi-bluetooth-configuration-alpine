@@ -247,6 +247,16 @@ cp restore-wifi-config.initd "$OVL/etc/init.d/restore-wifi-config"
 chmod +x "$OVL/etc/init.d/restore-wifi-config"
 ln -sf /etc/init.d/restore-wifi-config "$OVL/etc/runlevels/boot/restore-wifi-config"
 
+# Fixes chrony's default config so it actually steps (jumps) the clock
+# on first sync instead of getting stuck slewing forever -- see
+# fix-chrony-makestep.initd for the full explanation. Also unconditional
+# -- a wrong clock breaks any HTTPS client that validates certificate
+# dates, Tailscale's own control-plane connection very much included,
+# not just this specific optional feature.
+cp fix-chrony-makestep.initd "$OVL/etc/init.d/fix-chrony-makestep"
+chmod +x "$OVL/etc/init.d/fix-chrony-makestep"
+ln -sf /etc/init.d/fix-chrony-makestep "$OVL/etc/runlevels/boot/fix-chrony-makestep"
+
 # Tailscale, for reaching this Pi remotely -- see the TAILSCALE_AUTHKEY
 # check near the top of this script and README.md's "Remote access via
 # Tailscale". tailscale-openrc's own package already provides a working

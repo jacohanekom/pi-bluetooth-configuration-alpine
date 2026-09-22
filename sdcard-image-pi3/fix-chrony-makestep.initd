@@ -1,0 +1,46 @@
+#!/sbin/openrc-run
+# Alpine's own default chrony.conf uses `initstepslew`, not the modern
+# `makestep` -- initstepslew only ever attempts its one-time step
+# correction against the configured server(s) at chronyd's own very
+# first startup moment; if that one attempt doesn't land (network/DNS
+# not fully up yet, quite plausible this early in boot), chrony falls
+# back to plain incremental slewing for every correction afterward,
+# which is hopelessly inadequate for a multi-hundred-day initial offset
+# (this device has no RTC, so a cold boot's starting clock can be off
+# by however long it's been since this image was built). Confirmed on
+# real hardware: `chronyc tracking`/`sources -v` showed it had already
+# correctly determined the real time with every NTP source fully
+# reachable, yet `date` stayed wrong indefinitely -- it had calculated
+# the correction but never actually applied it. `makestep` instead
+# applies on each of its first N sync updates, not just one early-boot-
+# only attempt, so it's robust against exactly this kind of startup
+# timing issue. Downstream effect: any HTTPS client that validates
+# certificate dates (Tailscale's own control-plane connection, in
+# particular -- "x509: certificate has expired or is not yet valid")
+# fails outright while the clock is this wrong.
+#
+# Same clobbering problem as wpa_supplicant.conf (see
+# restore-wifi-config.initd/wifi_control.hpp's own comments) --
+# chrony's own package ships /etc/chrony/chrony.conf, which diskless
+# mode's every-boot-fresh package reinstall would silently overwrite
+# any apkovl-provided customization of it right back to Alpine's own
+# default, since apk installs happen after the apkovl unpacks and
+# diskless mode never remembers a previous install. Unlike
+# wpa_supplicant.conf, there's no dynamic per-boot content to preserve
+# here though -- this is a fixed, build-time-known correction, so this
+# just rewrites the file outright rather than needing a separate
+# save/restore pair.
+name="fix-chrony-makestep"
+description="Fixes chrony's default config to actually step the clock on first sync"
+
+start() {
+	ebegin "Fixing chrony makestep config"
+	cat > /etc/chrony/chrony.conf <<-EOF
+		pool pool.ntp.org iburst
+		makestep 1.0 3
+		driftfile /var/lib/chrony/chrony.drift
+		rtcsync
+		cmdport 0
+	EOF
+	eend 0
+}

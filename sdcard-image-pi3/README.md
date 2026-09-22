@@ -159,6 +159,37 @@ the last successful setup/forget cycle won't be captured. Not fixable
 in general for a diskless system without a UPS or similar; just worth
 knowing.
 
+## System clock reliability
+
+This board has no battery-backed real-time clock, so every cold boot
+starts with whatever time the kernel happens to have (often long in the
+past) until `chronyd` corrects it over NTP. Alpine's own default
+`chrony.conf` uses the legacy `initstepslew` directive, which only
+attempts its one-time step correction once, at `chronyd`'s own very
+first startup moment -- if network/DNS isn't fully ready right then
+(plausible this early in boot), chrony falls back to slow incremental
+slewing for every correction afterward, which is hopelessly inadequate
+for a clock that's off by months. Confirmed on real hardware: `chronyc
+tracking`/`sources -v` showed it had already correctly determined the
+real time with every configured NTP source fully reachable, yet `date`
+stayed wrong indefinitely -- the correction was calculated but never
+applied. `fix-chrony-makestep.initd` (boot runlevel, unconditional)
+replaces this with the modern `makestep 1.0 3` directive, which applies
+on each of the first three sync updates rather than a single early-boot
+attempt. A wrong clock breaks anything that validates HTTPS certificate
+dates -- this is what was actually behind Tailscale's own connection
+failing with `x509: certificate has expired or is not yet valid`, not
+a Tailscale-specific problem at all.
+
+Same clobbering concern as `wpa_supplicant.conf` (see above): chrony's
+own package ships `/etc/chrony/chrony.conf`, which diskless mode's
+every-boot-fresh package reinstall would otherwise silently overwrite
+any customization of back to Alpine's default. Unlike WiFi credentials
+there's no per-boot dynamic content to preserve here, so this just
+rewrites the file outright in the `boot` runlevel (same timing as
+`wait-for-wlan`/`restore-wifi-config`) rather than needing a save/
+restore pair.
+
 ## Prerequisites
 
 - Docker Desktop (used both for the aarch64 build -- genuinely native
