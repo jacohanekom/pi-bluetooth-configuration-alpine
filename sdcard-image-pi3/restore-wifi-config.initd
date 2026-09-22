@@ -1,0 +1,27 @@
+#!/sbin/openrc-run
+# Restores a previously-saved WiFi network config before wpa_supplicant
+# starts -- see wifi_control.hpp's own comment on
+# WPA_SUPPLICANT_CONF_SAVED for the full explanation. Short version:
+# pi-bluetooth-configuration's own package ships a bare, no-network
+# default AT wpa_supplicant.conf's own path (so a genuinely fresh
+# device still has a working ctrl_interface), which diskless mode's
+# apk_add-every-package-fresh-every-boot behavior reinstalls
+# unconditionally, clobbering any real network that was staged/saved
+# there before -- confirmed on real hardware: the provisioning marker
+# (never shipped by any package) survived a reboot while a saved
+# network (shipped by this one) silently didn't. Placed in the "boot"
+# runlevel, which always fully completes -- including all package
+# installation, which happens even earlier, in the initramfs itself,
+# before OpenRC's own runlevels start at all -- before "default" (where
+# wpa_supplicant/this daemon actually read this file), same reasoning
+# as wait-for-wlan.
+name="restore-wifi-config"
+description="Restores a previously-saved WiFi network config before wpa_supplicant starts"
+
+start() {
+	ebegin "Restoring saved WiFi config"
+	if [ -f /etc/wpa_supplicant/wpa_supplicant.conf.saved ]; then
+		cp /etc/wpa_supplicant/wpa_supplicant.conf.saved /etc/wpa_supplicant/wpa_supplicant.conf
+	fi
+	eend 0
+}

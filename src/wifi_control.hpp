@@ -17,6 +17,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
+#include <cstdio>
 #include <fstream>
 #include <iostream>
 #include <mutex>
@@ -30,6 +31,30 @@
 #include "subprocess.hpp"
 
 constexpr const char* WPA_SUPPLICANT_CONF = "/etc/wpa_supplicant/wpa_supplicant.conf";
+// A sibling copy of WPA_SUPPLICANT_CONF, updated alongside it on every
+// successful stage()/connect() (see backup_wpa_conf() below) and
+// cleared on forget() -- exists specifically for sdcard-image-pi3's
+// diskless image, which reinstalls every package fresh from scratch on
+// every single boot (root is tmpfs). pi-bluetooth-configuration's own
+// package ships a bare, no-network default AT THIS EXACT PATH (so a
+// genuinely fresh device still has a working ctrl_interface for wpa_cli
+// -- see wpa_supplicant.conf's own header comment), which apk
+// reinstalls unconditionally on every boot since diskless mode never
+// carries over apk's own "already installed, don't clobber a locally-
+// modified config" bookkeeping (only /etc itself survives a reboot, via
+// lbu -- not /lib/apk/db). That happens AFTER the apkovl (with
+// whatever real network was last saved here) is already unpacked, so
+// the package's bare default wins every time, silently discarding the
+// real one -- confirmed on real hardware: the provisioning marker
+// (never shipped by any package) survived a reboot while the staged
+// network (shipped by this one) didn't. This path isn't touched by any
+// package at all, so a small boot-runlevel service specific to that
+// image (restore-wifi-config.initd, see sdcard-image-pi3/build-image.sh)
+// can safely copy it back over the just-clobbered live file, before
+// wpa_supplicant/this daemon's own boot-time join attempt ever reads
+// it. Inert everywhere else (disk-resident images, a plain dev box) --
+// nothing there ever reads this path back.
+constexpr const char* WPA_SUPPLICANT_CONF_SAVED = "/etc/wpa_supplicant/wpa_supplicant.conf.saved";
 
 struct ScanResult {
     std::string ssid;
@@ -277,6 +302,8 @@ public:
             std::cerr << "[WifiControl] WARNING: wpa_cli save_config did not return OK (" << trim(save.output)
                       << ") -- this network will not persist across a reboot. Check that "
                          "update_config=1 is set in wpa_supplicant.conf and that the file is writable.\n";
+        } else {
+            backup_wpa_conf();
         }
 
         set_status(WifiStatus{WifiStatus::CONNECTING, ssid, "", ""});
@@ -312,6 +339,11 @@ public:
     void forget() {
         remove_all_networks();
         run_command({"wpa_cli", "-i", iface_, "save_config"});
+        // Otherwise the next boot's restore-wifi-config service (see
+        // WPA_SUPPLICANT_CONF_SAVED's own comment) would copy the
+        // now-forgotten network right back over the freshly-cleared
+        // live config, silently undoing this reset.
+        std::remove(WPA_SUPPLICANT_CONF_SAVED);
         set_status(WifiStatus{});
     }
 
@@ -382,6 +414,8 @@ public:
             out << "\tkey_mgmt=NONE\n";
         }
         out << "}\n";
+        out.close();
+        backup_wpa_conf();
         return true;
     }
 
@@ -390,6 +424,19 @@ private:
         std::lock_guard<std::mutex> lk(mu_);
         status_.state = WifiStatus::FAILED;
         status_.error = err;
+    }
+
+    // See WPA_SUPPLICANT_CONF_SAVED's own comment for why this exists.
+    // A plain file copy, not a rename/symlink -- WPA_SUPPLICANT_CONF
+    // itself needs to keep existing at its own well-known path for
+    // wpa_supplicant/wpa_cli to keep working normally everywhere this
+    // runs, diskless image or not.
+    void backup_wpa_conf() {
+        std::ifstream in(WPA_SUPPLICANT_CONF, std::ios::binary);
+        if (!in.is_open()) return;
+        std::ofstream out(WPA_SUPPLICANT_CONF_SAVED, std::ios::binary | std::ios::trunc);
+        if (!out.is_open()) return;
+        out << in.rdbuf();
     }
 
     // wpa_supplicant reloads every network saved in wpa_supplicant.conf

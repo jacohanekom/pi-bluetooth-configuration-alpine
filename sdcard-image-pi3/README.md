@@ -120,6 +120,31 @@ for two different classes of state:
   `lbu.list`. Found on real hardware: WiFi credentials correctly
   survived a reboot while the marker (still at the old bare-root path
   at the time) silently didn't.
+- **WiFi credentials specifically also need a second, unrelated fix** on
+  top of the `-d` one above -- `lbu commit` succeeding is necessary but
+  not sufficient for them. `pi-bluetooth-configuration`'s own package
+  ships a bare, no-network default `wpa_supplicant.conf` (so a
+  genuinely fresh device still has a working `ctrl_interface` for
+  `wpa_cli` -- see that file's own header comment), installed at exactly
+  the same path a real network gets staged/saved into. Diskless mode
+  reinstalls *every* package fresh from scratch on *every* boot (root is
+  tmpfs), and never carries over apk's own "already installed, don't
+  clobber a locally-modified config" bookkeeping (`/lib/apk/db` isn't
+  part of what `lbu` persists -- only `/etc` is) -- so that reinstall,
+  which happens right after the apkovl (with whatever real network was
+  last saved) is unpacked, unconditionally overwrites it back to the
+  bare default, every single time. Confirmed on real hardware: the
+  provisioning marker (never shipped by any package) survived a reboot
+  while a saved network (shipped by this one) silently didn't -- then
+  reproduced exactly in isolation (stage a real network -> simulate the
+  package reinstall clobbering it -> confirm it's gone) before fixing.
+  The fix: `wifi_control.hpp` now also mirrors a successful
+  stage/connect to `wpa_supplicant.conf.saved`, a path no package ever
+  touches, and `restore-wifi-config.initd` (a new "boot" runlevel
+  service, same placement/reasoning as `wait-for-wlan` above) copies it
+  back over the just-clobbered live file before `wpa_supplicant`/this
+  daemon's own boot-time join attempt ever reads it. `forget()` clears
+  `.saved` too, so a reset isn't silently undone by the next boot.
 - **Relay on/off state** (`pi-relay-control`'s "resume last position
   after reboot" feature) lives under `/var`, which isn't covered by
   the `/etc`-only `lbu` tracking above -- it's made to survive instead
@@ -359,6 +384,12 @@ down.
   resolution independently simulated and confirmed successful on this
   Mac; not yet test-booted on real Pi 3 hardware -- please report back
   if you hit anything on first boot.
+- The `wpa_supplicant.conf`-gets-clobbered-every-boot fix (see "Config
+  persistence across reboots") was reproduced and verified in isolation
+  (a real, deterministic simulation of the exact stage/clobber/restore
+  sequence, not just inferred from reading the code) but hasn't yet
+  been re-verified with an actual boot-clobber-restore cycle on real Pi
+  3 hardware.
 - Only tested/intended for a genuine Pi 3 (or other aarch64-capable
   board using the same `bcm2710`/`bcm2837`-family SoC); a Pi 4/5 would
   need its own verification even though the same aarch64 `.apk`s would

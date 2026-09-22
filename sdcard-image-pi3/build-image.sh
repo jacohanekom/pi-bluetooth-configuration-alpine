@@ -233,6 +233,20 @@ cp wait-for-wlan.initd "$OVL/etc/init.d/wait-for-wlan"
 chmod +x "$OVL/etc/init.d/wait-for-wlan"
 ln -sf /etc/init.d/wait-for-wlan "$OVL/etc/runlevels/boot/wait-for-wlan"
 
+# Restores a WiFi network staged/saved on a previous boot before
+# wpa_supplicant starts and this daemon attempts its own boot-time join
+# -- see restore-wifi-config.initd and wifi_control.hpp's own comment
+# on WPA_SUPPLICANT_CONF_SAVED for the full explanation of why this is
+# needed at all (pi-bluetooth-configuration's own package ships a bare
+# default wpa_supplicant.conf, which diskless mode's every-boot fresh
+# package reinstall silently clobbers a real saved network with,
+# confirmed on real hardware). Unconditional, not gated behind any
+# opt-in flag -- this fixes core WiFi persistence, not an optional
+# feature.
+cp restore-wifi-config.initd "$OVL/etc/init.d/restore-wifi-config"
+chmod +x "$OVL/etc/init.d/restore-wifi-config"
+ln -sf /etc/init.d/restore-wifi-config "$OVL/etc/runlevels/boot/restore-wifi-config"
+
 # Tailscale, for reaching this Pi remotely -- see the TAILSCALE_AUTHKEY
 # check near the top of this script and README.md's "Remote access via
 # Tailscale". tailscale-openrc's own package already provides a working
