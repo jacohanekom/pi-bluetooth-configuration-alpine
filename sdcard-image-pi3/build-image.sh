@@ -316,6 +316,20 @@ docker run --rm --platform linux/arm64 -v "$PWD/work/wetty":/wetty -w /wetty alp
 	# from anywhere -- is ever used here. Pruning the rest is a real
 	# size saving (roughly 60MB), not just tidiness.
 	find node_modules -type d \( -name "win32-*" -o -name "darwin-*" \) -exec rm -rf {} + 2>/dev/null || true
+	# npm (running as root in this throwaway container) creates every
+	# node_modules subdirectory itself, unlike the apk-fetch step above
+	# whose target directory the host pre-creates -- so, on a genuine
+	# Linux Docker host (confirmed the hard way: this worked locally on
+	# macOS Docker Desktop, whose bind-mount layer papers over exactly
+	# this, but failed on a real ubuntu-24.04-arm GitHub Actions runner),
+	# every nested directory npm created is root-owned and unwritable by
+	# the non-root user actually running this script, breaking the
+	# rm -rf/cp -r below and this script'"'"'s own final cleanup. Only
+	# root (still us, inside this container, before it exits) can fix
+	# that up -- chown back to whatever host uid:gid is actually running
+	# this script, passed in from outside since inside the container
+	# "id -u" would just say 0.
+	chown -R '"$(id -u):$(id -g)"' .
 '
 rm -rf "$OVL/usr/local/lib/wetty"
 mkdir -p "$OVL/usr/local/lib/wetty"
