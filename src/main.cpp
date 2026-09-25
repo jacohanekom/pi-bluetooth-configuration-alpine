@@ -125,6 +125,7 @@
 #include <chrono>
 #include <csignal>
 #include <cstdio>
+#include <cstring>
 #include <fstream>
 #include <iostream>
 #include <map>
@@ -133,6 +134,8 @@
 #include <string>
 #include <thread>
 #include <vector>
+
+#include <openssl/rand.h>
 
 #include "ap_control.hpp"
 #include "config.hpp"
@@ -163,6 +166,23 @@ constexpr const char* HOSTNAME_FILE = "/etc/hostname";
 // survive a reboot). Not used for access control -- nothing gates on
 // this file existing the way pi-relay-control gates on MARKER_FILE.
 constexpr const char* CAMERA_USER_FILE = "/etc/camera_user";
+
+// This device's own randomly-generated non-root login -- see
+// create_admin_account() below. Plain username, not a secret; read by
+// wetty.initd at service-start time (see that file's own comment) to
+// know which account to force ssh into now that Wetty may be reachable
+// from the internet via Cloudflare Tunnel and root SSH login is
+// disabled image-wide (build-image.sh's sshd_config now ships
+// PermitRootLogin no unconditionally, not just for Wetty specifically
+// -- see that script's own comment on why a Wetty-only restriction
+// wouldn't actually be a real security boundary).
+constexpr const char* ADMIN_USER_FILE = "/etc/admin-user";
+// Its own file under Alpine's doas.d override directory, not a
+// shared /etc/doas.conf edit -- confirmed directly against a real doas
+// that /etc/doas.d/*.conf is genuinely additive to /etc/doas.conf
+// (Alpine-specific; not a bare upstream-OpenBSD-doas feature), so this
+// doesn't need to parse-and-rewrite a file it doesn't own.
+constexpr const char* DOAS_ADMIN_CONF = "/etc/doas.d/pi-bluetooth-configuration-admin.conf";
 
 std::atomic<bool> g_running{true};
 std::atomic<int> g_inflight{0};
@@ -395,6 +415,97 @@ void write_camera_user(const std::string& name, const std::string& email) {
     f << "email=" << sanitize(email) << "\n";
 }
 
+// Cryptographically random (RAND_bytes, not std::rand()) -- this
+// becomes this device's own login credential material, generated once
+// at first successful setup (see create_admin_account()), so it needs
+// the same unguessability any freshly-minted password would. Returns
+// false without touching `out` if the underlying PRNG can't be read
+// (should never happen on a real Linux system, but a failure here must
+// never silently fall back to something predictable).
+bool random_string(size_t len, const char* alphabet, std::string& out) {
+    size_t alphabet_len = std::strlen(alphabet);
+    std::vector<unsigned char> buf(len);
+    if (RAND_bytes(buf.data(), static_cast<int>(len)) != 1) return false;
+    out.resize(len);
+    for (size_t i = 0; i < len; ++i) out[i] = alphabet[buf[i] % alphabet_len];
+    return true;
+}
+
+// Creates this Pi's one and only non-root login, the first time setup
+// ever actually finishes (see do_finish() below, which gates this on
+// ADMIN_USER_FILE not existing yet). Returns false, having created
+// nothing persistent, on any failure -- do_finish() refuses to finish
+// at all in that case, since build-image.sh's sshd_config now ships
+// PermitRootLogin no unconditionally, so a device that somehow
+// finished without ever getting a working admin account would have no
+// valid SSH/Wetty login whatsoever.
+bool create_admin_account(std::string& out_user, std::string& out_pass) {
+    std::string user, pass;
+    // Lowercase-only, prefixed with a letter -- conservative enough to
+    // satisfy every adduser implementation's own username rules without
+    // needing to know exactly which one this image ships.
+    if (!random_string(6, "abcdefghijklmnopqrstuvwxyz0123456789", user)) return false;
+    user = "aipi-" + user;
+    // 48 hex characters (24 bytes of real entropy) -- no special
+    // characters at all, so it's safe both as a plain argv element
+    // (execvp, no shell involved -- see subprocess.hpp) and embedded
+    // directly in a JSON response with no escaping needed.
+    if (!random_string(48, "0123456789abcdef", pass)) return false;
+
+    auto add = run_command({"adduser", "-D", "-h", "/home/" + user, user});
+    if (add.exit_code != 0) {
+        std::cerr << "[Main] failed to create admin user \"" << user << "\": " << trim(add.output) << "\n";
+        return false;
+    }
+    // Same SHA-512 crypt mechanism build-image.sh's own ROOT_PASSWORD
+    // uses at build time (`openssl passwd -6`) rather than
+    // reimplementing crypt(3) here. Passed as a plain argv element, not
+    // stdin, for the same reason build-image.sh does: execvp has no
+    // shell to leak it through, and this device has no untrusted local
+    // users who could read another root process's /proc/<pid>/cmdline
+    // during the sub-second window this runs.
+    auto hashed = run_command({"openssl", "passwd", "-6", pass});
+    if (hashed.exit_code != 0) {
+        std::cerr << "[Main] failed to hash admin password: " << trim(hashed.output) << "\n";
+        run_command({"deluser", user});
+        return false;
+    }
+    // usermod (from the `shadow` package -- busybox's own adduser/
+    // passwd/chpasswd don't include it) is the one tool that accepts an
+    // already-computed hash directly via argv; chpasswd -e can also set
+    // a pre-hashed password but only via stdin, which run_command()
+    // doesn't wire up (see subprocess.hpp) -- this avoids needing to.
+    auto set_pass = run_command({"usermod", "-p", trim(hashed.output), user});
+    if (set_pass.exit_code != 0) {
+        std::cerr << "[Main] failed to set admin password: " << trim(set_pass.output) << "\n";
+        run_command({"deluser", user});
+        return false;
+    }
+
+    // doas, not sudo -- Alpine doesn't package sudo by default, and
+    // this project already avoids adding packages beyond what's needed
+    // (see build-image.sh). "permit persist" mirrors what most sudo
+    // setups do (re-prompt periodically, not on literally every
+    // invocation) rather than plain "permit" (every time) or "permit
+    // nopass" (never -- which would make a stolen SSH session
+    // immediately root-equivalent with no further credential check).
+    {
+        std::ofstream f(DOAS_ADMIN_CONF);
+        f << "permit persist " << user << "\n";
+    }
+    // doas refuses to honor a config file it doesn't own outright or
+    // that's group/other-writable -- confirmed directly against a real
+    // doas, not assumed from its docs.
+    run_command({"chown", "root:root", DOAS_ADMIN_CONF});
+    run_command({"chmod", "0600", DOAS_ADMIN_CONF});
+
+    { std::ofstream f(ADMIN_USER_FILE); f << user << "\n"; }
+
+    out_user = user;
+    out_pass = pass;
+    return true;
+}
+
 // Returns null if CAMERA_USER_FILE doesn't exist yet (no one has ever
 // POSTed /user) rather than an object with empty fields, so the client
 // can tell "not set" apart from "set to blank".
@@ -500,42 +611,43 @@ void reboot_after_delay() {
     }).detach();
 }
 
-// Tailscale auto-join -- entirely optional and specific to
-// sdcard-image-pi3's TAILSCALE_AUTHKEY build path (see that image's
-// build-image.sh/README.md, "Remote access via Tailscale"). This
-// daemon has no Tailscale awareness beyond invoking this one fixed path
+// Cloudflare Tunnel auto-provision -- entirely optional and specific to
+// sdcard-image-pi3's CLOUDFLARE_API_TOKEN build path (see that image's
+// build-image.sh/README.md, "Remote access via Cloudflare Tunnel"). This
+// daemon has no Cloudflare awareness beyond invoking this one fixed path
 // with this device's own hardware serial; the script itself owns every
-// Tailscale-specific detail (it doesn't exist at all on any other
+// Cloudflare-specific detail (it doesn't exist at all on any other
 // deployment -- this daemon's own generic APKBUILD install, the
 // disk-resident Pi Zero image, a plain dev box).
-constexpr const char* TAILSCALE_PROVISION_SCRIPT = "/etc/tailscale-provision.sh";
-constexpr int TAILSCALE_PROVISION_MAX_ATTEMPTS = 20;
-constexpr int TAILSCALE_PROVISION_RETRY_SECS = 30;
+constexpr const char* CLOUDFLARE_PROVISION_SCRIPT = "/etc/cloudflare-provision.sh";
+constexpr int CLOUDFLARE_PROVISION_MAX_ATTEMPTS = 20;
+constexpr int CLOUDFLARE_PROVISION_RETRY_SECS = 30;
 
-// Joining needs genuine internet reachability, which a boot-time OpenRC
-// service has no reliable way to wait for on a freshly unconfigured
-// device sitting in its own fallback AP with no internet uplink at all.
-// This daemon retries instead, roughly every 30s, up to
-// TAILSCALE_PROVISION_MAX_ATTEMPTS times per process lifetime -- giving
-// up for this boot rather than retrying forever, but naturally trying
-// again on the next boot/daemon restart regardless, since the script's
-// own idempotency (skip once already joined) makes that safe. The
-// existence check up front avoids spawning a pointless 10-minute retry
-// loop on every other deployment where this script was never shipped.
-void provision_tailscale_async(const std::string& serial) {
+// Provisioning needs genuine internet reachability (to call the
+// Cloudflare API), which a boot-time OpenRC service has no reliable way
+// to wait for on a freshly unconfigured device sitting in its own
+// fallback AP with no internet uplink at all. This daemon retries
+// instead, roughly every 30s, up to CLOUDFLARE_PROVISION_MAX_ATTEMPTS
+// times per process lifetime -- giving up for this boot rather than
+// retrying forever, but naturally trying again on the next boot/daemon
+// restart regardless, since the script's own idempotency (skip once its
+// own tunnel already exists) makes that safe. The existence check up
+// front avoids spawning a pointless 10-minute retry loop on every other
+// deployment where this script was never shipped.
+void provision_cloudflare_async(const std::string& serial) {
     if (serial.empty()) return;
-    if (!std::ifstream(TAILSCALE_PROVISION_SCRIPT).good()) return;
+    if (!std::ifstream(CLOUDFLARE_PROVISION_SCRIPT).good()) return;
     std::thread([serial]() {
-        for (int attempt = 1; attempt <= TAILSCALE_PROVISION_MAX_ATTEMPTS; ++attempt) {
-            auto r = run_command({"sh", TAILSCALE_PROVISION_SCRIPT, serial}, 60);
+        for (int attempt = 1; attempt <= CLOUDFLARE_PROVISION_MAX_ATTEMPTS; ++attempt) {
+            auto r = run_command({"sh", CLOUDFLARE_PROVISION_SCRIPT, serial}, 60);
             if (r.exit_code == 0) {
                 if (!r.output.empty()) {
-                    std::cerr << "[Main] tailscale provisioning: " << trim(r.output) << "\n";
+                    std::cerr << "[Main] cloudflare provisioning: " << trim(r.output) << "\n";
                 }
                 return;
             }
-            std::cerr << "[Main] tailscale provisioning attempt " << attempt << " failed: " << trim(r.output) << "\n";
-            std::this_thread::sleep_for(std::chrono::seconds(TAILSCALE_PROVISION_RETRY_SECS));
+            std::cerr << "[Main] cloudflare provisioning attempt " << attempt << " failed: " << trim(r.output) << "\n";
+            std::this_thread::sleep_for(std::chrono::seconds(CLOUDFLARE_PROVISION_RETRY_SECS));
         }
     }).detach();
 }
@@ -558,7 +670,7 @@ int main(int argc, char** argv) {
     const std::string serial     = read_pi_serial();
     const std::string dev_name   = serial.empty() ? configured_name : serial;
     set_hostname_from_serial(serial);
-    provision_tailscale_async(serial);
+    provision_cloudflare_async(serial);
     const std::string iface      = cfg.get_str("wifi.interface", "wlan0");
     const std::string eth_iface  = cfg.get_str("ethernet.interface", "eth0");
     // Optional -- a second wired interface (e.g. a USB-Ethernet dongle)
@@ -752,14 +864,33 @@ int main(int argc, char** argv) {
     // already runs on every startup. Rejecting both would reboot into a
     // Pi that isn't actually configured at all, which finishing is
     // specifically meant to prevent.
-    auto do_finish = [&]() {
+    //
+    // Also the one and only place a fresh admin account (see
+    // create_admin_account()) ever gets created -- exactly once per
+    // device, gated on ADMIN_USER_FILE not existing yet, so every later
+    // /finish (e.g. reconfiguring WiFi on an already-provisioned
+    // device) leaves it untouched. Returns the freshly generated
+    // username/password via the out-parameters so the /finish HTTP
+    // handler can hand them back to the app in that same response --
+    // the only time they're ever retrievable, since only a password
+    // hash is kept on disk. Refuses to finish at all if account
+    // creation fails, rather than rebooting into a device with no valid
+    // login whatsoever -- see create_admin_account()'s own comment.
+    auto do_finish = [&](std::string& admin_user, std::string& admin_pass) -> bool {
         bool staged_via_ap = ap.is_running() && staged_network;
         if (!staged_via_ap && wifi.get_status().state != WifiStatus::CONNECTED) {
             std::cerr << "[Finish] ignoring: WiFi is not connected and nothing has been staged\n";
-            return;
+            return false;
+        }
+        if (!std::ifstream(ADMIN_USER_FILE).good()) {
+            if (!create_admin_account(admin_user, admin_pass)) {
+                std::cerr << "[Finish] aborting: failed to create the admin account\n";
+                return false;
+            }
         }
         std::ofstream(MARKER_FILE).close();
         reboot_after_delay();
+        return true;
     };
 
     // Ethernet direct-connect is only reconfigurable until the wizard
@@ -950,9 +1081,28 @@ int main(int argc, char** argv) {
         return httpsrv::Response::json("{\"ok\":true}");
     });
 
+    // Synchronous, unlike every other route above -- the admin
+    // account/credentials it may create (see do_finish()'s own comment)
+    // only ever exist in memory here, once, so they have to reach the
+    // response before this function returns; a detached background
+    // thread (the usual pattern here) would have no way to get them
+    // back into an HTTP response the client can still read. Nothing
+    // this actually does is slow (a handful of sub-second subprocess
+    // calls, no network I/O) -- reboot_after_delay() itself still
+    // backgrounds the reboot separately, same as before, so the
+    // response reaches the app well within its 3-second delay.
     server.route("POST", "/finish", [&](const httpsrv::Request&) {
         std::cerr << "[Command] finish requested\n";
-        std::thread([&]() { InflightGuard guard; do_finish(); }).detach();
+        std::string admin_user, admin_pass;
+        if (!do_finish(admin_user, admin_pass)) {
+            return httpsrv::Response::error(400, "not ready to finish yet");
+        }
+        if (!admin_user.empty()) {
+            std::ostringstream o;
+            o << "{\"ok\":true,\"adminUsername\":\"" << escape_json(admin_user) << "\","
+              << "\"adminPassword\":\"" << escape_json(admin_pass) << "\"}";
+            return httpsrv::Response::json(o.str());
+        }
         return httpsrv::Response::json("{\"ok\":true}");
     });
 

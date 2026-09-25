@@ -177,9 +177,13 @@ applied. `fix-chrony-makestep.initd` (boot runlevel, unconditional)
 replaces this with the modern `makestep 1.0 3` directive, which applies
 on each of the first three sync updates rather than a single early-boot
 attempt. A wrong clock breaks anything that validates HTTPS certificate
-dates -- this is what was actually behind Tailscale's own connection
-failing with `x509: certificate has expired or is not yet valid`, not
-a Tailscale-specific problem at all.
+dates -- this is what was actually behind a `x509: certificate has
+expired or is not yet valid` failure seen on real hardware (against
+this image's previous Tailscale-based remote-access feature, before it
+was replaced by Cloudflare Tunnel -- the same clock bug would just as
+easily break cloudflared's own connection to Cloudflare's edge, or any
+other HTTPS client), not a problem specific to whichever remote-access
+mechanism happened to be in use.
 
 Same clobbering concern as `wpa_supplicant.conf` (see above): chrony's
 own package ships `/etc/chrony/chrony.conf`, which diskless mode's
@@ -237,90 +241,189 @@ Optional: `PI_HOSTNAME=whatever` (defaults to `aipicam`). Output is
 
 `ROOT_PASSWORD` is only ever used in-memory to compute a SHA-512 crypt
 hash (`openssl passwd -6`) baked into the `apkovl`; the plaintext itself
-is never written to disk or committed anywhere.
+is never written to disk or committed anywhere. It's only usable at a
+physical keyboard/monitor plugged into the Pi, though -- root can't log
+in over SSH or Wetty at all; see "Logging in: the admin account, not
+root" below for how those actually work.
 
-## Remote access via Tailscale (optional)
+## Web terminal (Wetty)
 
-By default this Pi is only reachable over SSH while you're on the same
-LAN (or its own fallback AP). If you also want to reach it from
-anywhere -- e.g. it's deployed somewhere without you physically present
--- `build-image.sh` can bake in [Tailscale](https://tailscale.com), a
-WireGuard-based mesh VPN with a managed coordination service handling
-NAT traversal/discovery, entirely opt-in:
+Every image also bakes in [Wetty](https://github.com/butlerx/wetty), a
+browser-based terminal -- unconditional, not gated behind any env var,
+since it's useful over the LAN/fallback AP on its own (e.g. from a
+phone with no SSH client) even before you decide whether to also set up
+Cloudflare Tunnel below. Alpine doesn't package it (it's an npm
+package with a native addon, `node-pty`, not a single static binary),
+so `build-image.sh` runs `npm install` once at build time, for this
+image's own aarch64/musl target specifically (confirmed the compiled
+native binding is genuinely `ELF 64-bit LSB shared object, ARM
+aarch64`, not copied from anywhere), and bundles the result directly.
+
+Visit `http://<hostname>.local:3000` (or the Pi's IP) from any browser
+on the same LAN to get a full terminal -- Wetty spawns a real `ssh -t
+localhost` subprocess per connection (`--force-ssh`, see
+`wetty.initd`'s own comment for why that flag specifically matters when
+running as root against localhost), so it's gated by the exact same
+sshd as connecting with a regular SSH client -- this doesn't add or
+remove any authentication of its own, just another way to reach the
+same sshd. **Not root**, though, and not `ROOT_PASSWORD` either -- see
+"Logging in: the admin account, not root" below.
+
+## Logging in: the admin account, not root
+
+Root can no longer log in over SSH or Wetty at all (`PermitRootLogin
+no`, unconditional, not just for Wetty specifically -- see
+build-image.sh's own comment on why a Wetty-only restriction wouldn't
+actually be a real security boundary: Wetty's `--ssh-user` is a
+preference it applies to itself, not something a connecting client is
+bound by, and a raw `Remote-User` HTTP header or `/ssh/<user>` URL path
+can override it outright). `ROOT_PASSWORD` still gets hashed into
+`/etc/shadow` every boot as before, but it's now only ever usable at a
+physical keyboard/monitor plugged directly into the Pi.
+
+Instead, the very first time `POST /finish` actually succeeds (i.e. the
+first time the iOS app's setup wizard completes) `pi-bluetooth-
+configuration` generates a random username and password, creates that
+Unix account, permits it to `doas` (Alpine's sudo-equivalent) to root,
+and returns both in that same `/finish` response for the app to display
+to you. This is the **only** time either is ever retrievable -- only a
+SHA-512 password hash is kept on disk from then on, the same way
+`ROOT_PASSWORD` itself has always been handled here, so write it down
+somewhere. Log in with it the same way you would have with root
+(`ssh <user>@<hostname>.local`, the web terminal, or over the tunnel
+once Cloudflare Tunnel below is set up), then `doas <command>` (or
+`doas -s` for a root shell) whenever you actually need root.
+
+Reconfiguring an already-provisioned device (WiFi changes, etc. --
+anything that calls `/finish` again) leaves this account untouched;
+the response is a plain `{"ok":true}` with no credentials in it, same
+as before this feature existed. There's no recovery path if you lose
+the password short of wiping `/etc/admin-user` and the account itself
+and letting the next `/finish` regenerate both from scratch.
+
+## Remote access via Cloudflare Tunnel (optional)
+
+By default the Wetty terminal above (and SSH directly) are only
+reachable while you're on the same LAN (or its own fallback AP). If you
+also want to reach it from anywhere -- e.g. it's deployed somewhere
+without you physically present -- `build-image.sh` can bake in
+[Cloudflare
+Tunnel](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/),
+entirely opt-in, routing straight to that same Wetty terminal. All four
+of these must be set together:
 
 ```sh
 ROOT_PASSWORD='something-you-choose' \
-TAILSCALE_AUTHKEY='<a reusable Tailscale auth key>' \
+CLOUDFLARE_API_TOKEN='<a scoped Cloudflare API token>' \
+CLOUDFLARE_ACCOUNT_ID='<your Cloudflare account ID>' \
+CLOUDFLARE_ZONE_ID='<the zone ID owning CLOUDFLARE_DOMAIN>' \
+CLOUDFLARE_DOMAIN='devices.example.com' \
 ./build-image.sh
 ```
 
-Leave `TAILSCALE_AUTHKEY` unset (the default) and none of this applies
--- no packages fetched, no service enabled, nothing changes about the
-image.
+Leave `CLOUDFLARE_API_TOKEN` unset (the default) and none of this
+applies -- no packages fetched, no binary downloaded, no service
+enabled, nothing changes about the image.
 
-Unlike a self-hosted VPN (e.g. plain WireGuard), there's **no server
-for you to run or maintain** -- like Cloudflare Tunnel, Tailscale only
-ever makes outbound connections, so it works behind any NAT/firewall
-with no port forwarding anywhere. Unlike Cloudflare Tunnel, per-device
-identity needs **no build-time or first-boot API orchestration at
-all**: a single *reusable* auth key baked into the image lets every
-device built from it join the same tailnet, each automatically
-registering as its own distinct node -- Alpine packages
-`tailscale`/`tailscale-openrc` directly (no custom binary download, no
-hand-written OpenRC service, unlike Cloudflare Tunnel's `cloudflared`).
+Like Tailscale (this image's remote-access mechanism until this
+feature replaced it), `cloudflared` only ever makes outbound
+connections to Cloudflare's edge, so there's **no server for you to run
+or maintain** and it works behind any NAT/firewall with no port
+forwarding anywhere. Unlike Tailscale, though, a Cloudflare Tunnel has
+no concept of "join" -- a tunnel *is* a specific set of DNS hostnames,
+so a single secret shared by every device would make them
+indistinguishable replicas of the *same* tunnel rather than separately
+addressable devices. Each device therefore needs **its own tunnel,
+credentials, and DNS record**, created via the Cloudflare API the first
+time it has internet access, rather than Tailscale's simpler
+"present a shared key" model. Alpine also doesn't package `cloudflared`
+at all (confirmed directly, not assumed), so `build-image.sh` fetches
+its official prebuilt aarch64 binary straight from a [pinned GitHub
+release](https://github.com/cloudflare/cloudflared/releases),
+verified against a checksum recorded in the script, and ships a
+hand-written OpenRC service for it (`cloudflared.initd`) rather than
+relying on a package-provided one.
 
 `pi-bluetooth-configuration` itself (see `src/main.cpp`,
-`provision_tailscale_async()`) invokes `tailscale up --authkey=...
---hostname=<this device's hardware serial>` the first time the device
-has internet access -- same identity already used for its hostname and
-AP SSID. Retried roughly every 30s if it fails (most likely: no
-internet yet -- a freshly unconfigured device sits in its own fallback
-AP with no uplink at all until WiFi setup finishes), idempotent (skips
-entirely once already joined, checked via `tailscale status`'s own exit
-code -- confirmed directly it reliably reflects join state, not
-assumed). This is what makes the *same built image* flashable onto any
-number of physical Pis -- each joins as its own node automatically,
-with no per-build/per-device step on your end beyond flashing the card.
+`provision_cloudflare_async()`) invokes `provision-cloudflare.sh` with
+this device's hardware serial the first time it has internet access --
+same identity already used for its hostname and AP SSID. That script
+owns every Cloudflare-specific detail: it looks for (and cleans up) any
+stale tunnel of the same name from an earlier interrupted attempt, then
+calls the Cloudflare API to create a fresh tunnel named after this
+device's serial, writes its credentials and an ingress rule mapping
+`<serial>.<CLOUDFLARE_DOMAIN>` to Wetty (`http://localhost:3000`, see
+"Web terminal (Wetty)" above) under `/etc/cloudflared/`, upserts the
+CNAME routing that hostname to the new tunnel, and only then enables
+and starts the `cloudflared` service.
+Retried roughly every 30s if any step fails (most likely: no internet
+yet -- a freshly unconfigured device sits in its own fallback AP with
+no uplink at all until WiFi setup finishes), idempotent (skips entirely
+once `/etc/cloudflared/config.yml` already exists, which the script
+only ever writes as its very last step). This is what makes the *same
+built image* flashable onto any number of physical Pis -- each
+provisions its own tunnel automatically, with no per-device step on
+your end beyond flashing the card (the per-device *orchestration* is
+real, unlike Tailscale, but it's the API token doing that work at
+first boot, not you).
 
-Once joined, `ssh root@<serial>` works directly via
-[MagicDNS](https://tailscale.com/kb/1081/magicdns) from any other
-device on the same tailnet (enabled by default for new tailnets) -- no
-manual routing/DNS step needed, unlike Cloudflare Tunnel.
+Once provisioned, reach it from any browser, anywhere -- no
+`cloudflared` (or any other client software) needed on the connecting
+machine at all, since the tunnel is terminated at Cloudflare's edge as
+plain HTTPS:
 
-**One-time setup**: [login.tailscale.com/admin/settings/keys](https://login.tailscale.com/admin/settings/keys)
--> **Generate auth key** -> **Reusable** (so every device built from
-this image can use the same one) -> **Tagged**, e.g. `tag:aipicam`
-(strongly recommended, not just for scoping ACLs to these devices
-specifically rather than granting them whatever access your own user
-account has -- [confirmed directly against Tailscale's own
-docs](https://tailscale.com/docs/features/access-control/key-expiry),
-a device that authenticates using a *tagged* key has its own key expiry
-**disabled automatically and permanently**, regardless of the auth
-key's own expiration afterward). Copy the generated key (starts with
-`tskey-auth-`); that's `TAILSCALE_AUTHKEY` above.
+```
+https://<serial>.devices.example.com
+```
 
-The auth key itself still expires after at most 90 days (a hard
-Tailscale platform limit, not configurable higher) -- but that only
-limits how much longer it can be used to onboard *additional new*
-devices; it has no effect on devices that already joined using it, and
-(because it was tagged) their own connections don't expire at all.
-Building more devices after the key expires just needs a fresh one,
-same steps as above -- already-deployed devices need nothing. Tagging
-has to happen at auth time via the key itself; tagging a device
-afterward through the admin console doesn't retroactively disable its
-expiry.
+**One-time setup**:
+
+1. Find your **Account ID** on the right-hand sidebar of any zone's
+   Overview page in the [Cloudflare
+   dashboard](https://dash.cloudflare.com); that's
+   `CLOUDFLARE_ACCOUNT_ID` above.
+2. Find the **Zone ID** for the domain you want devices under
+   (`devices.example.com` above can be a subdomain of a zone you
+   already own, e.g. the zone is `example.com`) on that same Overview
+   page; that's `CLOUDFLARE_ZONE_ID`.
+3. [dash.cloudflare.com/profile/api-tokens](https://dash.cloudflare.com/profile/api-tokens)
+   -> **Create Token** -> **Custom token** -> permissions
+   **Account / Cloudflare Tunnel / Edit** and **Zone / DNS / Edit**,
+   with **Account Resources** and **Zone Resources** both scoped to
+   just this one account/zone (not "All accounts"/"All zones" -- this
+   token can create and delete tunnels and DNS records within whatever
+   it's scoped to, so keep that blast radius as small as possible).
+   Copy the generated token; that's `CLOUDFLARE_API_TOKEN` above.
 
 #### Security note
 
-The auth key lives on the device's filesystem (`/etc/tailscale-authkey`,
-mode 600) only *until* this device successfully joins --
-`provision-tailscale.sh` deletes it once `tailscale up` succeeds, since
-a device with an established identity never needs to re-present it. A
-device compromised *before* its first successful join exposes a
-credential that can register new devices onto the tailnet (bounded by
-whatever tag/ACL/expiration it was created with); a device compromised
-*after* only exposes that one device's own node identity, not the
-ability to add others.
+The API token lives on the device's filesystem
+(`/etc/cloudflare-api-token`, mode 600) only *until* this device
+successfully provisions its own tunnel -- `provision-cloudflare.sh`
+deletes it once that succeeds, since a device with its own established
+tunnel identity never needs to re-present it. This matters *more* here
+than it did for Tailscale's reusable auth key: that key could only
+register one more node onto an already-scoped tailnet, while this
+token can create or delete **any** tunnel and DNS record within
+whatever account/zone scope you gave it. A device compromised *before*
+its first successful provisioning exposes that account/zone-wide
+capability (bounded by the token's own scope, hence scoping it tightly
+above); a device compromised *after* only exposes that one device's own
+tunnel credentials and its one Wetty endpoint, not the ability to touch
+your Cloudflare account further.
+
+Note also that a Cloudflare Tunnel by itself only provides
+*connectivity*, not *authentication* -- reaching the tunnel gets you to
+Wetty, which (via `--force-ssh`) is itself just another way to reach
+this Pi's own sshd, gated by the admin account's own password (root
+login is disabled outright -- see "Logging in: the admin account, not
+root" above) or SSH keys, same as LAN access. If you want an
+identity-based access gate in front of it too (recommended for
+anything reachable from the public internet), configure a [Cloudflare
+Access application](https://developers.cloudflare.com/cloudflare-one/policies/access/)
+for `*.CLOUDFLARE_DOMAIN` in the dashboard -- that's a manual,
+account-wide policy decision independent of any single device, so it's
+outside what this build/provisioning automation sets up for you.
 
 ## 3. Write it to an SD card
 
@@ -357,11 +460,13 @@ One-time setup, repo secrets on **pi-bluetooth-configuration-alpine**
   fine-grained PAT (https://github.com/settings/personal-access-tokens)
   scoped to just `pi-relay-control-alpine` and `victron-ve-direct-alpine`,
   with **Actions: Read-only** repository permission, and save it here.
-- `SDCARD_TAILSCALE_AUTHKEY` (optional) -- same meaning as the local
-  `TAILSCALE_AUTHKEY` env var above. Leave unset to skip Tailscale
-  entirely, same as locally. A secret rather than a `workflow_dispatch`
-  input since it's a real credential, not a cosmetic setting like
-  `hostname`.
+- `SDCARD_CLOUDFLARE_API_TOKEN`, `SDCARD_CLOUDFLARE_ACCOUNT_ID`,
+  `SDCARD_CLOUDFLARE_ZONE_ID`, `SDCARD_CLOUDFLARE_DOMAIN` (optional) --
+  same meaning as the local `CLOUDFLARE_API_TOKEN`/`CLOUDFLARE_ACCOUNT_ID`/
+  `CLOUDFLARE_ZONE_ID`/`CLOUDFLARE_DOMAIN` env vars above. Leave all
+  four unset to skip Cloudflare Tunnel entirely, same as locally.
+  Secrets rather than `workflow_dispatch` inputs since these are real
+  credentials/identifiers, not a cosmetic setting like `hostname`.
 
 Then trigger it from the Actions tab, or:
 
@@ -378,9 +483,13 @@ Grab the result from the run's Artifacts section
   its fallback AP (SSID = the Pi's hardware serial) -- follow the normal
   setup flow in the iOS app from there. See the main
   [README](../README.md).
-- SSH: `ssh root@<hostname>.local` (or its DHCP-assigned IP), password
-  is whatever you set as `ROOT_PASSWORD`. Host keys are fresh every
-  boot -- see "Config persistence across reboots" above.
+- SSH/Wetty: neither works yet at this point -- root login is disabled
+  entirely and the admin account doesn't exist until the app's wizard
+  actually finishes (see "Logging in: the admin account, not root"
+  above). Once it does, `ssh <user>@<hostname>.local` or
+  `http://<hostname>.local:3000`, using the credentials the app showed
+  you. Host keys are fresh every boot -- see "Config persistence across
+  reboots" above.
 - Relays: `pi-relay-control` starts with its default GPIO/port mapping
   from [`pi-relay-control.conf`](../../pi-relay-control-alpine/pi-relay-control.conf)
   baked into its own `.apk`; edit `/etc/pi-relay-control.conf` and
@@ -395,14 +504,19 @@ Grab the result from the run's Artifacts section
 
 This daemon's fallback AP is deliberately open (no password) so a phone
 can join it during setup -- see the main README's Security model
-section. That means, for however long the Pi is in fallback-AP mode,
-anyone in range can also reach its SSH port over that same open network.
-Change `ROOT_PASSWORD` to something you're comfortable with before
-building, and consider switching to key-based auth once you're on the
-device -- `/etc/ssh/sshd_config` changes made directly on a running
+section. Anyone in range can join that same open network for however
+long the Pi is in fallback-AP mode, but that no longer buys them SSH or
+Wetty access the way it used to before this account model existed:
+root login is disabled outright, and the admin account this image now
+relies on for everything doesn't exist until the app's own wizard
+actually finishes -- so there's genuinely nothing to log into yet at
+that point either way. `ROOT_PASSWORD` still matters for physical
+console access (see "Logging in: the admin account, not root" above),
+so change it to something you're comfortable with before building
+regardless. Consider switching the admin account to key-based auth once
+it exists -- `/etc/ssh/sshd_config` changes made directly on a running
 device now *do* survive a clean reboot (see "Config persistence across
-reboots" above), so this can be done live rather than only by editing
-`build-image.sh`'s `aipicam-setup.start` template and rebuilding.
+reboots" above), so this can be done live.
 
 Also note `victron-ve-direct`'s `allow_set = true` default in its
 `config.ini` lets anyone who can reach its status port (`:8562`) change
@@ -411,10 +525,15 @@ down.
 
 ## Known limitations
 
-- Filesystem verified (`fsck.vfat`) and the full offline `apk add`
-  resolution independently simulated and confirmed successful on this
-  Mac; not yet test-booted on real Pi 3 hardware -- please report back
-  if you hit anything on first boot.
+- A full real run of `build-image.sh` (using placeholder `.apk`
+  artifacts standing in for the three real daemons) was verified
+  end-to-end on this Mac: `fsck.fat` reports a clean filesystem, and the
+  resulting apkovl was extracted and inspected directly to confirm it
+  actually contains what each feature is supposed to ship (Wetty's
+  compiled `node_modules`, the `cloudflared` binary matching its pinned
+  checksum byte-for-byte, correct runlevel wiring). Not yet run with the
+  real daemon artifacts or test-booted on real Pi 3 hardware -- please
+  report back if you hit anything on first boot.
 - The `wpa_supplicant.conf`-gets-clobbered-every-boot fix (see "Config
   persistence across reboots") was reproduced and verified in isolation
   (a real, deterministic simulation of the exact stage/clobber/restore
@@ -425,12 +544,39 @@ down.
   board using the same `bcm2710`/`bcm2837`-family SoC); a Pi 4/5 would
   need its own verification even though the same aarch64 `.apk`s would
   technically install.
-- Tailscale support: verified that Alpine actually packages
-  `tailscale`/`tailscale-openrc` (not assumed), that `tailscale status`
-  reliably reflects join state via its exit code (checked directly
-  against a real `tailscaled`, both before and after simulating a
-  join), and the generated `apkovl` contents (packages, auth key file,
-  provisioning script, `/var/lib/tailscale` symlink, runlevel wiring)
-  by inspecting a real build's output -- but joining a real tailnet
-  hasn't been exercised end-to-end, and neither this nor real hardware
-  has been tested yet.
+- Wetty: the exact pinned `WETTY_VERSION` installs cleanly for
+  aarch64/musl and its native `node-pty` binding was confirmed to
+  actually be a freshly-compiled `ELF 64-bit LSB shared object, ARM
+  aarch64`, not a copied prebuilt for the wrong platform; a live
+  instance was confirmed to serve real HTTP traffic. The root-on-
+  localhost-spawns-`login`-instead-of-`ssh` behavior `--force-ssh`
+  works around was confirmed by reading Wetty's own installed source
+  directly, not assumed or inferred from its docs. Not yet exercised via
+  an actual browser session logging in over websockets end-to-end, and
+  not yet tested on real hardware.
+- Admin account/doas: `adduser -D` + `openssl passwd -6` +
+  `usermod -p <hash>` (the exact sequence `create_admin_account()`
+  runs) was verified end-to-end in a real Alpine container -- a genuine
+  `ssh` login with the freshly-generated password succeeded, and a
+  `permit persist <user>` rule in `/etc/doas.d/*.conf` (root-owned,
+  mode 0600) was confirmed to actually grant root via `doas`, including
+  doas's own file-ownership/writability checks (refuses a config it
+  doesn't own or that's group/other-writable, confirmed directly).
+  `main.cpp`'s changes compile cleanly (`-Wall -Wextra`, no warnings) in
+  this project's standard Docker verification, but the actual `/finish`
+  HTTP flow (server compiled, no daemon-level integration test) and a
+  real boot's very first setup-to-credentials round trip haven't been
+  exercised end-to-end yet -- the iOS app also needs a corresponding
+  update to read and display `adminUsername`/`adminPassword` from that
+  response, which is outside this repo.
+- Cloudflare Tunnel support: confirmed directly (not assumed) that
+  Alpine packages neither `cloudflared` nor an OpenRC service for it,
+  and confirmed the pinned `CLOUDFLARED_VERSION`/`CLOUDFLARED_SHA256`
+  against the real GitHub release. `provision-cloudflare.sh`'s own
+  control flow (tunnel create, stale-tunnel cleanup and retry, DNS
+  record upsert, credentials/config.yml written correctly, API token
+  deletion, and idempotent skip on a second run) was exercised
+  end-to-end against a mock Cloudflare API in a real Alpine container,
+  including the API-error and no-connectivity retry paths -- but it
+  hasn't yet been run against a real Cloudflare account, and neither
+  this feature nor real hardware has been tested on an actual boot yet.

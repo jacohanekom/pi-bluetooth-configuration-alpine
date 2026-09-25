@@ -1,0 +1,56 @@
+#!/sbin/openrc-run
+# Browser-based terminal -- serves an xterm.js UI over plain HTTP on
+# :3000 (LAN-reachable, same trust level sshd already has there; see
+# build-image.sh's own Security note) that, per-connection, spawns a
+# genuine `ssh -t localhost` subprocess via node-pty. --force-ssh is
+# load-bearing, not cosmetic, and matters regardless of which
+# --ssh-user is passed below: Wetty's own command-selection logic
+# (node_modules/wetty/build/server/command.js) spawns the *local*
+# `login` program directly instead of `ssh` whenever the *wetty process
+# itself* is running as root (which it is here -- command_user="root",
+# same as every other daemon in this image) AND the target host is
+# localhost -- confirmed directly by reading that file, not assumed.
+# `login` does its own PAM/shadow prompt (so it's not an auth bypass)
+# but doesn't go through sshd at all, silently ignoring sshd_config's
+# PermitRootLogin/PasswordAuthentication entirely. --force-ssh routes
+# through the real `ssh` client (from the openssh-client package)
+# against sshd instead, so this behaves identically to a plain `ssh`
+# from any other machine.
+name="wetty"
+description="Browser-based terminal (proxies to sshd via a real ssh subprocess)"
+
+# The admin account pi-bluetooth-configuration creates the first time
+# setup finishes (see src/main.cpp's create_admin_account(), and
+# build-image.sh's own comment on why root SSH is now disabled
+# image-wide) -- read fresh on every start/restart, not baked in at
+# build time, since it doesn't exist until then. Before that first
+# successful finish, this file doesn't exist yet, so --ssh-user is
+# simply omitted below -- Wetty falls back to its own interactive
+# username prompt (the same experience as never passing --ssh-user at
+# all), which is safe either way now that root itself is refused at
+# sshd regardless of what gets typed there.
+ADMIN_USER_FILE="/etc/admin-user"
+SSH_USER_ARG=""
+if [ -f "$ADMIN_USER_FILE" ]; then
+	SSH_USER_ARG="--ssh-user $(cat "$ADMIN_USER_FILE")"
+fi
+
+command="/usr/bin/node"
+command_args="/usr/local/lib/wetty/node_modules/wetty/build/main.js \
+	--ssh-host localhost --ssh-port 22 --ssh-auth password \
+	--force-ssh --base / --host 0.0.0.0 --port 3000 $SSH_USER_ARG"
+command_user="root"
+export HOME="/root"
+
+supervisor=supervise-daemon
+respawn_delay=5
+respawn_max=0
+
+pidfile="/run/${RC_SVCNAME}.pid"
+output_log="/var/log/${RC_SVCNAME}.log"
+error_log="/var/log/${RC_SVCNAME}.log"
+
+depend() {
+	need net
+	after sshd
+}

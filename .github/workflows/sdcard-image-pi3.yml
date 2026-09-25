@@ -67,12 +67,15 @@ jobs:
         env:
           ROOT_PASSWORD: ${{ secrets.SDCARD_ROOT_PASSWORD }}
           PI_HOSTNAME: ${{ inputs.hostname }}
-          # A repo secret, not a workflow_dispatch input -- this is a
-          # real credential, unlike hostname, and secrets aren't
-          # settable per-dispatch anyway. Leave unset to skip Tailscale
-          # entirely -- see sdcard-image-pi3/README.md, "Remote access
-          # via Tailscale".
-          TAILSCALE_AUTHKEY: ${{ secrets.SDCARD_TAILSCALE_AUTHKEY }}
+          # Repo secrets, not workflow_dispatch inputs -- these are real
+          # credentials, unlike hostname, and secrets aren't settable
+          # per-dispatch anyway. Leave CLOUDFLARE_API_TOKEN unset to skip
+          # Cloudflare Tunnel entirely -- see sdcard-image-pi3/README.md,
+          # "Remote access via Cloudflare Tunnel".
+          CLOUDFLARE_API_TOKEN: ${{ secrets.SDCARD_CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.SDCARD_CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_ZONE_ID: ${{ secrets.SDCARD_CLOUDFLARE_ZONE_ID }}
+          CLOUDFLARE_DOMAIN: ${{ secrets.SDCARD_CLOUDFLARE_DOMAIN }}
         run: |
           cd sdcard-image-pi3
           ./build-image.sh

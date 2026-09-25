@@ -15,9 +15,11 @@
 # applies on each of its first N sync updates, not just one early-boot-
 # only attempt, so it's robust against exactly this kind of startup
 # timing issue. Downstream effect: any HTTPS client that validates
-# certificate dates (Tailscale's own control-plane connection, in
-# particular -- "x509: certificate has expired or is not yet valid")
-# fails outright while the clock is this wrong.
+# certificate dates fails outright while the clock is this wrong --
+# confirmed on real hardware against this image's previous Tailscale-
+# based remote-access feature ("x509: certificate has expired or is not
+# yet valid"), and just as applicable to cloudflared's own connection to
+# Cloudflare's edge now.
 #
 # Same clobbering problem as wpa_supplicant.conf (see
 # restore-wifi-config.initd/wifi_control.hpp's own comments) --

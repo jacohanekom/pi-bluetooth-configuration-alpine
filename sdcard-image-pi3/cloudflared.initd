@@ -1,0 +1,32 @@
+#!/sbin/openrc-run
+# Runs the cloudflared binary this build fetched directly from
+# Cloudflare's GitHub releases (see build-image.sh's CLOUDFLARED_VERSION
+# -- Alpine doesn't package cloudflared itself, confirmed directly
+# against a real `apk search`, not assumed).
+#
+# Deliberately NOT enabled in any runlevel at build time, unlike
+# tailscale-openrc's own /etc/init.d/tailscale (which could start
+# unjoined and just sit idle) -- there's no config for cloudflared to
+# even start against until provision-cloudflare.sh has created this
+# device's own tunnel and written /etc/cloudflared/config.yml. That
+# script does the `rc-update add`/`rc-service start` itself, once that
+# file actually exists -- see its own comments.
+name="cloudflared"
+description="Cloudflare Tunnel client (remote access to the Wetty web terminal)"
+
+command="/usr/local/bin/cloudflared"
+command_args="--config /etc/cloudflared/config.yml --no-autoupdate tunnel run"
+command_user="root"
+
+supervisor=supervise-daemon
+respawn_delay=5
+respawn_max=0
+
+pidfile="/run/${RC_SVCNAME}.pid"
+output_log="/var/log/${RC_SVCNAME}.log"
+error_log="/var/log/${RC_SVCNAME}.log"
+
+depend() {
+	need net
+	after wpa_supplicant dhcpcd
+}

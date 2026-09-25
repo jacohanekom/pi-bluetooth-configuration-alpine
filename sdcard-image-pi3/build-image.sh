@@ -23,6 +23,21 @@ cd "$(dirname "$0")"
 
 ALPINE_VERSION=3.22
 ALPINE_RELEASE=3.22.5
+# Pinned the same way ALPINE_RELEASE above is -- reproducible builds,
+# not whatever happens to be "latest" on the day this runs. SHA256 is
+# GitHub's own per-asset digest (returned by the releases API, not
+# computed by us) for cloudflared-linux-arm64 at this exact tag; bump
+# both together when updating.
+CLOUDFLARED_VERSION=2026.9.3
+CLOUDFLARED_SHA256=aaeb2d7d0da3614634c7e03ab13487a1522c2e79165ed2929cfe23d5e95b326d
+# Pinned for the same reason as CLOUDFLARED_VERSION -- npm's own
+# resolution of a bare "wetty" would silently drift between builds
+# otherwise. Verified this exact version installs and its node-pty
+# native binding compiles cleanly for aarch64/musl inside the
+# alpine:$ALPINE_VERSION container used below (confirmed the resulting
+# .node file is genuinely `ELF 64-bit LSB shared object, ARM aarch64`,
+# not a copied prebuilt for the wrong platform).
+WETTY_VERSION=3.2.2
 PI_HOSTNAME="${PI_HOSTNAME:-aipicam}"
 IMG_SIZE_MB=768
 OUT_IMG="aipicam-pi3-diskless.img"
@@ -36,22 +51,31 @@ VICTRON_APK="artifacts/victron-ve-direct-aarch64.apk"
 
 : "${ROOT_PASSWORD:?set ROOT_PASSWORD in the environment (used once, at build time, to hash into /etc/shadow -- never stored in plaintext or committed)}"
 
-# Optional: Tailscale, for reaching this Pi over SSH from outside its
-# own LAN with no self-hosted server and no inbound port forwarding
-# anywhere -- same outbound-only-connection shape as the WireGuard/
-# Cloudflare Tunnel approaches considered earlier, but simpler than
-# either: Alpine packages `tailscale`/`tailscale-openrc` directly (no
-# custom binary download, no hand-written OpenRC service), and per-
-# device identity is automatic -- a single *reusable* auth key baked
-# into the image lets every device built from it join the same tailnet,
-# each registering as its own distinct node the first time it actually
-# runs `tailscale up` (see provision-tailscale.sh, invoked by
+# Optional: Cloudflare Tunnel, for reaching this Pi's Wetty web terminal
+# (see the unconditional Wetty setup further down) from outside its own
+# LAN, with no self-hosted server and no inbound port forwarding
+# anywhere -- cloudflared only ever makes outbound
+# connections to Cloudflare's edge. Unlike a single reusable secret
+# shared by every device (as Tailscale's own auth key was), a Tunnel has
+# no concept of "join": each device needs its OWN tunnel, own
+# credentials, and own DNS hostname, so this needs a scoped Cloudflare
+# API token baked in instead -- provision-cloudflare.sh (invoked by
 # pi-bluetooth-configuration itself once this device has internet
-# access -- same reasoning as hostname/AP SSID already being this
-# device's hardware serial, not something shared across a whole image).
-# Entirely opt-in -- leave TAILSCALE_AUTHKEY unset and none of this
-# gets added at all. See README.md, "Remote access via Tailscale".
-TAILSCALE_AUTHKEY="${TAILSCALE_AUTHKEY:-}"
+# access) uses it to create this device's tunnel and DNS record via the
+# Cloudflare API, named after this device's hardware serial -- same
+# reasoning as hostname/AP SSID already being that serial, not something
+# shared across a whole image. All four of these must be set together;
+# leave CLOUDFLARE_API_TOKEN unset (the default) and none of this gets
+# added at all. See README.md, "Remote access via Cloudflare Tunnel".
+CLOUDFLARE_API_TOKEN="${CLOUDFLARE_API_TOKEN:-}"
+CLOUDFLARE_ACCOUNT_ID="${CLOUDFLARE_ACCOUNT_ID:-}"
+CLOUDFLARE_ZONE_ID="${CLOUDFLARE_ZONE_ID:-}"
+CLOUDFLARE_DOMAIN="${CLOUDFLARE_DOMAIN:-}"
+if [ -n "$CLOUDFLARE_API_TOKEN" ]; then
+	: "${CLOUDFLARE_ACCOUNT_ID:?CLOUDFLARE_API_TOKEN is set -- CLOUDFLARE_ACCOUNT_ID must be too, see README.md}"
+	: "${CLOUDFLARE_ZONE_ID:?CLOUDFLARE_API_TOKEN is set -- CLOUDFLARE_ZONE_ID must be too, see README.md}"
+	: "${CLOUDFLARE_DOMAIN:?CLOUDFLARE_API_TOKEN is set -- CLOUDFLARE_DOMAIN must be too, see README.md}"
+fi
 
 rm -rf work
 mkdir -p work/bootfs work/repo/aarch64 work/apkovl
@@ -80,9 +104,13 @@ tar -C work/bootfs -xzf "$OFFICIAL_TARBALL"
 # the .boot_repository marker file -- see README.md's "How it works".
 echo "==> Fetching additional packages (offline dependency closure)"
 cp work/bootfs/apks/aarch64/*.apk work/repo/aarch64/
-TAILSCALE_PACKAGES=""
-if [ -n "$TAILSCALE_AUTHKEY" ]; then
-	TAILSCALE_PACKAGES="tailscale tailscale-openrc"
+CLOUDFLARE_PACKAGES=""
+if [ -n "$CLOUDFLARE_API_TOKEN" ]; then
+	# curl + jq: what provision-cloudflare.sh needs on-device to call the
+	# Cloudflare API and parse its JSON responses. cloudflared itself is
+	# NOT an apk package (Alpine doesn't ship one) -- it's fetched
+	# separately below, straight into the apkovl, not through this repo.
+	CLOUDFLARE_PACKAGES="curl jq"
 fi
 docker run --rm --platform linux/arm64 -v "$PWD/work/repo/aarch64":/out alpine:"$ALPINE_VERSION" sh -c '
 	set -e
@@ -96,7 +124,9 @@ docker run --rm --platform linux/arm64 -v "$PWD/work/repo/aarch64":/out alpine:"
 		dbus dbus-openrc \
 		linux-firmware-brcm wireless-regdb \
 		libgcc libstdc++ \
-		'"$TAILSCALE_PACKAGES"'
+		nodejs openssh-client \
+		doas shadow \
+		'"$CLOUDFLARE_PACKAGES"'
 '
 cp "$BT_APK" "$RELAY_APK" "$VICTRON_APK" work/repo/aarch64/
 
@@ -147,7 +177,8 @@ echo "==> Building the apkovl overlay"
 OVL=work/apkovl
 mkdir -p "$OVL"/etc/apk/keys "$OVL"/etc/apk/protected_paths.d \
 	"$OVL"/etc/runlevels/boot "$OVL"/etc/runlevels/default "$OVL"/etc/runlevels/shutdown \
-	"$OVL"/etc/init.d "$OVL"/etc/local.d "$OVL"/var/lib
+	"$OVL"/etc/init.d "$OVL"/etc/local.d "$OVL"/etc/doas.d "$OVL"/var/lib \
+	"$OVL"/usr/local/bin "$OVL"/usr/local/lib
 
 cp "work/repo/$REPO_KEY" "$OVL/etc/apk/keys/"
 
@@ -168,11 +199,15 @@ cat > "$OVL/etc/apk/world" <<-EOF
 	openssh-server
 	linux-firmware-brcm
 	wireless-regdb
+	nodejs
+	openssh-client
+	doas
+	shadow
 EOF
-if [ -n "$TAILSCALE_AUTHKEY" ]; then
+if [ -n "$CLOUDFLARE_API_TOKEN" ]; then
 	{
-		echo "tailscale"
-		echo "tailscale-openrc"
+		echo "curl"
+		echo "jq"
 	} >> "$OVL/etc/apk/world"
 fi
 
@@ -251,50 +286,106 @@ ln -sf /etc/init.d/restore-wifi-config "$OVL/etc/runlevels/boot/restore-wifi-con
 # on first sync instead of getting stuck slewing forever -- see
 # fix-chrony-makestep.initd for the full explanation. Also unconditional
 # -- a wrong clock breaks any HTTPS client that validates certificate
-# dates, Tailscale's own control-plane connection very much included,
-# not just this specific optional feature.
+# dates, cloudflared's own connection to Cloudflare's edge very much
+# included, not just this specific optional feature.
 cp fix-chrony-makestep.initd "$OVL/etc/init.d/fix-chrony-makestep"
 chmod +x "$OVL/etc/init.d/fix-chrony-makestep"
 ln -sf /etc/init.d/fix-chrony-makestep "$OVL/etc/runlevels/boot/fix-chrony-makestep"
 
-# Tailscale, for reaching this Pi remotely -- see the TAILSCALE_AUTHKEY
-# check near the top of this script and README.md's "Remote access via
-# Tailscale". tailscale-openrc's own package already provides a working
-# /etc/init.d/tailscale (it just starts tailscaled -- actually joining
-# the tailnet is a separate step, done below by
-# pi-bluetooth-configuration itself calling provision-tailscale.sh),
-# enabled unconditionally below alongside the other default-runlevel
-# services whenever TAILSCALE_AUTHKEY is set.
-if [ -n "$TAILSCALE_AUTHKEY" ]; then
-	# Kept in its own file (mode 600, read by provision-tailscale.sh),
-	# same treatment as the WiFi password and root's own hashed
-	# password elsewhere in this build -- and deleted by that script
-	# once this device has actually joined, since a reusable auth key
-	# is only ever needed for a device's initial join (see that
-	# script's own comment).
-	printf '%s' "$TAILSCALE_AUTHKEY" > "$OVL/etc/tailscale-authkey"
-	chmod 600 "$OVL/etc/tailscale-authkey"
+# Wetty, a browser-based terminal (xterm.js talking to a real `ssh`
+# subprocess over a websocket) -- unconditional, unlike Cloudflare
+# Tunnel: useful over the LAN/fallback AP on its own (e.g. from a phone
+# with no SSH client), and becomes the Cloudflare Tunnel's ingress
+# target when that feature is also enabled (see provision-cloudflare.sh).
+# Not an apk package (nowhere in Alpine or otherwise) and not a single
+# static binary either -- it's an npm package with a native addon
+# (node-pty) that needs compiling, so build it once here, for this
+# image's own target arch, and bundle the result directly (nodejs
+# itself, to actually run it, comes from the local apk repo above like
+# any other package).
+echo "==> Building Wetty $WETTY_VERSION (npm install, aarch64-native)"
+mkdir -p work/wetty
+docker run --rm --platform linux/arm64 -v "$PWD/work/wetty":/wetty -w /wetty alpine:"$ALPINE_VERSION" sh -c '
+	set -e
+	apk add --no-cache nodejs npm python3 build-base >/dev/null
+	npm init -y >/dev/null
+	npm install wetty@'"$WETTY_VERSION"' --omit=dev --omit=optional >/dev/null
+	# node-pty ships prebuilt native bindings for several platforms this
+	# image will never run on; only the linux-arm64 one -- compiled
+	# fresh just above, for this exact musl/aarch64 target, not copied
+	# from anywhere -- is ever used here. Pruning the rest is a real
+	# size saving (roughly 60MB), not just tidiness.
+	find node_modules -type d \( -name "win32-*" -o -name "darwin-*" \) -exec rm -rf {} + 2>/dev/null || true
+'
+rm -rf "$OVL/usr/local/lib/wetty"
+mkdir -p "$OVL/usr/local/lib/wetty"
+cp -r work/wetty/node_modules "$OVL/usr/local/lib/wetty/"
 
-	cp provision-tailscale.sh "$OVL/etc/tailscale-provision.sh"
-	chmod +x "$OVL/etc/tailscale-provision.sh"
+cp wetty.initd "$OVL/etc/init.d/wetty"
+chmod +x "$OVL/etc/init.d/wetty"
 
-	# Diskless mode resets /var to tmpfs every boot -- symlink
-	# Tailscale's own state directory (its node identity/keys, once
-	# `tailscale up` establishes them) onto the persistent boot media
-	# instead, same pattern as pi-relay-control's relay-state below.
-	# Without this, every reboot would show up as a brand new device in
-	# the tailnet admin console instead of the same one reconnecting.
-	ln -sf /media/mmcblk0p1/tailscale-state "$OVL/var/lib/tailscale"
+# Cloudflare Tunnel, for reaching this Pi remotely -- see the
+# CLOUDFLARE_API_TOKEN check near the top of this script and README.md's
+# "Remote access via Cloudflare Tunnel". Unlike tailscale-openrc's own
+# package, Alpine ships nothing for cloudflared at all -- fetch the
+# official prebuilt aarch64 binary directly from its GitHub release
+# (verified against the pinned CLOUDFLARED_SHA256 above, not trusted
+# blind) rather than inventing our own build of it.
+if [ -n "$CLOUDFLARE_API_TOKEN" ]; then
+	echo "==> Fetching cloudflared $CLOUDFLARED_VERSION (aarch64)"
+	mkdir -p "$OVL/usr/local/bin"
+	CLOUDFLARED_BIN="$OVL/usr/local/bin/cloudflared"
+	curl -fsSL -o "$CLOUDFLARED_BIN" \
+		"https://github.com/cloudflare/cloudflared/releases/download/${CLOUDFLARED_VERSION}/cloudflared-linux-arm64"
+	if command -v sha256sum >/dev/null 2>&1; then
+		ACTUAL_SHA=$(sha256sum "$CLOUDFLARED_BIN" | cut -d' ' -f1)
+	else
+		ACTUAL_SHA=$(shasum -a 256 "$CLOUDFLARED_BIN" | cut -d' ' -f1)
+	fi
+	[ "$ACTUAL_SHA" = "$CLOUDFLARED_SHA256" ] || {
+		echo "cloudflared download checksum mismatch: got $ACTUAL_SHA, expected $CLOUDFLARED_SHA256" >&2
+		exit 1
+	}
+	chmod +x "$CLOUDFLARED_BIN"
+
+	cp cloudflared.initd "$OVL/etc/init.d/cloudflared"
+	chmod +x "$OVL/etc/init.d/cloudflared"
+
+	cp provision-cloudflare.sh "$OVL/etc/cloudflare-provision.sh"
+	chmod +x "$OVL/etc/cloudflare-provision.sh"
+
+	# Kept in their own files (mode 600, read by
+	# provision-cloudflare.sh), same treatment as the WiFi password and
+	# root's own hashed password elsewhere in this build. The API token
+	# is deleted by that script once this device has actually
+	# provisioned its own tunnel, since it's only ever needed for a
+	# device's initial provisioning (see that script's own comment) --
+	# unlike Tailscale's node identity, this device's tunnel credentials
+	# end up under /etc (config.yml + the credentials JSON, both
+	# persisted by the same `+etc` lbu tracking as everything else here),
+	# so no separate /var symlink onto the boot partition is needed.
+	printf '%s' "$CLOUDFLARE_API_TOKEN" > "$OVL/etc/cloudflare-api-token"
+	printf '%s' "$CLOUDFLARE_ACCOUNT_ID" > "$OVL/etc/cloudflare-account-id"
+	printf '%s' "$CLOUDFLARE_ZONE_ID" > "$OVL/etc/cloudflare-zone-id"
+	printf '%s' "$CLOUDFLARE_DOMAIN" > "$OVL/etc/cloudflare-domain"
+	chmod 600 "$OVL/etc/cloudflare-api-token" "$OVL/etc/cloudflare-account-id" \
+		"$OVL/etc/cloudflare-zone-id" "$OVL/etc/cloudflare-domain"
+
+	# NOT added to any runlevel here, unlike tailscale-openrc's service --
+	# there's no config for cloudflared to start against until
+	# provision-cloudflare.sh has actually created this device's tunnel
+	# and written config.yml; that script enables/starts the service
+	# itself once that file exists (see cloudflared.initd's own comment).
 fi
 
 ln -sf /etc/init.d/local "$OVL/etc/runlevels/default/local"
-for svc in wpa_supplicant dhcpcd chronyd sshd dbus avahi-daemon \
+for svc in wpa_supplicant dhcpcd chronyd sshd dbus avahi-daemon wetty \
 	pi-bluetooth-configuration pi-relay-control victron-ve-direct; do
 	ln -sf "/etc/init.d/$svc" "$OVL/etc/runlevels/default/$svc"
 done
-if [ -n "$TAILSCALE_AUTHKEY" ]; then
-	ln -sf /etc/init.d/tailscale "$OVL/etc/runlevels/default/tailscale"
-fi
+# cloudflared is deliberately NOT wired into a runlevel here -- see the
+# CLOUDFLARE_API_TOKEN block above and cloudflared.initd's own comment;
+# provision-cloudflare.sh enables it itself once actually configured.
 
 # alpine-baselayout's default /etc/shadow and openssh's default
 # sshd_config don't exist yet when this overlay is unpacked (that
@@ -308,10 +399,31 @@ fi
 # sshd has therefore already started (with the stock, unmodified
 # sshd_config -- PermitRootLogin prohibit-password) by the time this
 # script edits the file on disk; a running sshd doesn't notice config
-# changes without being told to, so root+password logins were being
-# silently rejected despite the file ending up correct. `rc-service
-# sshd restart` (not just editing the file) is what actually makes the
-# new PermitRootLogin/PasswordAuthentication settings take effect.
+# changes without being told to, so this was silently not taking effect
+# despite the file ending up correct. `rc-service sshd restart` (not
+# just editing the file) is what actually makes the new PermitRootLogin/
+# PasswordAuthentication settings take effect.
+#
+# PermitRootLogin is "no", not "yes" -- root's own password (still set
+# below, unconditionally) is only ever usable at the physical console
+# now, not over SSH/Wetty at all. This is unconditional, not scoped to
+# just Wetty specifically: Wetty's own --ssh-user (see wetty.initd)
+# picks which account it forces a connection into, but that's a
+# preference wetty applies to itself, not a security boundary a
+# connecting client is bound by -- Wetty's own address() function
+# (confirmed by reading its installed source directly) lets a raw HTTP
+# `Remote-User` header or a `/ssh/<user>` URL path override --ssh-user
+# outright, meant for sitting behind an authenticating reverse proxy
+# that sets/strips that header itself, which this image doesn't run.
+# With no such proxy in front of it, "just don't default wetty to root"
+# would be cosmetic, not a real restriction, once Wetty is reachable
+# from the internet via Cloudflare Tunnel -- only disabling root at
+# sshd itself actually closes it, for every path (Wetty and direct LAN
+# SSH both). pi-bluetooth-configuration's own create_admin_account()
+# (see src/main.cpp, called the first time POST /finish ever succeeds)
+# is the intended replacement: a per-device random username/password,
+# permitted to `doas` to root, handed back to the app once, in that
+# same /finish response.
 ROOT_HASH=$(docker run --rm --platform linux/arm64 alpine:"$ALPINE_VERSION" sh -c \
 	'apk add --no-cache openssl >/dev/null 2>&1; openssl passwd -6 "$1"' _ "$ROOT_PASSWORD")
 cat > "$OVL/etc/local.d/aipicam-setup.start" <<EOF
@@ -321,7 +433,7 @@ mv /etc/shadow.new /etc/shadow
 chmod 640 /etc/shadow
 
 sed -i \\
-	-e 's/^#\\?PermitRootLogin.*/PermitRootLogin yes/' \\
+	-e 's/^#\\?PermitRootLogin.*/PermitRootLogin no/' \\
 	-e 's/^#\\?PasswordAuthentication.*/PasswordAuthentication yes/' \\
 	/etc/ssh/sshd_config
 
@@ -347,8 +459,17 @@ ln -sf /media/mmcblk0p1/relay-state "$OVL/var/lib/relay_control"
 # account's own uid/gid happens to be -- a real device's own `lbu
 # commit` (running as root) would naturally produce root:root, and nothing
 # here needs to be owned by anyone else.
+#
+# `usr` is included alongside `etc`/`var` because cloudflared's binary
+# and Wetty's bundled node_modules both live under
+# usr/local/{bin,lib} -- diskless mode's root is rebuilt from nothing
+# but this tarball plus the local apk repo every single boot, so
+# anything under $OVL not captured here simply wouldn't exist at
+# runtime. (Both directories are created unconditionally above so this
+# always has something to archive, even on a build with neither
+# feature's conditional content added.)
 ( cd "$OVL" && COPYFILE_DISABLE=1 tar czf "../../work/$PI_HOSTNAME.apkovl.tar.gz" \
-	--owner=0 --group=0 etc var )
+	--owner=0 --group=0 etc var usr )
 
 # ── 4. Assemble the boot media contents ─────────────────────────────────────
 echo "==> Assembling boot media contents"
@@ -358,9 +479,6 @@ cp "work/repo/$REPO_KEY" work/bootfs/apks/
 touch work/bootfs/apks/.boot_repository
 cp "work/$PI_HOSTNAME.apkovl.tar.gz" work/bootfs/
 mkdir -p work/bootfs/relay-state
-if [ -n "$TAILSCALE_AUTHKEY" ]; then
-	mkdir -p work/bootfs/tailscale-state
-fi
 
 # ── 5. Build the final single-partition .img ────────────────────────────────
 # Diskless mode needs only one FAT32 partition (kernel, apks/, apkovl --
