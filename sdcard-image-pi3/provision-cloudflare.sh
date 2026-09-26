@@ -49,14 +49,23 @@ API="https://api.cloudflare.com/client/v4"
 # $1=method $2=path $3=JSON body (optional). -sS: silent progress meter
 # but still print connection-level errors (e.g. no internet yet) to
 # stderr, where main.cpp's own retry-attempt logging picks them up.
+# --connect-timeout/--max-time are load-bearing, not just tidiness:
+# without them curl falls back to its own (much longer) internal
+# defaults, and this is called from main.cpp's own detached background
+# thread -- a slow-to-fail DNS/TCP attempt here (exactly what "no
+# internet yet" looks like at the OS level, as opposed to a fast
+# "network unreachable") can run for tens of seconds per call, several
+# calls per attempt, competing for this board's own limited CPU/network
+# stack for that whole time. Bounded here so a bad network fails fast
+# and predictably instead of however long curl would otherwise take.
 api() {
 	if [ -n "${3:-}" ]; then
-		curl -sS -X "$1" "$API$2" \
+		curl -sS --connect-timeout 5 --max-time 15 -X "$1" "$API$2" \
 			-H "Authorization: Bearer $API_TOKEN" \
 			-H "Content-Type: application/json" \
 			--data "$3"
 	else
-		curl -sS -X "$1" "$API$2" \
+		curl -sS --connect-timeout 5 --max-time 15 -X "$1" "$API$2" \
 			-H "Authorization: Bearer $API_TOKEN"
 	fi
 }

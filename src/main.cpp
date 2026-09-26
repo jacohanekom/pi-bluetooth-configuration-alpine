@@ -670,7 +670,6 @@ int main(int argc, char** argv) {
     const std::string serial     = read_pi_serial();
     const std::string dev_name   = serial.empty() ? configured_name : serial;
     set_hostname_from_serial(serial);
-    provision_cloudflare_async(serial);
     const std::string iface      = cfg.get_str("wifi.interface", "wlan0");
     const std::string eth_iface  = cfg.get_str("ethernet.interface", "eth0");
     // Optional -- a second wired interface (e.g. a USB-Ethernet dongle)
@@ -816,6 +815,22 @@ int main(int argc, char** argv) {
             std::cerr << "[AP] failed to start: " << ap_err << "\n";
         }
     }
+
+    // Deliberately started only *after* the station-vs-AP decision above
+    // is fully resolved, not at the top of main() -- a real device
+    // showed a boot-time WiFi join failing on the same boot this thread
+    // ran its first (real, curl-based, several-sequential-HTTPS-round-
+    // trips) Cloudflare API attempt, then joining cleanly on a later
+    // boot where config.yml already existed and this call was a
+    // near-instant no-op (see provision-cloudflare.sh's own idempotency
+    // check) -- consistent with (not independently proven as) resource
+    // contention between that attempt and wpa_supplicant's own
+    // association, both competing for this board's modest CPU/network
+    // stack during the same timing-sensitive window. This reordering
+    // removes that overlap entirely regardless of whether contention
+    // was the full explanation; see also provision-cloudflare.sh's own
+    // curl timeouts, added for the same reason.
+    provision_cloudflare_async(serial);
 
     httpsrv::HttpServer server;
 
