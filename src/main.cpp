@@ -122,10 +122,12 @@
 #include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <cerrno>
 #include <chrono>
 #include <csignal>
 #include <cstdio>
 #include <cstring>
+#include <ctime>
 #include <fstream>
 #include <iostream>
 #include <map>
@@ -134,6 +136,8 @@
 #include <string>
 #include <thread>
 #include <vector>
+
+#include <sys/time.h>
 
 #include <openssl/rand.h>
 
@@ -725,7 +729,11 @@ int main(int argc, char** argv) {
     // know it still needs to actually attempt the join itself (live, in
     // place -- see do_finish's own comment) rather than trusting
     // wifi.state, which was never driven to CONNECTED by staging alone.
+    // staged_ssid/staged_psk are what do_finish's live-join thread
+    // actually joins with -- see its own comment for why stage() writing
+    // to wpa_supplicant.conf alone was never enough on its own.
     bool staged_network = false;
+    std::string staged_ssid, staged_psk;
 
     // Tries to join whatever's already configured -- wpa_supplicant,
     // already started by OpenRC before this daemon (see its own
@@ -926,7 +934,7 @@ int main(int argc, char** argv) {
             // real, confusing state on a real device) -- finished now
             // means "provisioned and actually on the network," not just
             // "the wizard was attempted."
-            std::thread([&]() {
+            std::thread([&, ssid = staged_ssid, psk = staged_psk]() {
                 std::string stop_err;
                 if (!ap.stop(stop_err)) {
                     std::cerr << "[Finish] failed to free the radio from AP mode: " << stop_err << "\n";
@@ -938,13 +946,27 @@ int main(int argc, char** argv) {
                 }
                 staged_network = false;
 
-                bool joined = false;
-                for (int i = 0; i < sta_boot_timeout_secs * 2; ++i) {
-                    if (wifi.get_status().state == WifiStatus::CONNECTED) { joined = true; break; }
-                    std::this_thread::sleep_for(std::chrono::milliseconds(500));
-                }
+                // ap.stop() only gets wpa_supplicant's control socket back
+                // up -- it does NOT itself drive a join. An earlier version
+                // of this just polled wifi.get_status() from here, trusting
+                // wpa_supplicant to auto-associate from what stage() wrote
+                // into wpa_supplicant.conf the same way it does on a fresh
+                // boot; confirmed on real hardware that this is NOT
+                // reliable coming out of an active AP-mode session (wlan0
+                // hands back from hostapd in a state fresh-boot wpa_supplicant
+                // never has to deal with) -- the join would silently never
+                // happen live at all, only ever succeeding on an actual
+                // reboot, which starts wpa_supplicant on a never-touched-by-
+                // hostapd interface. wifi.connect() (the same call an
+                // already-connected device's own /connect reconfigure path
+                // already uses, proven to work) actively drives the whole
+                // thing instead: fresh network via wpa_cli, enable/select,
+                // poll for actual association, then an explicit dhcpcd
+                // lease request -- not just waiting and hoping.
+                bool joined = wifi.connect(ssid, psk);
                 if (!joined) {
-                    std::cerr << "[Finish] live join failed after staging -- falling back to AP mode\n";
+                    std::cerr << "[Finish] live join failed after staging (" << wifi.get_status().error
+                              << ") -- falling back to AP mode\n";
                     std::string ap_err;
                     if (!ap.start(dev_name, ap_err)) {
                         std::cerr << "[AP] failed to restart after a failed join: " << ap_err << "\n";
@@ -1003,6 +1025,53 @@ int main(int argc, char** argv) {
         if (!eth.set_static_ip(ip, range_start, range_end, ip_err)) {
             std::cerr << "[Ethernet] failed to set static IP " << ip << ": " << ip_err << "\n";
         }
+    };
+
+    // None of these boards have a battery-backed RTC (see
+    // sdcard-image-pi3/README.md's "System clock reliability") -- every
+    // cold boot starts with whatever time the kernel happens to have,
+    // often long in the past, until chronyd corrects it over NTP. That
+    // needs real internet access, which a freshly unconfigured device
+    // sitting in its own fallback AP doesn't have yet -- so a wrong clock
+    // can otherwise persist for the entire time the wizard is being run,
+    // which matters because it also breaks HTTPS certificate-date
+    // validation for anything this daemon itself does over HTTPS (e.g.
+    // provision_cloudflare_async's own calls once WiFi does join). The
+    // phone's own clock is essentially always correct by comparison
+    // (carrier/OS-synced), so the app can just hand it over directly
+    // instead of waiting on NTP. No reboot needed -- `date -u -s` takes
+    // effect immediately, same live-in-place philosophy as everything
+    // else this daemon does post-boot.
+    auto do_set_time = [&](long unix_time) -> bool {
+        // A direct settimeofday() call, not a `date -u -s` subprocess --
+        // confirmed directly against Alpine's own BusyBox date applet
+        // that it prints "can't set date: Operation not permitted" to
+        // stderr yet still exits 0 when the underlying syscall itself is
+        // refused (e.g. no CAP_SYS_TIME), which would have made
+        // run_command()'s usual exit_code check silently report success
+        // for a clock that was never actually changed. settimeofday()
+        // itself reports that failure reliably via errno, the same
+        // reasoning that already led to using RAND_bytes() directly
+        // instead of shelling out for randomness elsewhere in this file.
+        struct timeval tv;
+        tv.tv_sec = static_cast<time_t>(unix_time);
+        tv.tv_usec = 0;
+        if (settimeofday(&tv, nullptr) != 0) {
+            std::cerr << "[Time] failed to set system clock: " << std::strerror(errno) << "\n";
+            return false;
+        }
+        // Best-effort and expected to fail on every board this image
+        // targets (no RTC hardware to write to at all) -- not worth
+        // failing the whole request over; chronyd will happily correct
+        // this again over NTP once real internet access exists anyway.
+        run_command({"hwclock", "-w"});
+        std::time_t t = static_cast<std::time_t>(unix_time);
+        std::tm tm_utc{};
+        gmtime_r(&t, &tm_utc);
+        char buf[32];
+        std::strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &tm_utc);
+        std::cerr << "[Time] system clock set to " << buf << " UTC\n";
+        return true;
     };
 
     // Relays are no part of the setup wizard -- they're only meaningful
@@ -1150,19 +1219,24 @@ int main(int argc, char** argv) {
             // WifiControl::stage), fast enough to do synchronously and
             // report the real outcome immediately, instead of the usual
             // fire-and-forget pattern other routes use for slower,
-            // backgrounded work. The actual join is attempted fresh after
-            // the reboot POST /finish triggers, via the same
-            // station-then-AP-fallback logic that already runs on every
-            // boot -- so a wrong password/out-of-range network falls back
-            // into the AP again automatically, same as "nothing
-            // configured" does today.
+            // backgrounded work. This also durably persists the network
+            // to disk (survives this daemon crashing/restarting before
+            // /finish is ever called) -- but staging alone is NOT what
+            // actually joins it: do_finish's own live-join thread calls
+            // wifi.connect(staged_ssid, staged_psk) explicitly once the
+            // radio is freed from AP mode (see its own comment for why
+            // relying on wpa_supplicant auto-associating from this staged
+            // file alone, the way a fresh boot does, turned out not to be
+            // reliable coming out of an active AP-mode session).
             std::string stage_err;
             if (!wifi.stage(ssid, psk, stage_err)) {
                 std::cerr << "[Wifi] failed to stage \"" << ssid << "\": " << stage_err << "\n";
                 return httpsrv::Response::error(500, stage_err);
             }
             staged_network = true;
-            std::cerr << "[Wifi] staged \"" << ssid << "\" -- will attempt on next reboot\n";
+            staged_ssid = ssid;
+            staged_psk = psk;
+            std::cerr << "[Wifi] staged \"" << ssid << "\" -- will join live once /finish is called\n";
             return httpsrv::Response::json("{\"ok\":true}");
         }
 
@@ -1196,6 +1270,22 @@ int main(int argc, char** argv) {
             o << "{\"ok\":true,\"adminUsername\":\"" << escape_json(admin_user) << "\","
               << "\"adminPassword\":\"" << escape_json(admin_pass) << "\"}";
             return httpsrv::Response::json(o.str());
+        }
+        return httpsrv::Response::json("{\"ok\":true}");
+    });
+
+    // Not gated on MARKER_FILE the way /ethernet's setter is -- a wrong
+    // clock is exactly as much of a problem before the wizard finishes
+    // (see do_set_time's own comment: it can break this daemon's own
+    // HTTPS calls, e.g. Cloudflare provisioning, the moment WiFi joins)
+    // as after, so there's no state in which setting it should be
+    // refused.
+    server.route("POST", "/time", [&](const httpsrv::Request& req) {
+        long unix_time = json_get_int(req.body, "unixTime", -1);
+        if (unix_time < 0) return httpsrv::Response::error(400, "unixTime (seconds since epoch, UTC) is required");
+        std::cerr << "[Command] set_time requested: " << unix_time << "\n";
+        if (!do_set_time(unix_time)) {
+            return httpsrv::Response::error(500, "failed to set system time");
         }
         return httpsrv::Response::json("{\"ok\":true}");
     });

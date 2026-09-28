@@ -355,9 +355,17 @@ public:
     // is stopped entirely in that state (see ap_control.hpp), so there's
     // no live control socket for wpa_cli to talk to at all, yet the
     // wizard still needs a way to save what the user just entered without
-    // disrupting the AP itself (see main.cpp's do_connect for why that
-    // matters). Takes effect the next time wpa_supplicant (re)starts and
-    // reads this file -- normally this daemon's own next reboot.
+    // disrupting the AP itself (see main.cpp's POST /connect for why that
+    // matters). This alone is only a durability measure (surviving this
+    // daemon crashing/restarting, or a genuine reboot, before /finish is
+    // ever called) -- it does NOT itself drive a join. main.cpp's
+    // do_finish() calls connect() above explicitly, live, with the same
+    // ssid/psk, once the radio is actually freed from AP mode; relying on
+    // wpa_supplicant to auto-associate from this staged file alone (the
+    // way a fresh boot's already-running wpa_supplicant does) turned out
+    // not to be reliable coming out of an active AP-mode session on real
+    // hardware -- confirmed the live join was silently never attempted at
+    // all that way, only ever succeeding on an actual reboot.
     //
     // Replaces every network{} block already in the file with exactly
     // one new one (same "single active network" model as connect()
