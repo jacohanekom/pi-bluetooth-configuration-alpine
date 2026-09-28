@@ -157,7 +157,6 @@ namespace {
 // protected_paths.d/*.list. A marker under /etc survives a reboot
 // there; one at "/" silently wouldn't.
 constexpr const char* MARKER_FILE = "/etc/successfully-initialized";
-constexpr int REBOOT_DELAY_SECS = 3;
 constexpr const char* HOSTNAME_FILE = "/etc/hostname";
 // Purely informational -- the iOS app's Sign in with Apple result
 // (name/email) gets POSTed here once and stored so the device's owner
@@ -566,51 +565,6 @@ void set_hostname_from_serial(const std::string& serial) {
     std::ofstream(HOSTNAME_FILE) << serial << "\n";
 }
 
-// Waits long enough for the just-sent HTTP response to actually reach
-// the client before anything this triggers (an AP teardown, in
-// particular) could drop the connection it travelled over, then
-// reboots. Fire-and-forget: once the reboot command is issued, the
-// whole system (including this process) is going down regardless of
-// what run_command reports back.
-//
-// On Alpine diskless installs (see sdcard-image-pi3), root is tmpfs --
-// nothing here (WiFi credentials just saved into wpa_supplicant.conf,
-// MARKER_FILE, SSH host keys, etc.) would survive this reboot at all
-// otherwise. An earlier attempt handled this via a generic OpenRC
-// shutdown-runlevel service instead of here, relying on it always
-// running before the actual reboot; that turned out to fail on real
-// hardware for reasons not fully root-caused, so this commits
-// explicitly at the one moment this process actually knows a reboot is
-// about to happen, rather than depending on shutdown-sequence
-// ordering. `lbu` doesn't exist on non-diskless installs (disk-
-// resident images, plain dev boxes) -- run_command() fails via a
-// normal execvp()+_exit(127), not an exception, so this is safe to
-// call unconditionally and just quietly does nothing useful there.
-//
-// -d is load-bearing, not cosmetic: `lbu commit`'s own target filename
-// is "$(hostname).apkovl.tar.gz" (confirmed by reading alpine-conf's
-// lbu.in directly), computed from the CURRENT hostname at commit time
-// -- but set_hostname_from_serial() above already renamed the live
-// hostname away from the image's build-time one (e.g. "aipicam") by
-// the time this ever runs. Without -d, lbu commit finds that mismatch
-// (the existing on-disk apkovl was named after the OLD hostname) and
-// refuses outright ("more than one apkovl file(s) were found ...
-// Please use -d to replace"), rather than silently doing nothing --
-// meaning every commit was failing outright, losing WiFi credentials
-// and MARKER_FILE both, confirmed against a real device. -d tells it
-// to just replace whatever apkovl(s) already exist with the current
-// one, which is exactly what a single-owner device wants regardless of
-// what its hostname was at build time vs. now.
-void reboot_after_delay() {
-    std::thread([]() {
-        std::this_thread::sleep_for(std::chrono::seconds(REBOOT_DELAY_SECS));
-        auto commit = run_command({"lbu", "commit", "-d", "mmcblk0p1"});
-        std::cerr << "[Main] lbu commit before reboot: " << trim(commit.output) << "\n";
-        std::cerr << "[Main] rebooting now\n";
-        run_command({"reboot"});
-    }).detach();
-}
-
 // Cloudflare Tunnel auto-provision -- entirely optional and specific to
 // sdcard-image-pi3's CLOUDFLARE_API_TOKEN build path (see that image's
 // build-image.sh/README.md, "Remote access via Cloudflare Tunnel"). This
@@ -768,9 +722,9 @@ int main(int argc, char** argv) {
     // True once credentials have been staged into wpa_supplicant.conf
     // directly (see WifiControl::stage and the POST /connect route
     // below) while the fallback AP was active. do_finish checks this to
-    // allow concluding the wizard even though wifi.state was never
-    // actually driven to CONNECTED -- the join itself only happens after
-    // the reboot POST /finish triggers, not before.
+    // know it still needs to actually attempt the join itself (live, in
+    // place -- see do_finish's own comment) rather than trusting
+    // wifi.state, which was never driven to CONNECTED by staging alone.
     bool staged_network = false;
 
     // Tries to join whatever's already configured -- wpa_supplicant,
@@ -861,24 +815,62 @@ int main(int argc, char** argv) {
     // still be adjusted first if needed.
     auto do_connect = [&](const std::string& ssid, const std::string& psk) { wifi.connect(ssid, psk); };
 
+    // No reboot -- an earlier version of this rebooted into a fresh
+    // diskless boot to get back to a clean AP-mode state, but that meant
+    // every reset/reconfigure paid diskless mode's own full package-
+    // reinstall cost, and (worse) went through exactly the boot-time
+    // wpa_supplicant.conf-gets-clobbered-then-restored dance that's
+    // already this image's single flakiest sequence (see "Config
+    // persistence across reboots"). Doing it live instead -- the same
+    // ap.start()/wifi.forget() calls this daemon already has, just
+    // invoked directly rather than deferred to the next boot -- sidesteps
+    // that whole class of risk, not just this specific bug.
     auto do_forget = [&]() {
         wifi.forget();
         std::remove(MARKER_FILE);
-        reboot_after_delay();
+        // pi-relay-control's own start_pre() already ran at boot (before
+        // this marker was ever removed) and is presumably still running
+        // from back then -- restart it so it re-evaluates that gate now
+        // and actually stops, rather than staying up despite a Pi that's
+        // no longer considered provisioned.
+        run_command({"rc-service", "pi-relay-control", "restart"});
+        std::string ap_err;
+        if (!ap.start(dev_name, ap_err)) {
+            std::cerr << "[AP] failed to start after forget: " << ap_err << "\n";
+        }
+        // On Alpine diskless installs (see sdcard-image-pi3), root is
+        // tmpfs -- none of what just changed under /etc would survive a
+        // future reboot without this. -d is load-bearing, not cosmetic:
+        // `lbu commit`'s own target filename is
+        // "$(hostname).apkovl.tar.gz" (confirmed by reading alpine-conf's
+        // lbu.in directly), computed from the CURRENT hostname at commit
+        // time -- but set_hostname_from_serial() already renamed the
+        // live hostname away from the image's build-time one (e.g.
+        // "aipicam") long before this ever runs. Without -d, lbu commit
+        // finds that mismatch (the existing on-disk apkovl was named
+        // after the OLD hostname) and refuses outright ("more than one
+        // apkovl file(s) were found ... Please use -d to replace"),
+        // rather than silently doing nothing -- meaning every commit was
+        // failing outright, confirmed against a real device. -d tells it
+        // to just replace whatever apkovl(s) already exist with the
+        // current one, which is exactly what a single-owner device wants
+        // regardless of what its hostname was at build time vs. now.
+        auto commit = run_command({"lbu", "commit", "-d", "mmcblk0p1"});
+        std::cerr << "[Main] lbu commit after forget: " << trim(commit.output) << "\n";
     };
 
-    // The end of the wizard -- marks success on disk and reboots into
-    // the Pi's normal role rather than staying up to be managed further.
-    // Allowed in either of two states: WiFi is already actually
-    // connected (the do_connect path above, reconfiguring an
-    // already-networked Pi), or credentials were staged while the
-    // fallback AP was active (see POST /connect below) -- in the latter
-    // case wifi.state is *not* "connected" yet at all, since nothing has
-    // actually been attempted; the join itself only happens after this
-    // reboot, via the same station-then-AP-fallback boot sequence that
-    // already runs on every startup. Rejecting both would reboot into a
-    // Pi that isn't actually configured at all, which finishing is
-    // specifically meant to prevent.
+    // The end of the wizard -- switches this Pi into its normal
+    // (already-provisioned) role live, in place, rather than rebooting
+    // into it (see do_forget's own comment on why rebooting for this was
+    // dropped entirely). Allowed in either of two states: WiFi is
+    // already actually connected (the do_connect path above,
+    // reconfiguring an already-networked Pi), or credentials were staged
+    // while the fallback AP was active (see POST /connect below) -- in
+    // the latter case, everything from here on out but the admin account
+    // itself has to happen *after* this function returns, backgrounded
+    // (see below for why), rather than before. Rejecting both starting
+    // states outright would finish into a Pi that isn't actually
+    // configured at all, which this is specifically meant to prevent.
     //
     // Also the one and only place a fresh admin account (see
     // create_admin_account()) ever gets created -- exactly once per
@@ -889,7 +881,7 @@ int main(int argc, char** argv) {
     // handler can hand them back to the app in that same response --
     // the only time they're ever retrievable, since only a password
     // hash is kept on disk. Refuses to finish at all if account
-    // creation fails, rather than rebooting into a device with no valid
+    // creation fails, rather than finishing into a device with no valid
     // login whatsoever -- see create_admin_account()'s own comment.
     auto do_finish = [&](std::string& admin_user, std::string& admin_pass) -> bool {
         bool staged_via_ap = ap.is_running() && staged_network;
@@ -897,14 +889,101 @@ int main(int argc, char** argv) {
             std::cerr << "[Finish] ignoring: WiFi is not connected and nothing has been staged\n";
             return false;
         }
+
+        // Deliberately created *before* anything below that might free
+        // the radio from AP mode -- doing that tears down the very TCP
+        // connection this request arrived over (the phone was reached
+        // via that same AP), which would silently drop the response
+        // (credentials included) before it ever reached the client no
+        // matter how this function structured its return value. Account
+        // creation itself never touches the radio, so it's safe to do
+        // synchronously, before responding, regardless of which case
+        // below applies.
         if (!std::ifstream(ADMIN_USER_FILE).good()) {
             if (!create_admin_account(admin_user, admin_pass)) {
                 std::cerr << "[Finish] aborting: failed to create the admin account\n";
                 return false;
             }
         }
+
+        if (staged_via_ap) {
+            // Everything else -- freeing the radio, attempting the live
+            // join, falling back to AP mode on failure, and only then
+            // marking this device finished -- happens on a detached
+            // thread instead, so the response carrying the credentials
+            // above gets a chance to actually reach the client first.
+            // The client's own contract here is unchanged from the old
+            // reboot-based design: an immediate ok:true means "accepted,
+            // expect a disconnect," with the real outcome (joined vs.
+            // fell back to AP again) only discoverable afterward, by
+            // reconnecting and polling -- see HTTPManager.swift's
+            // finishSetup().
+            //
+            // MARKER_FILE is deliberately NOT written until the join is
+            // actually confirmed (unlike the old reboot-based design,
+            // which wrote it up front and could end up "finished" on
+            // disk despite the post-reboot join failing, confirmed as a
+            // real, confusing state on a real device) -- finished now
+            // means "provisioned and actually on the network," not just
+            // "the wizard was attempted."
+            std::thread([&]() {
+                std::string stop_err;
+                if (!ap.stop(stop_err)) {
+                    std::cerr << "[Finish] failed to free the radio from AP mode: " << stop_err << "\n";
+                    std::string restart_err;
+                    if (!ap.start(dev_name, restart_err)) {
+                        std::cerr << "[AP] failed to restore AP mode after a failed stop: " << restart_err << "\n";
+                    }
+                    return;
+                }
+                staged_network = false;
+
+                bool joined = false;
+                for (int i = 0; i < sta_boot_timeout_secs * 2; ++i) {
+                    if (wifi.get_status().state == WifiStatus::CONNECTED) { joined = true; break; }
+                    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                }
+                if (!joined) {
+                    std::cerr << "[Finish] live join failed after staging -- falling back to AP mode\n";
+                    std::string ap_err;
+                    if (!ap.start(dev_name, ap_err)) {
+                        std::cerr << "[AP] failed to restart after a failed join: " << ap_err << "\n";
+                    }
+                    return;
+                }
+                std::cerr << "[Finish] joined " << wifi.get_status().ssid << " live\n";
+
+                std::ofstream(MARKER_FILE).close();
+                // Both of these already ran at boot, before this marker
+                // existed (pi-relay-control's own start_pre() refusing
+                // to start) or before real internet existed yet
+                // (provision_cloudflare_async's own retry budget, which
+                // may well have already exhausted itself waiting on a
+                // wizard that took its time) -- restart/re-trigger both
+                // now that the actual precondition each was waiting on
+                // has just become true, rather than requiring a reboot
+                // to notice.
+                run_command({"rc-service", "pi-relay-control", "restart"});
+                run_command({"rc-service", "wetty", "restart"});
+                provision_cloudflare_async(serial);
+                // -d is load-bearing here too -- see do_forget's own
+                // comment on this exact flag.
+                auto commit = run_command({"lbu", "commit", "-d", "mmcblk0p1"});
+                std::cerr << "[Main] lbu commit after finish: " << trim(commit.output) << "\n";
+            }).detach();
+            return true;
+        }
+
+        // Not staged-via-AP: this device was already connected the whole
+        // time, so nothing above applies and nothing here disrupts this
+        // response's own connection -- safe to just do it all
+        // synchronously.
         std::ofstream(MARKER_FILE).close();
-        reboot_after_delay();
+        run_command({"rc-service", "pi-relay-control", "restart"});
+        run_command({"rc-service", "wetty", "restart"});
+        provision_cloudflare_async(serial);
+        auto commit = run_command({"lbu", "commit", "-d", "mmcblk0p1"});
+        std::cerr << "[Main] lbu commit after finish: " << trim(commit.output) << "\n";
         return true;
     };
 
@@ -1032,21 +1111,22 @@ int main(int argc, char** argv) {
     // is expected to have cached them from then, but this route
     // doesn't assume either field is present).
     //
-    // Unlike WiFi credentials/MARKER_FILE/SSH host keys, this write
-    // isn't followed by reboot_after_delay() -- nothing else on this
-    // path reboots the device -- so on a diskless install (see
-    // sdcard-image-pi3) it would otherwise only ever land in tmpfs and
-    // vanish on the next reboot that isn't itself a /finish or /forget.
-    // `lbu` doesn't exist on non-diskless installs; run_command() fails
-    // safely there (a normal execvp()+_exit(127), not an exception), so
-    // this is safe to call unconditionally.
+    // No route in this daemon reboots the device anymore (see do_forget's
+    // own comment on why that was dropped) -- every write under /etc,
+    // this one included, needs its own explicit commit or it would only
+    // ever land in tmpfs and vanish on the next reboot regardless of
+    // where that reboot actually comes from (a future /finish or
+    // /forget don't touch this file at all, so they wouldn't save it for
+    // free). `lbu` doesn't exist on non-diskless installs; run_command()
+    // fails safely there (a normal execvp()+_exit(127), not an
+    // exception), so this is safe to call unconditionally.
     server.route("POST", "/user", [&](const httpsrv::Request& req) {
         std::string name = json_get_string(req.body, "name");
         std::string email = json_get_string(req.body, "email");
         if (name.empty() && email.empty()) return httpsrv::Response::error(400, "name or email is required");
         write_camera_user(name, email);
-        // -d: see reboot_after_delay()'s own comment on this flag --
-        // load-bearing here too, for the same reason.
+        // -d: see do_forget's own comment on this flag -- load-bearing
+        // here too, for the same reason.
         auto commit = run_command({"lbu", "commit", "-d", "mmcblk0p1"});
         std::cerr << "[Command] user set: " << (name.empty() ? "(no name)" : name)
                    << (email.empty() ? "" : " <" + email + ">") << "\n";
@@ -1096,16 +1176,15 @@ int main(int argc, char** argv) {
         return httpsrv::Response::json("{\"ok\":true}");
     });
 
-    // Synchronous, unlike every other route above -- the admin
-    // account/credentials it may create (see do_finish()'s own comment)
-    // only ever exist in memory here, once, so they have to reach the
-    // response before this function returns; a detached background
-    // thread (the usual pattern here) would have no way to get them
-    // back into an HTTP response the client can still read. Nothing
-    // this actually does is slow (a handful of sub-second subprocess
-    // calls, no network I/O) -- reboot_after_delay() itself still
-    // backgrounds the reboot separately, same as before, so the
-    // response reaches the app well within its 3-second delay.
+    // do_finish() itself stays fast (a handful of sub-second subprocess
+    // calls at most) regardless of which case applies -- see its own
+    // comment on why the staged-via-AP path backgrounds everything past
+    // account creation onto a detached thread rather than blocking this
+    // handler on the actual join attempt. The admin account/credentials
+    // it may create only ever exist in memory here, once, so they have
+    // to reach the response before this function returns; the usual
+    // fire-and-forget pattern the routes above use would have no way to
+    // get them back into an HTTP response the client can still read.
     server.route("POST", "/finish", [&](const httpsrv::Request&) {
         std::cerr << "[Command] finish requested\n";
         std::string admin_user, admin_pass;

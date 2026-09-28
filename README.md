@@ -75,7 +75,7 @@ locally, a WiFi password containing bytes not valid as text isn't an
 issue -- but SSIDs are always sent as hex too, sidestepping wpa_supplicant's
 control-interface quoting rules entirely.
 
-## One-shot provisioning and reboot behavior
+## One-shot provisioning, no reboot needed
 
 This daemon isn't meant to stay up managing an active WiFi connection --
 its only job is to get the Pi onto a network (or off one) and then get
@@ -96,30 +96,63 @@ wizard's remaining steps afterward either.
   connection to the daemon is never disrupted, so the wizard continues
   normally: `POST /ethernet` stays available for the local network
   configuration step, then the client sends `POST /finish`, which is
-  what actually reboots the Pi. The join itself is only attempted
-  *after* that reboot, via the same station-then-AP-fallback logic that
-  already runs on every startup -- so a wrong password or an
-  out-of-range network just falls back into AP mode again automatically,
-  the same way "nothing configured" does today, and the phone (having
-  lost the AP at that point regardless, once the Pi reboots) needs to
-  search again to find out which way it went.
+  what actually attempts the join -- live, in place, not via a reboot
+  (see below).
 - **If the AP is *not* active** (already on a real network, e.g.
   reconfiguring): `POST /connect` joins the given network directly and
   synchronously (unchanged from before) without marking setup finished
-  or rebooting -- `POST /ethernet` stays available for one more optional
-  step before the client sends `POST /finish`.
+  -- `POST /ethernet` stays available for one more optional step before
+  the client sends `POST /finish`.
 - **`POST /finish`**: allowed in either of two states -- WiFi is already
   actually connected (the direct-join path above), or credentials were
   staged while the fallback AP was active (the previous bullet); rejected
-  (a no-op, logged) if neither is true, since rebooting then would land
-  on a Pi that isn't actually configured at all. Creates
-  `/etc/successfully-initialized` (an empty marker file -- under `/etc`
-  specifically so diskless installs' config-persistence mechanism
-  actually picks it up on reboot, see sdcard-image-pi3's own README),
-  waits 3 seconds (enough time for the HTTP response to actually reach
-  the client before the connection drops), then reboots the Pi.
-- **`POST /forget`**: removes `/etc/successfully-initialized` if present,
-  then reboots the same way (also after the 3-second delay).
+  (HTTP 400, logged) if neither is true, since finishing then would leave
+  a Pi that isn't actually configured at all. The response can include a
+  one-time `adminUsername`/`adminPassword` pair (see "Logging in: the
+  admin account, not root" below) -- that account is always created
+  synchronously, before responding, specifically so it can ride back in
+  this same response. In the staged-via-AP case, everything past that
+  point -- freeing the radio from AP mode (`ap.stop()`, the same
+  mechanism the direct-join path above already relies on), waiting to
+  see whether `wpa_supplicant` (restarted fresh by that call, reading
+  the network `stage()` already wrote into its config) actually joins
+  within the same timeout a boot-time join gets, and falling back to AP
+  mode again on failure so the wizard can be retried -- happens
+  *afterward*, on a background thread, not before responding: freeing
+  the radio tears down the very connection this response has to travel
+  over, so anything past account creation has to be backgrounded or the
+  response (credentials included) would never actually reach the phone.
+  The client-side contract is exactly what an old reboot-based version
+  of this already trained callers to expect -- an immediate `ok:true`
+  means "accepted," with the real outcome (joined, or fell back to AP
+  again) only discoverable afterward by reconnecting and polling `GET
+  /status`, not from this response. `/etc/successfully-initialized` (an
+  empty marker file -- under `/etc` specifically so diskless installs'
+  config-persistence mechanism actually picks it up, see
+  sdcard-image-pi3's own README) is deliberately only created once the
+  live join is actually *confirmed*, not just attempted -- an earlier,
+  reboot-based version of this created it up front regardless of the
+  post-reboot join's own outcome, which could leave a real device
+  "finished" on disk despite WiFi never actually working, confirmed as a
+  genuine, confusing state on real hardware. Once actually configured
+  (or already was), also restarts `pi-relay-control` and `wetty` (both
+  may have already refused to fully start at boot, before this marker
+  existed or before a real network did), gives Cloudflare Tunnel
+  provisioning a fresh attempt, and commits via `lbu` so all of this
+  survives a future reboot. No reboot happens as part of `/finish`
+  itself anymore -- an earlier version rebooted here specifically to get
+  back to a clean state, but that meant paying diskless mode's full
+  package-reinstall cost on every finish/reset, and routing every single
+  one through exactly the boot-time-config-gets-clobbered-then-restored
+  sequence that's this image's own flakiest corner (see
+  sdcard-image-pi3's README, "Config persistence across reboots") --
+  doing it live sidesteps that whole class of risk instead of just
+  working around it.
+- **`POST /forget`**: removes `/etc/successfully-initialized` and the
+  saved WiFi config if present, restarts `pi-relay-control` (so it
+  notices the marker is gone and actually stops), switches the radio
+  back into AP mode live, and commits via `lbu` -- also no reboot, for
+  the same reason as `/finish` above.
 
 `/etc/successfully-initialized` is meant for other boot-time scripts/units
 on the Pi to check (`test -f /etc/successfully-initialized`) to know
@@ -406,7 +439,7 @@ control.
 This daemon advertises itself over multicast DNS (RFC 6762/6763 -- the
 protocol Apple calls Bonjour) as `<serial>._aipicam._tcp.local.`, where
 `<serial>` is this Pi's own hardware serial number, same as the fallback
-AP's own SSID (see "One-shot provisioning and reboot behavior" above) --
+AP's own SSID (see "One-shot provisioning, no reboot needed" above) --
 so a client app can find it automatically (iOS's `NWBrowser`, or any
 other mDNS-aware client) instead of requiring its address to be typed
 in, on whichever network (the fallback AP, or a real one once joined) it
@@ -462,9 +495,9 @@ these routes need.
 |---|---|---|
 | `GET /status` | -- | Combined snapshot: `wifi`, `apActive`, `eth`, `leases`, `relays`, `victron`, `scan` -- see "Status JSON" below. No server push (no BLE-style notify): poll this periodically instead. |
 | `POST /scan` | -- | `{"ok":true}` immediately; triggers a background scan (~4s). Poll `GET /status`'s `scan` field for results. |
-| `POST /connect` | `{"ssid":...,"password":...}` (omit/empty password for an open network) | `{"ok":true}`; see "One-shot provisioning and reboot behavior" above -- while the fallback AP is active this only *stages* the credentials (no join attempted, no reboot yet) so the wizard can continue; otherwise it joins directly and synchronously, same as before. |
-| `POST /forget` | -- | `{"ok":true}` immediately; forgets the configured network and reboots a few seconds later. |
-| `POST /finish` | -- | `{"ok":true}` immediately; allowed if WiFi is connected *or* credentials were staged via `POST /connect` from AP mode (see above) -- concludes setup and reboots. |
+| `POST /connect` | `{"ssid":...,"password":...}` (omit/empty password for an open network) | `{"ok":true}`; see "One-shot provisioning, no reboot needed" above -- while the fallback AP is active this only *stages* the credentials (no join attempted yet) so the wizard can continue; otherwise it joins directly and synchronously, same as before. |
+| `POST /forget` | -- | `{"ok":true}` immediately; forgets the configured network and switches back to AP mode live, no reboot. |
+| `POST /finish` | -- | `{"ok":true,"adminUsername":...,"adminPassword":...}` on this device's very first successful finish, otherwise `{"ok":true}`; HTTP 400 if WiFi isn't connected and nothing was staged. Allowed if WiFi is connected *or* credentials were staged via `POST /connect` from AP mode (see above) -- responds fast either way; in the staged case, the actual join/AP-fallback happens afterward in the background, not before this response (see above). |
 | `GET /ethernet` | -- | `{"ip":...,"rangeStart":...,"rangeEnd":...}` -- eth0's current gateway config. |
 | `POST /ethernet` | `{"ip":...,"rangeStart":...,"rangeEnd":...}` | `{"ok":true}`; see "Ethernet direct-connect" (rejected once setup has finished). |
 | `POST /relay` | `{"port":...,"state":"on"\|"off"}` | `{"ok":bool,"relays":[...]}` -- see "Relay control" (rejected until setup has finished). |
@@ -535,7 +568,7 @@ in-progress `connecting` state with something stale from wpa_supplicant
 mid-change.
 
 `apActive` reflects whether the fallback access point is currently
-running (see "One-shot provisioning and reboot behavior" above).
+running (see "One-shot provisioning, no reboot needed" above).
 
 `scan` is sorted strongest-first, deduplicated by SSID, capped at
 `scan.max_results` (default 10). Hidden networks (blank SSID in the scan)
@@ -626,7 +659,7 @@ started automatically the first time the daemon applies `eth0`'s default
 gateway IP (see "Ethernet direct-connect") -- no need to enable it
 manually. `hostapd` is deliberately *not* enabled at boot -- this daemon
 starts/stops it itself, dynamically, as it enters/leaves fallback-AP mode
-(see "One-shot provisioning and reboot behavior" above). `iptables` needs
+(see "One-shot provisioning, no reboot needed" above). `iptables` needs
 no service of its own; the daemon applies its NAT rules itself at startup
 (see "Internet sharing (eth0 -> WiFi)").
 
