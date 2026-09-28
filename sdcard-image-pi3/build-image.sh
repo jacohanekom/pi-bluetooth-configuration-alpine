@@ -30,14 +30,6 @@ ALPINE_RELEASE=3.22.5
 # both together when updating.
 CLOUDFLARED_VERSION=2026.9.3
 CLOUDFLARED_SHA256=aaeb2d7d0da3614634c7e03ab13487a1522c2e79165ed2929cfe23d5e95b326d
-# Pinned for the same reason as CLOUDFLARED_VERSION -- npm's own
-# resolution of a bare "wetty" would silently drift between builds
-# otherwise. Verified this exact version installs and its node-pty
-# native binding compiles cleanly for aarch64/musl inside the
-# alpine:$ALPINE_VERSION container used below (confirmed the resulting
-# .node file is genuinely `ELF 64-bit LSB shared object, ARM aarch64`,
-# not a copied prebuilt for the wrong platform).
-WETTY_VERSION=3.2.2
 PI_HOSTNAME="${PI_HOSTNAME:-aipicam}"
 IMG_SIZE_MB=768
 OUT_IMG="aipicam-pi3-diskless.img"
@@ -51,8 +43,8 @@ VICTRON_APK="artifacts/victron-ve-direct-aarch64.apk"
 
 : "${ROOT_PASSWORD:?set ROOT_PASSWORD in the environment (used once, at build time, to hash into /etc/shadow -- never stored in plaintext or committed)}"
 
-# Optional: Cloudflare Tunnel, for reaching this Pi's Wetty web terminal
-# (see the unconditional Wetty setup further down) from outside its own
+# Optional: Cloudflare Tunnel, for reaching this Pi's ttyd web terminal
+# (see the unconditional ttyd setup further down) from outside its own
 # LAN, with no self-hosted server and no inbound port forwarding
 # anywhere -- cloudflared only ever makes outbound
 # connections to Cloudflare's edge. Unlike a single reusable secret
@@ -124,7 +116,7 @@ docker run --rm --platform linux/arm64 -v "$PWD/work/repo/aarch64":/out alpine:"
 		dbus dbus-openrc \
 		linux-firmware-brcm wireless-regdb \
 		libgcc libstdc++ \
-		nodejs openssh-client \
+		ttyd openssh-client \
 		doas shadow \
 		'"$CLOUDFLARE_PACKAGES"'
 '
@@ -178,7 +170,7 @@ OVL=work/apkovl
 mkdir -p "$OVL"/etc/apk/keys "$OVL"/etc/apk/protected_paths.d \
 	"$OVL"/etc/runlevels/boot "$OVL"/etc/runlevels/default "$OVL"/etc/runlevels/shutdown \
 	"$OVL"/etc/init.d "$OVL"/etc/local.d "$OVL"/etc/doas.d "$OVL"/var/lib \
-	"$OVL"/usr/local/bin "$OVL"/usr/local/lib
+	"$OVL"/usr/local/bin
 
 cp "work/repo/$REPO_KEY" "$OVL/etc/apk/keys/"
 
@@ -199,7 +191,7 @@ cat > "$OVL/etc/apk/world" <<-EOF
 	openssh-server
 	linux-firmware-brcm
 	wireless-regdb
-	nodejs
+	ttyd
 	openssh-client
 	doas
 	shadow
@@ -292,51 +284,19 @@ cp fix-chrony-makestep.initd "$OVL/etc/init.d/fix-chrony-makestep"
 chmod +x "$OVL/etc/init.d/fix-chrony-makestep"
 ln -sf /etc/init.d/fix-chrony-makestep "$OVL/etc/runlevels/boot/fix-chrony-makestep"
 
-# Wetty, a browser-based terminal (xterm.js talking to a real `ssh`
-# subprocess over a websocket) -- unconditional, unlike Cloudflare
+# ttyd (a browser-based terminal wrapping a real `ssh` subprocess in a
+# websocket+pty) is a plain apk package -- unlike Wetty, an earlier npm-
+# based choice dropped entirely (a single ~220KB C binary via libwebsockets,
+# no JS runtime, no build-time compile step, no node_modules to bundle,
+# and no risk on ARMv6 boards, which Node.js/V8 hasn't properly
+# supported in years). Package-fetched into the local repo and installed
+# via the world file below like any other package -- see ttyd.initd for
+# how it's actually invoked. Unconditional, not gated behind Cloudflare
 # Tunnel: useful over the LAN/fallback AP on its own (e.g. from a phone
 # with no SSH client), and becomes the Cloudflare Tunnel's ingress
 # target when that feature is also enabled (see provision-cloudflare.sh).
-# Not an apk package (nowhere in Alpine or otherwise) and not a single
-# static binary either -- it's an npm package with a native addon
-# (node-pty) that needs compiling, so build it once here, for this
-# image's own target arch, and bundle the result directly (nodejs
-# itself, to actually run it, comes from the local apk repo above like
-# any other package).
-echo "==> Building Wetty $WETTY_VERSION (npm install, aarch64-native)"
-mkdir -p work/wetty
-docker run --rm --platform linux/arm64 -v "$PWD/work/wetty":/wetty -w /wetty alpine:"$ALPINE_VERSION" sh -c '
-	set -e
-	apk add --no-cache nodejs npm python3 build-base >/dev/null
-	npm init -y >/dev/null
-	npm install wetty@'"$WETTY_VERSION"' --omit=dev --omit=optional >/dev/null
-	# node-pty ships prebuilt native bindings for several platforms this
-	# image will never run on; only the linux-arm64 one -- compiled
-	# fresh just above, for this exact musl/aarch64 target, not copied
-	# from anywhere -- is ever used here. Pruning the rest is a real
-	# size saving (roughly 60MB), not just tidiness.
-	find node_modules -type d \( -name "win32-*" -o -name "darwin-*" \) -exec rm -rf {} + 2>/dev/null || true
-	# npm (running as root in this throwaway container) creates every
-	# node_modules subdirectory itself, unlike the apk-fetch step above
-	# whose target directory the host pre-creates -- so, on a genuine
-	# Linux Docker host (confirmed the hard way: this worked locally on
-	# macOS Docker Desktop, whose bind-mount layer papers over exactly
-	# this, but failed on a real ubuntu-24.04-arm GitHub Actions runner),
-	# every nested directory npm created is root-owned and unwritable by
-	# the non-root user actually running this script, breaking the
-	# rm -rf/cp -r below and this script'"'"'s own final cleanup. Only
-	# root (still us, inside this container, before it exits) can fix
-	# that up -- chown back to whatever host uid:gid is actually running
-	# this script, passed in from outside since inside the container
-	# "id -u" would just say 0.
-	chown -R '"$(id -u):$(id -g)"' .
-'
-rm -rf "$OVL/usr/local/lib/wetty"
-mkdir -p "$OVL/usr/local/lib/wetty"
-cp -r work/wetty/node_modules "$OVL/usr/local/lib/wetty/"
-
-cp wetty.initd "$OVL/etc/init.d/wetty"
-chmod +x "$OVL/etc/init.d/wetty"
+cp ttyd.initd "$OVL/etc/init.d/ttyd"
+chmod +x "$OVL/etc/init.d/ttyd"
 
 # Cloudflare Tunnel, for reaching this Pi remotely -- see the
 # CLOUDFLARE_API_TOKEN check near the top of this script and README.md's
@@ -393,7 +353,7 @@ if [ -n "$CLOUDFLARE_API_TOKEN" ]; then
 fi
 
 ln -sf /etc/init.d/local "$OVL/etc/runlevels/default/local"
-for svc in wpa_supplicant dhcpcd chronyd sshd dbus avahi-daemon wetty \
+for svc in wpa_supplicant dhcpcd chronyd sshd dbus avahi-daemon ttyd \
 	pi-bluetooth-configuration pi-relay-control victron-ve-direct; do
 	ln -sf "/etc/init.d/$svc" "$OVL/etc/runlevels/default/$svc"
 done
@@ -420,22 +380,21 @@ done
 #
 # PermitRootLogin is "no", not "yes" -- root's own password (still set
 # below, unconditionally) is only ever usable at the physical console
-# now, not over SSH/Wetty at all. This is unconditional, not scoped to
-# just Wetty specifically: Wetty's own --ssh-user (see wetty.initd)
-# picks which account it forces a connection into, but that's a
-# preference wetty applies to itself, not a security boundary a
-# connecting client is bound by -- Wetty's own address() function
-# (confirmed by reading its installed source directly) lets a raw HTTP
-# `Remote-User` header or a `/ssh/<user>` URL path override --ssh-user
-# outright, meant for sitting behind an authenticating reverse proxy
-# that sets/strips that header itself, which this image doesn't run.
-# With no such proxy in front of it, "just don't default wetty to root"
-# would be cosmetic, not a real restriction, once Wetty is reachable
-# from the internet via Cloudflare Tunnel -- only disabling root at
-# sshd itself actually closes it, for every path (Wetty and direct LAN
-# SSH both). pi-bluetooth-configuration's own create_admin_account()
-# (see src/main.cpp, called the first time POST /finish ever succeeds)
-# is the intended replacement: a per-device random username/password,
+# now, not over SSH/ttyd at all. This is unconditional, not scoped to
+# just ttyd specifically: ttyd just runs whatever command it's given
+# (see ttyd.initd) with no smart behavior of its own to route around --
+# unlike an earlier Wetty-based version of this, whose own address()
+# function let a raw HTTP `Remote-User` header or a `/ssh/<user>` URL
+# path override its own --ssh-user default outright (confirmed by
+# reading its installed source directly), meant for sitting behind an
+# authenticating reverse proxy this image doesn't run. Regardless, root
+# needs to stay closed at sshd itself: ttyd's own command line already
+# hardcodes which account it connects as, but disabling root only
+# *there* wouldn't stop a direct LAN SSH login as root once this device
+# might be reachable from the internet via Cloudflare Tunnel.
+# pi-bluetooth-configuration's own create_admin_account() (see
+# src/main.cpp, called the first time POST /finish ever succeeds) is
+# the intended replacement: a per-device random username/password,
 # permitted to `doas` to root, handed back to the app once, in that
 # same /finish response.
 ROOT_HASH=$(docker run --rm --platform linux/arm64 alpine:"$ALPINE_VERSION" sh -c \
@@ -474,14 +433,14 @@ ln -sf /media/mmcblk0p1/relay-state "$OVL/var/lib/relay_control"
 # commit` (running as root) would naturally produce root:root, and nothing
 # here needs to be owned by anyone else.
 #
-# `usr` is included alongside `etc`/`var` because cloudflared's binary
-# and Wetty's bundled node_modules both live under
-# usr/local/{bin,lib} -- diskless mode's root is rebuilt from nothing
-# but this tarball plus the local apk repo every single boot, so
-# anything under $OVL not captured here simply wouldn't exist at
-# runtime. (Both directories are created unconditionally above so this
-# always has something to archive, even on a build with neither
-# feature's conditional content added.)
+# `usr` is included alongside `etc`/`var` because cloudflared's own
+# binary lives under usr/local/bin (fetched directly, not via apk --
+# ttyd, unlike an earlier Wetty-based version of this, is a plain apk
+# package now, so it doesn't need this at all) -- diskless mode's root
+# is rebuilt from nothing but this tarball plus the local apk repo every
+# single boot, so anything under $OVL not captured here simply wouldn't
+# exist at runtime. (Created unconditionally above so this always has
+# something to archive, even on a build without Cloudflare enabled.)
 ( cd "$OVL" && COPYFILE_DISABLE=1 tar czf "../../work/$PI_HOSTNAME.apkovl.tar.gz" \
 	--owner=0 --group=0 etc var usr )
 

@@ -168,13 +168,13 @@ constexpr const char* CAMERA_USER_FILE = "/etc/camera_user";
 
 // This device's own randomly-generated non-root login -- see
 // create_admin_account() below. Plain username, not a secret; read by
-// wetty.initd at service-start time (see that file's own comment) to
-// know which account to force ssh into now that Wetty may be reachable
-// from the internet via Cloudflare Tunnel and root SSH login is
-// disabled image-wide (build-image.sh's sshd_config now ships
-// PermitRootLogin no unconditionally, not just for Wetty specifically
-// -- see that script's own comment on why a Wetty-only restriction
-// wouldn't actually be a real security boundary).
+// ttyd.initd at service-start time (see that file's own comment) to
+// know which account to connect as now that ttyd may be reachable from
+// the internet via Cloudflare Tunnel and root SSH login is disabled
+// image-wide (build-image.sh's sshd_config now ships PermitRootLogin no
+// unconditionally, not just for ttyd specifically -- see that script's
+// own comment on why a ttyd-only restriction wouldn't actually be a
+// real security boundary).
 constexpr const char* ADMIN_USER_FILE = "/etc/admin-user";
 // Its own file under Alpine's doas.d override directory, not a
 // shared /etc/doas.conf edit -- confirmed directly against a real doas
@@ -437,7 +437,7 @@ bool random_string(size_t len, const char* alphabet, std::string& out) {
 // at all in that case, since build-image.sh's sshd_config now ships
 // PermitRootLogin no unconditionally, so a device that somehow
 // finished without ever getting a working admin account would have no
-// valid SSH/Wetty login whatsoever.
+// valid SSH/ttyd login whatsoever.
 bool create_admin_account(std::string& out_user, std::string& out_pass) {
     std::string user, pass;
     // Lowercase-only, prefixed with a letter -- conservative enough to
@@ -964,7 +964,7 @@ int main(int argc, char** argv) {
                 // has just become true, rather than requiring a reboot
                 // to notice.
                 run_command({"rc-service", "pi-relay-control", "restart"});
-                run_command({"rc-service", "wetty", "restart"});
+                run_command({"rc-service", "ttyd", "restart"});
                 provision_cloudflare_async(serial);
                 // -d is load-bearing here too -- see do_forget's own
                 // comment on this exact flag.
@@ -980,7 +980,7 @@ int main(int argc, char** argv) {
         // synchronously.
         std::ofstream(MARKER_FILE).close();
         run_command({"rc-service", "pi-relay-control", "restart"});
-        run_command({"rc-service", "wetty", "restart"});
+        run_command({"rc-service", "ttyd", "restart"});
         provision_cloudflare_async(serial);
         auto commit = run_command({"lbu", "commit", "-d", "mmcblk0p1"});
         std::cerr << "[Main] lbu commit after finish: " << trim(commit.output) << "\n";

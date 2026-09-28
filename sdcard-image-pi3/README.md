@@ -243,41 +243,38 @@ Optional: `PI_HOSTNAME=whatever` (defaults to `aipicam`). Output is
 hash (`openssl passwd -6`) baked into the `apkovl`; the plaintext itself
 is never written to disk or committed anywhere. It's only usable at a
 physical keyboard/monitor plugged into the Pi, though -- root can't log
-in over SSH or Wetty at all; see "Logging in: the admin account, not
+in over SSH or ttyd at all; see "Logging in: the admin account, not
 root" below for how those actually work.
 
-## Web terminal (Wetty)
+## Web terminal (ttyd)
 
-Every image also bakes in [Wetty](https://github.com/butlerx/wetty), a
+Every image also bakes in [ttyd](https://github.com/tsl0922/ttyd), a
 browser-based terminal -- unconditional, not gated behind any env var,
 since it's useful over the LAN/fallback AP on its own (e.g. from a
 phone with no SSH client) even before you decide whether to also set up
-Cloudflare Tunnel below. Alpine doesn't package it (it's an npm
-package with a native addon, `node-pty`, not a single static binary),
-so `build-image.sh` runs `npm install` once at build time, for this
-image's own aarch64/musl target specifically (confirmed the compiled
-native binding is genuinely `ELF 64-bit LSB shared object, ARM
-aarch64`, not copied from anywhere), and bundles the result directly.
+Cloudflare Tunnel below. A plain apk package (~220KB, plain C via
+libwebsockets) -- no build step, no bundled runtime, and no risk on
+ARMv6 boards the way an earlier Wetty-based version of this had
+(Node.js/V8 hasn't properly supported ARMv6 in years; ttyd has no such
+dependency at all).
 
 Visit `http://<hostname>.local:3000` (or the Pi's IP) from any browser
-on the same LAN to get a full terminal -- Wetty spawns a real `ssh -t
-localhost` subprocess per connection (`--force-ssh`, see
-`wetty.initd`'s own comment for why that flag specifically matters when
-running as root against localhost), so it's gated by the exact same
-sshd as connecting with a regular SSH client -- this doesn't add or
-remove any authentication of its own, just another way to reach the
-same sshd. **Not root**, though, and not `ROOT_PASSWORD` either -- see
-"Logging in: the admin account, not root" below.
+on the same LAN to get a full terminal -- ttyd wraps a real `ssh -t
+localhost` subprocess per connection in a websocket+pty (see
+`ttyd.initd`'s own comment), so it's gated by the exact same sshd as
+connecting with a regular SSH client -- this doesn't add or remove any
+authentication of its own, just another way to reach the same sshd.
+**Not root**, though, and not `ROOT_PASSWORD` either -- see "Logging
+in: the admin account, not root" below.
 
 ## Logging in: the admin account, not root
 
-Root can no longer log in over SSH or Wetty at all (`PermitRootLogin
-no`, unconditional, not just for Wetty specifically -- see
-build-image.sh's own comment on why a Wetty-only restriction wouldn't
-actually be a real security boundary: Wetty's `--ssh-user` is a
-preference it applies to itself, not something a connecting client is
-bound by, and a raw `Remote-User` HTTP header or `/ssh/<user>` URL path
-can override it outright). `ROOT_PASSWORD` still gets hashed into
+Root can no longer log in over SSH or ttyd at all (`PermitRootLogin
+no`, unconditional, not just for ttyd specifically -- see
+build-image.sh's own comment on why that matters even though ttyd
+itself has no Wetty-style "smart" behavior to route around: it just
+runs the exact command line it's given, always). `ROOT_PASSWORD` still
+gets hashed into
 `/etc/shadow` every boot as before, but it's now only ever usable at a
 physical keyboard/monitor plugged directly into the Pi.
 
@@ -303,13 +300,13 @@ and letting the next `/finish` regenerate both from scratch.
 
 ## Remote access via Cloudflare Tunnel (optional)
 
-By default the Wetty terminal above (and SSH directly) are only
+By default the ttyd terminal above (and SSH directly) are only
 reachable while you're on the same LAN (or its own fallback AP). If you
 also want to reach it from anywhere -- e.g. it's deployed somewhere
 without you physically present -- `build-image.sh` can bake in
 [Cloudflare
 Tunnel](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/),
-entirely opt-in, routing straight to that same Wetty terminal. All four
+entirely opt-in, routing straight to that same ttyd terminal. All four
 of these must be set together:
 
 ```sh
@@ -352,8 +349,8 @@ owns every Cloudflare-specific detail: it looks for (and cleans up) any
 stale tunnel of the same name from an earlier interrupted attempt, then
 calls the Cloudflare API to create a fresh tunnel named after this
 device's serial, writes its credentials and an ingress rule mapping
-`<serial>.<CLOUDFLARE_DOMAIN>` to Wetty (`http://localhost:3000`, see
-"Web terminal (Wetty)" above) under `/etc/cloudflared/`, upserts the
+`<serial>.<CLOUDFLARE_DOMAIN>` to ttyd (`http://localhost:3000`, see
+"Web terminal (ttyd)" above) under `/etc/cloudflared/`, upserts the
 CNAME routing that hostname to the new tunnel, and only then enables
 and starts the `cloudflared` service.
 Retried roughly every 30s if any step fails (most likely: no internet
@@ -409,15 +406,15 @@ whatever account/zone scope you gave it. A device compromised *before*
 its first successful provisioning exposes that account/zone-wide
 capability (bounded by the token's own scope, hence scoping it tightly
 above); a device compromised *after* only exposes that one device's own
-tunnel credentials and its one Wetty endpoint, not the ability to touch
+tunnel credentials and its one ttyd endpoint, not the ability to touch
 your Cloudflare account further.
 
 Note also that a Cloudflare Tunnel by itself only provides
 *connectivity*, not *authentication* -- reaching the tunnel gets you to
-Wetty, which (via `--force-ssh`) is itself just another way to reach
-this Pi's own sshd, gated by the admin account's own password (root
-login is disabled outright -- see "Logging in: the admin account, not
-root" above) or SSH keys, same as LAN access. If you want an
+ttyd, which is itself just another way to reach this Pi's own sshd,
+gated by the admin account's own password (root login is disabled
+outright -- see "Logging in: the admin account, not root" above) or SSH
+keys, same as LAN access. If you want an
 identity-based access gate in front of it too (recommended for
 anything reachable from the public internet), configure a [Cloudflare
 Access application](https://developers.cloudflare.com/cloudflare-one/policies/access/)
@@ -483,7 +480,7 @@ Grab the result from the run's Artifacts section
   its fallback AP (SSID = the Pi's hardware serial) -- follow the normal
   setup flow in the iOS app from there. See the main
   [README](../README.md).
-- SSH/Wetty: neither works yet at this point -- root login is disabled
+- SSH/ttyd: neither works yet at this point -- root login is disabled
   entirely and the admin account doesn't exist until the app's wizard
   actually finishes (see "Logging in: the admin account, not root"
   above). Once it does, `ssh <user>@<hostname>.local` or
@@ -506,7 +503,7 @@ This daemon's fallback AP is deliberately open (no password) so a phone
 can join it during setup -- see the main README's Security model
 section. Anyone in range can join that same open network for however
 long the Pi is in fallback-AP mode, but that no longer buys them SSH or
-Wetty access the way it used to before this account model existed:
+ttyd access the way it used to before this account model existed:
 root login is disabled outright, and the admin account this image now
 relies on for everything doesn't exist until the app's own wizard
 actually finishes -- so there's genuinely nothing to log into yet at
@@ -529,9 +526,9 @@ down.
   artifacts standing in for the three real daemons) was verified
   end-to-end on this Mac: `fsck.fat` reports a clean filesystem, and the
   resulting apkovl was extracted and inspected directly to confirm it
-  actually contains what each feature is supposed to ship (Wetty's
-  compiled `node_modules`, the `cloudflared` binary matching its pinned
-  checksum byte-for-byte, correct runlevel wiring). Not yet run with the
+  actually contains what each feature is supposed to ship (the
+  `cloudflared` binary matching its pinned checksum byte-for-byte,
+  correct runlevel wiring). Not yet run with the
   real daemon artifacts or test-booted on real Pi 3 hardware -- please
   report back if you hit anything on first boot.
 - The `wpa_supplicant.conf`-gets-clobbered-every-boot fix (see "Config
@@ -544,14 +541,10 @@ down.
   board using the same `bcm2710`/`bcm2837`-family SoC); a Pi 4/5 would
   need its own verification even though the same aarch64 `.apk`s would
   technically install.
-- Wetty: the exact pinned `WETTY_VERSION` installs cleanly for
-  aarch64/musl and its native `node-pty` binding was confirmed to
-  actually be a freshly-compiled `ELF 64-bit LSB shared object, ARM
-  aarch64`, not a copied prebuilt for the wrong platform; a live
-  instance was confirmed to serve real HTTP traffic. The root-on-
-  localhost-spawns-`login`-instead-of-`ssh` behavior `--force-ssh`
-  works around was confirmed by reading Wetty's own installed source
-  directly, not assumed or inferred from its docs. Not yet exercised via
+- ttyd: confirmed directly (not assumed) that it's a plain apk package
+  on both aarch64 and armhf, with no build step needed, and that it
+  serves real HTTP traffic and binds `0.0.0.0` correctly when started
+  with the exact command line `ttyd.initd` uses. Not yet exercised via
   an actual browser session logging in over websockets end-to-end, and
   not yet tested on real hardware.
 - Admin account/doas: `adduser -D` + `openssl passwd -6` +

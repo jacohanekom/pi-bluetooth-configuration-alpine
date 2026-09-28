@@ -1,4 +1,10 @@
 #!/bin/sh
+# Identical to sdcard-image-pi3's own copy of this file -- genuinely
+# architecture-independent (plain OpenRC/shell, no aarch64-vs-armhf
+# distinction anywhere in it), so it's duplicated here rather than
+# shared from one place, matching this build's own self-contained-
+# per-image-directory convention (see sdcard-image-pi3.yml/
+# sdcard-image-pi-zero.yml, each `cd`-ing into its own directory).
 # Creates this device's own Cloudflare Tunnel and points
 # <serial>.<CLOUDFLARE_DOMAIN> at it, then starts cloudflared -- invoked
 # (and retried) by pi-bluetooth-configuration itself, see that repo's

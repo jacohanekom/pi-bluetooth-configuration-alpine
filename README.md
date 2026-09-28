@@ -135,7 +135,7 @@ wizard's remaining steps afterward either.
   post-reboot join's own outcome, which could leave a real device
   "finished" on disk despite WiFi never actually working, confirmed as a
   genuine, confusing state on real hardware. Once actually configured
-  (or already was), also restarts `pi-relay-control` and `wetty` (both
+  (or already was), also restarts `pi-relay-control` and `ttyd` (both
   may have already refused to fully start at boot, before this marker
   existed or before a real network did), gives Cloudflare Tunnel
   provisioning a fresh attempt, and commits via `lbu` so all of this
