@@ -30,10 +30,12 @@
  */
 #include <chrono>
 #include <fstream>
+#include <iostream>
 #include <sstream>
 #include <string>
 #include <thread>
 
+#include "dnsmasq_lock.hpp"
 #include "eth_control.hpp" // reuses network_prefix24/replace_marker_block
 #include "subprocess.hpp"
 
@@ -89,16 +91,6 @@ public:
             out << hostapd_conf.str();
         }
 
-        std::string prefix = ethctl::network_prefix24(ip_);
-        std::ostringstream dnsmasq_block;
-        dnsmasq_block << "interface=" << iface_ << "\n"
-                      << "bind-interfaces\n"
-                      << "dhcp-authoritative\n"
-                      << "dhcp-range=" << prefix << "." << range_start_ << ","
-                      << prefix << "." << range_end_ << ",255.255.255.0,1h\n"
-                      << "dhcp-option=option:dns-server," << ip_ << "\n";
-        ethctl::replace_marker_block(DNSMASQ_CONF, dnsmasq_block.str(), BEGIN_MARKER, END_MARKER);
-
         // Deliberately NOT `rc-update add`-ed into the default runlevel:
         // hostapd's lifecycle is entirely this daemon's own decision
         // (station mode first, AP only as a fallback -- see main.cpp's
@@ -113,11 +105,28 @@ public:
             return false;
         }
 
-        run_command({"rc-update", "add", "dnsmasq", "default"});
-        auto dnsmasq_restart = run_command({"rc-service", "dnsmasq", "restart"}, 20);
-        if (dnsmasq_restart.exit_code != 0) {
-            err = "dnsmasq failed to restart: " + dnsmasq_restart.output;
-            return false;
+        std::string prefix = ethctl::network_prefix24(ip_);
+        std::ostringstream dnsmasq_block;
+        dnsmasq_block << "interface=" << iface_ << "\n"
+                      << "bind-interfaces\n"
+                      << "dhcp-authoritative\n"
+                      << "dhcp-range=" << prefix << "." << range_start_ << ","
+                      << prefix << "." << range_end_ << ",255.255.255.0,1h\n"
+                      << "dhcp-option=option:dns-server," << ip_ << "\n";
+        // See dnsmasq_lock.hpp -- eth_control.hpp's set_static_ip() (the
+        // eth0/bridge gateway) touches this same file and this same
+        // service, so this whole sequence has to be exclusive with that
+        // too, not just internally atomic.
+        {
+            std::lock_guard<std::mutex> lock(dnsmasq_guard::mu);
+            ethctl::replace_marker_block(DNSMASQ_CONF, dnsmasq_block.str(), BEGIN_MARKER, END_MARKER);
+
+            run_command({"rc-update", "add", "dnsmasq", "default"});
+            auto dnsmasq_restart = run_command({"rc-service", "dnsmasq", "restart"}, 20);
+            if (dnsmasq_restart.exit_code != 0) {
+                err = "dnsmasq failed to restart: " + dnsmasq_restart.output;
+                return false;
+            }
         }
 
         running_ = true;
@@ -128,8 +137,21 @@ public:
     // called right before attempting to join a newly-submitted network.
     bool stop(std::string& err) {
         run_command({"rc-service", "hostapd", "stop"}, 15);
-        ethctl::replace_marker_block(DNSMASQ_CONF, "", BEGIN_MARKER, END_MARKER);
-        run_command({"rc-service", "dnsmasq", "restart"}, 20);
+        // See dnsmasq_lock.hpp and start()'s own comment above -- same
+        // exclusivity requirement applies here. Unlike start(), a failed
+        // restart here was previously left completely unchecked/
+        // unlogged -- worth surfacing now that it's a real, confirmed
+        // failure mode (this exact race, on real hardware with a USB
+        // Ethernet bridge attached), not just a theoretical one.
+        {
+            std::lock_guard<std::mutex> lock(dnsmasq_guard::mu);
+            ethctl::replace_marker_block(DNSMASQ_CONF, "", BEGIN_MARKER, END_MARKER);
+            auto dnsmasq_restart = run_command({"rc-service", "dnsmasq", "restart"}, 20);
+            if (dnsmasq_restart.exit_code != 0) {
+                std::cerr << "[AP] dnsmasq failed to restart while leaving AP mode: "
+                          << dnsmasq_restart.output << "\n";
+            }
+        }
         run_command({"ip", "addr", "flush", "dev", iface_});
 
         auto start = run_command({"rc-service", "wpa_supplicant", "start"}, 15);

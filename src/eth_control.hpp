@@ -88,6 +88,7 @@
 #include <string>
 #include <vector>
 
+#include "dnsmasq_lock.hpp"
 #include "subprocess.hpp"
 
 namespace ethctl {
@@ -351,14 +352,21 @@ public:
                        << "dhcp-range=" << prefix << "." << range_start << ","
                        << prefix << "." << range_end << ",255.255.255.0,12h\n"
                        << "dhcp-option=option:dns-server," << ip << "\n";
-        replace_marker_block(DNSMASQ_CONF, dnsmasq_block.str());
+        // See dnsmasq_lock.hpp -- ap_control.hpp's own start()/stop()
+        // touch this same file and this same service, so this whole
+        // read-modify-write-then-restart sequence has to be exclusive
+        // with those, not just internally atomic.
+        {
+            std::lock_guard<std::mutex> lock(dnsmasq_guard::mu);
+            replace_marker_block(DNSMASQ_CONF, dnsmasq_block.str());
 
-        run_command({"rc-update", "add", "dnsmasq", "default"});
-        run_command({"rc-service", "dnsmasq", "stop"});
-        auto start = run_command({"rc-service", "dnsmasq", "start"}, 20);
-        if (start.exit_code != 0) {
-            err = "dnsmasq failed to start: " + start.output;
-            return false;
+            run_command({"rc-update", "add", "dnsmasq", "default"});
+            run_command({"rc-service", "dnsmasq", "stop"});
+            auto start = run_command({"rc-service", "dnsmasq", "start"}, 20);
+            if (start.exit_code != 0) {
+                err = "dnsmasq failed to start: " + start.output;
+                return false;
+            }
         }
         return true;
     }
