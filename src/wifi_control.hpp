@@ -258,6 +258,27 @@ public:
     bool connect(const std::string& ssid, const std::string& psk) {
         using namespace wifi_detail;
 
+        // See network_lock.hpp -- held for this ENTIRE function. This is
+        // the only caller of connect() that ever matters for this lock
+        // (unlike ap_control.hpp's start(), it never runs at boot), so
+        // there's no boot-time responsiveness to protect the way
+        // start()'s own deliberately narrow scope does. Confirmed on
+        // real hardware that a narrower lock (just around the dhcpcd
+        // call below) wasn't enough: main.cpp's POST /ethernet
+        // (do_set_ethernet) and main.cpp's do_finish() firing moments
+        // apart still interleaved their rc-service calls around each
+        // narrow critical section, producing OpenRC's own "dnsmasq
+        // stopped by something else"/"already starting" -- genuinely
+        // overlapping rc-service invocations at the OS level, not just a
+        // C++-side race. Holding this for the whole function (through
+        // ap_control.hpp's own stop(), which does the same for the same
+        // reason) means a concurrent Ethernet reconfiguration simply
+        // waits for the entire live-join attempt to finish first, rather
+        // than competing with it (and its own CPU/USB load, on hardware
+        // with a real USB Ethernet bridge attached) for the single core
+        // this whole association/lease sequence is racing the clock on.
+        std::lock_guard<std::mutex> lock(network_guard::mu);
+
         remove_all_networks();
 
         auto add = run_command({"wpa_cli", "-i", iface_, "add_network"});
@@ -309,7 +330,17 @@ public:
 
         set_status(WifiStatus{WifiStatus::CONNECTING, ssid, "", ""});
 
-        const int poll_attempts = 20; // ~10s
+        // 30s, not the original 10s -- confirmed on real hardware (a Pi
+        // Zero W, single ARMv6 core, with a USB Ethernet bridge attached)
+        // that association can genuinely take longer than 10s under real
+        // concurrent CPU/USB load from that bridge's own setup, timing
+        // out here even though the credentials were entirely correct.
+        // This lock now keeps that contention from happening DURING the
+        // dhcpcd call below, but not during association itself (wpa_cli
+        // doesn't touch dhcpcd/dnsmasq/hostapd, so it isn't covered by
+        // this function's own lock scope) -- widening the timeout is the
+        // actual fix for that specific window.
+        const int poll_attempts = 60; // ~30s
         bool associated = false;
         for (int i = 0; i < poll_attempts; ++i) {
             auto st = run_command({"wpa_cli", "-i", iface_, "status"});
@@ -321,24 +352,10 @@ public:
             return false;
         }
 
-        // See network_lock.hpp -- held only for this call, not the whole
-        // function: this runs concurrently with (and was confirmed on
-        // real hardware to race against) ap_control.hpp's start()/stop()
-        // and eth_control.hpp's set_static_ip(), which all touch
-        // dhcpcd/dnsmasq/hostapd, the same shared, mutually-exclusive
-        // network-stack state this specific call depends on being
-        // settled. The wpa_cli setup and association poll above don't
-        // touch any of that, so they're deliberately left outside the
-        // lock -- holding it across the up-to-~10s association wait
-        // would otherwise block an unrelated Ethernet reconfiguration
-        // for no reason.
-        {
-            std::lock_guard<std::mutex> lock(network_guard::mu);
-            auto lease = run_command({"dhcpcd", "-q", "-t", "15", iface_}, 20);
-            if (lease.timed_out) {
-                fail("dhcpcd timed out waiting for a lease");
-                return false;
-            }
+        auto lease = run_command({"dhcpcd", "-q", "-t", "20", iface_}, 25);
+        if (lease.timed_out) {
+            fail("dhcpcd timed out waiting for a lease");
+            return false;
         }
 
         std::string ip = read_ipv4_address();

@@ -149,27 +149,39 @@ public:
     // Tears the AP back down and hands wlan0 back to wpa_supplicant --
     // called right before attempting to join a newly-submitted network.
     bool stop(std::string& err) {
-        // See network_lock.hpp and start()'s own comment above -- same
-        // narrow scope (hostapd stop through dnsmasq restart only, not
-        // this whole function) for the same reason: the trailing
-        // wpa_supplicant restart/ready-poll below doesn't touch
-        // dhcpcd/dnsmasq/hostapd, so it doesn't need this exclusivity
-        // and shouldn't be held up by (or hold up) set_static_ip()'s own
-        // slower, unrelated bridge-setup steps.
-        {
-            std::lock_guard<std::mutex> lock(network_guard::mu);
-            run_command({"rc-service", "hostapd", "stop"}, 15);
-            // Unlike start(), a failed restart here was previously left
-            // completely unchecked/unlogged -- worth surfacing now that
-            // it's a real, confirmed failure mode (this exact race, on
-            // real hardware with a USB Ethernet bridge attached), not
-            // just a theoretical one.
-            ethctl::replace_marker_block(DNSMASQ_CONF, "", BEGIN_MARKER, END_MARKER);
-            auto dnsmasq_restart = run_command({"rc-service", "dnsmasq", "restart"}, 20);
-            if (dnsmasq_restart.exit_code != 0) {
-                std::cerr << "[AP] dnsmasq failed to restart while leaving AP mode: "
-                          << dnsmasq_restart.output << "\n";
-            }
+        // See network_lock.hpp -- held for this ENTIRE function, unlike
+        // start()'s deliberately narrow scope. The difference: start()
+        // runs at boot (racing eth_control.hpp's own boot-time Ethernet-
+        // bridge setup thread, which must never be blocked from
+        // finishing so the fallback AP can come up promptly), while
+        // stop() only ever runs later, from main.cpp's do_finish() --
+        // there's no boot-time caller to keep responsive here. Confirmed
+        // on real hardware that a narrow lock wasn't enough on its own:
+        // main.cpp's POST /ethernet (do_set_ethernet, its own detached
+        // thread) and do_finish()'s live-join thread firing moments apart
+        // still interleaved their individual rc-service calls just
+        // outside each narrow critical section, producing OpenRC's own
+        // "dnsmasq stopped by something else"/"dnsmasq is already
+        // starting" -- i.e. two genuinely overlapping rc-service
+        // invocations at the OS level, not just a C++-side race. Holding
+        // this for the whole function (through wifi_control.hpp's own
+        // connect(), which does the same for the same reason) means a
+        // concurrent Ethernet reconfiguration simply waits for the
+        // entire live-join attempt to finish first, rather than racing
+        // any part of it.
+        std::lock_guard<std::mutex> lock(network_guard::mu);
+
+        run_command({"rc-service", "hostapd", "stop"}, 15);
+        // Unlike start(), a failed restart here was previously left
+        // completely unchecked/unlogged -- worth surfacing now that
+        // it's a real, confirmed failure mode (this exact race, on
+        // real hardware with a USB Ethernet bridge attached), not
+        // just a theoretical one.
+        ethctl::replace_marker_block(DNSMASQ_CONF, "", BEGIN_MARKER, END_MARKER);
+        auto dnsmasq_restart = run_command({"rc-service", "dnsmasq", "restart"}, 20);
+        if (dnsmasq_restart.exit_code != 0) {
+            std::cerr << "[AP] dnsmasq failed to restart while leaving AP mode: "
+                      << dnsmasq_restart.output << "\n";
         }
         run_command({"ip", "addr", "flush", "dev", iface_});
 
