@@ -263,16 +263,6 @@ public:
             return false;
         }
 
-        // See network_lock.hpp -- held for this entire function, not just
-        // the dnsmasq-touching lines below: this function also restarts
-        // dhcpcd directly, and ap_control.hpp's start()/stop() (the WiFi
-        // fallback AP) both depend on dhcpcd being in a settled state via
-        // OpenRC's `need net` and also touch this same dnsmasq.conf --
-        // confirmed on real hardware that letting the two race produces
-        // exactly "cannot start dnsmasq/hostapd as dhcpcd would not
-        // start".
-        std::lock_guard<std::mutex> lock(network_guard::mu);
-
         std::string prefix = network_prefix24(ip);
 
         {
@@ -292,7 +282,26 @@ public:
         if (have_iface2) dhcpcd_block << " " << iface2_;
         dhcpcd_block << " " << BRIDGE_NAME << "\n";
         replace_marker_block(DHCPCD_CONF, dhcpcd_block.str());
-        run_command({"rc-service", "dhcpcd", "restart"}, 20);
+        // See network_lock.hpp -- held only for this restart, not the
+        // whole function: ap_control.hpp's start()/stop() (the WiFi
+        // fallback AP) and wifi_control.hpp's connect() all depend on
+        // dhcpcd being in a settled state via OpenRC's `need net`, or
+        // touch it directly -- confirmed on real hardware that letting
+        // those race with this exact restart produces "cannot start
+        // dnsmasq/hostapd as dhcpcd would not start" and a WiFi join
+        // that associates but never gets an IP. Scoped narrowly (not the
+        // whole function) after ALSO confirming on real hardware that a
+        // wider lock here creates a worse regression: the bridge
+        // creation/STP-disable/interface-enslavement steps below are
+        // slow and deliberately run on their own detached thread at boot
+        // specifically so they never block the WiFi AP from starting --
+        // holding this lock across them serializes this function behind
+        // ap_control.hpp's own start(), which can leave the fallback AP
+        // simply never starting while this thread is still running.
+        {
+            std::lock_guard<std::mutex> lock(network_guard::mu);
+            run_command({"rc-service", "dhcpcd", "restart"}, 20);
+        }
 
         // Bridge eth0 (and the second interface, if configured and
         // actually present) into one local network -- see this file's
@@ -364,12 +373,17 @@ public:
                        << "dhcp-option=option:dns-server," << ip << "\n";
         replace_marker_block(DNSMASQ_CONF, dnsmasq_block.str());
 
-        run_command({"rc-update", "add", "dnsmasq", "default"});
-        run_command({"rc-service", "dnsmasq", "stop"});
-        auto start = run_command({"rc-service", "dnsmasq", "start"}, 20);
-        if (start.exit_code != 0) {
-            err = "dnsmasq failed to start: " + start.output;
-            return false;
+        // See network_lock.hpp and the dhcpcd restart above -- same
+        // narrow-scope reasoning.
+        {
+            std::lock_guard<std::mutex> lock(network_guard::mu);
+            run_command({"rc-update", "add", "dnsmasq", "default"});
+            run_command({"rc-service", "dnsmasq", "stop"});
+            auto start = run_command({"rc-service", "dnsmasq", "start"}, 20);
+            if (start.exit_code != 0) {
+                err = "dnsmasq failed to start: " + start.output;
+                return false;
+            }
         }
         return true;
     }

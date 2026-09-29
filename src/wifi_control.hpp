@@ -258,15 +258,6 @@ public:
     bool connect(const std::string& ssid, const std::string& psk) {
         using namespace wifi_detail;
 
-        // See network_lock.hpp -- held for this entire function, not just
-        // the dhcpcd call below: this runs concurrently with (and was
-        // confirmed on real hardware to race against) ap_control.hpp's
-        // start()/stop() and eth_control.hpp's set_static_ip(), which all
-        // touch dhcpcd/dnsmasq/hostapd, the same shared, mutually-
-        // exclusive network-stack state this function's own `dhcpcd -q`
-        // call at the bottom depends on being settled.
-        std::lock_guard<std::mutex> lock(network_guard::mu);
-
         remove_all_networks();
 
         auto add = run_command({"wpa_cli", "-i", iface_, "add_network"});
@@ -330,10 +321,24 @@ public:
             return false;
         }
 
-        auto lease = run_command({"dhcpcd", "-q", "-t", "15", iface_}, 20);
-        if (lease.timed_out) {
-            fail("dhcpcd timed out waiting for a lease");
-            return false;
+        // See network_lock.hpp -- held only for this call, not the whole
+        // function: this runs concurrently with (and was confirmed on
+        // real hardware to race against) ap_control.hpp's start()/stop()
+        // and eth_control.hpp's set_static_ip(), which all touch
+        // dhcpcd/dnsmasq/hostapd, the same shared, mutually-exclusive
+        // network-stack state this specific call depends on being
+        // settled. The wpa_cli setup and association poll above don't
+        // touch any of that, so they're deliberately left outside the
+        // lock -- holding it across the up-to-~10s association wait
+        // would otherwise block an unrelated Ethernet reconfiguration
+        // for no reason.
+        {
+            std::lock_guard<std::mutex> lock(network_guard::mu);
+            auto lease = run_command({"dhcpcd", "-q", "-t", "15", iface_}, 20);
+            if (lease.timed_out) {
+                fail("dhcpcd timed out waiting for a lease");
+                return false;
+            }
         }
 
         std::string ip = read_ipv4_address();

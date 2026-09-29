@@ -55,16 +55,6 @@ public:
     // old BLE-advertised name used) so multiple units are distinguishable
     // in a phone's WiFi network list, same reasoning as before.
     bool start(const std::string& ssid, std::string& err) {
-        // See network_lock.hpp -- held for this entire function, not just
-        // the dnsmasq-touching lines: hostapd/dnsmasq both depend on
-        // dhcpcd via OpenRC's `need net`, and eth_control.hpp's
-        // set_static_ip() (the eth0/bridge gateway) restarts dhcpcd
-        // directly -- confirmed on real hardware that letting the two
-        // run concurrently can leave dhcpcd mid-restart exactly when
-        // this function's own hostapd/dnsmasq start attempts need it,
-        // failing both with "cannot start X as dhcpcd would not start".
-        std::lock_guard<std::mutex> lock(network_guard::mu);
-
         // wpa_supplicant and hostapd can't both hold the radio -- get the
         // former out of the way first. Harmless if it wasn't running
         // (e.g. a fresh boot with nothing configured at all, where it
@@ -108,6 +98,26 @@ public:
         // Leaving hostapd there would mean it starts automatically on
         // every *future* boot too, racing this daemon's own wlan0 setup
         // regardless of whether AP mode is actually needed that time.
+        //
+        // See network_lock.hpp -- held from here through the dnsmasq
+        // restart below, NOT this whole function: hostapd and dnsmasq
+        // both depend on dhcpcd via OpenRC's `need net`, and
+        // eth_control.hpp's set_static_ip() (the eth0/bridge gateway)
+        // restarts dhcpcd directly -- confirmed on real hardware that
+        // letting the two race leaves dhcpcd mid-restart exactly when
+        // this function's own hostapd/dnsmasq start attempts need it,
+        // failing both with "cannot start X as dhcpcd would not start".
+        // Scoped this narrowly (not the whole function) after ALSO
+        // confirming on real hardware that a wider lock creates a worse
+        // regression: it serializes this function entirely behind
+        // set_static_ip()'s own bridge-creation/STP-disable steps (slow,
+        // and deliberately run on their own detached thread at boot so
+        // they never block the AP from starting), which can leave the
+        // fallback AP simply never starting if that thread is still
+        // running -- the earlier wpa_supplicant-stop/ip-addr/hostapd-conf
+        // steps above don't touch dhcpcd/dnsmasq/hostapd at all, so they
+        // don't need this exclusivity either.
+        std::lock_guard<std::mutex> lock(network_guard::mu);
         run_command({"rc-service", "hostapd", "stop"});
         auto hostapd_start = run_command({"rc-service", "hostapd", "start"}, 20);
         if (hostapd_start.exit_code != 0) {
@@ -140,20 +150,26 @@ public:
     // called right before attempting to join a newly-submitted network.
     bool stop(std::string& err) {
         // See network_lock.hpp and start()'s own comment above -- same
-        // exclusivity requirement applies here, for this whole function.
-        std::lock_guard<std::mutex> lock(network_guard::mu);
-
-        run_command({"rc-service", "hostapd", "stop"}, 15);
-        // Unlike start(), a failed restart here was previously left
-        // completely unchecked/unlogged -- worth surfacing now that it's
-        // a real, confirmed failure mode (this exact race, on real
-        // hardware with a USB Ethernet bridge attached), not just a
-        // theoretical one.
-        ethctl::replace_marker_block(DNSMASQ_CONF, "", BEGIN_MARKER, END_MARKER);
-        auto dnsmasq_restart = run_command({"rc-service", "dnsmasq", "restart"}, 20);
-        if (dnsmasq_restart.exit_code != 0) {
-            std::cerr << "[AP] dnsmasq failed to restart while leaving AP mode: "
-                      << dnsmasq_restart.output << "\n";
+        // narrow scope (hostapd stop through dnsmasq restart only, not
+        // this whole function) for the same reason: the trailing
+        // wpa_supplicant restart/ready-poll below doesn't touch
+        // dhcpcd/dnsmasq/hostapd, so it doesn't need this exclusivity
+        // and shouldn't be held up by (or hold up) set_static_ip()'s own
+        // slower, unrelated bridge-setup steps.
+        {
+            std::lock_guard<std::mutex> lock(network_guard::mu);
+            run_command({"rc-service", "hostapd", "stop"}, 15);
+            // Unlike start(), a failed restart here was previously left
+            // completely unchecked/unlogged -- worth surfacing now that
+            // it's a real, confirmed failure mode (this exact race, on
+            // real hardware with a USB Ethernet bridge attached), not
+            // just a theoretical one.
+            ethctl::replace_marker_block(DNSMASQ_CONF, "", BEGIN_MARKER, END_MARKER);
+            auto dnsmasq_restart = run_command({"rc-service", "dnsmasq", "restart"}, 20);
+            if (dnsmasq_restart.exit_code != 0) {
+                std::cerr << "[AP] dnsmasq failed to restart while leaving AP mode: "
+                          << dnsmasq_restart.output << "\n";
+            }
         }
         run_command({"ip", "addr", "flush", "dev", iface_});
 
