@@ -132,7 +132,7 @@ echo "==> Building the apkovl overlay"
 OVL=work/apkovl
 mkdir -p "$OVL"/etc/apk/keys "$OVL"/etc/apk/protected_paths.d \
 	"$OVL"/etc/runlevels/boot "$OVL"/etc/runlevels/default "$OVL"/etc/runlevels/shutdown \
-	"$OVL"/etc/init.d "$OVL"/etc/local.d "$OVL"/etc/doas.d "$OVL"/var/lib \
+	"$OVL"/etc/init.d "$OVL"/etc/local.d "$OVL"/etc/doas.d "$OVL"/var/lib "$OVL"/var/log \
 	"$OVL"/usr/local/bin
 
 cp "work/repo/$REPO_KEY" "$OVL/etc/apk/keys/"
@@ -267,6 +267,10 @@ chmod +x "$OVL/etc/local.d/aipicam-setup.start"
 
 ln -sf /media/mmcblk0p1/relay-state "$OVL/var/lib/relay_control"
 
+# Same reasoning, for the daemon's own log -- see sdcard-image-pi3's own
+# build-image.sh comment on this exact symlink.
+ln -sf /media/mmcblk0p1/pi-bluetooth-configuration.log "$OVL/var/log/pi-bluetooth-configuration.log"
+
 ( cd "$OVL" && COPYFILE_DISABLE=1 tar czf "../../work/$PI_HOSTNAME.apkovl.tar.gz" \
 	--owner=0 --group=0 etc var usr )
 
@@ -278,6 +282,7 @@ cp "work/repo/$REPO_KEY" work/bootfs/apks/
 touch work/bootfs/apks/.boot_repository
 cp "work/$PI_HOSTNAME.apkovl.tar.gz" work/bootfs/
 mkdir -p work/bootfs/relay-state
+touch work/bootfs/pi-bluetooth-configuration.log
 
 # ── 5. Build the final single-partition .img ────────────────────────────────
 echo "==> Building the final .img"

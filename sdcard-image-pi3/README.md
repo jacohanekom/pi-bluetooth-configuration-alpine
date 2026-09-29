@@ -152,6 +152,15 @@ for two different classes of state:
   `/media/mmcblk0p1/relay-state`, a directory pre-created directly on
   the boot partition (the actual SD card content, mounted read-write
   for the whole time the system runs).
+- **The daemon's own log** (`/var/log/pi-bluetooth-configuration.log`)
+  is handled the same way -- symlinked to
+  `/media/mmcblk0p1/pi-bluetooth-configuration.log` -- so it's still
+  there after a reboot instead of vanishing with the rest of tmpfs, the
+  same way it did while debugging a live-join failure that only showed
+  up after a reboot in the first place. Not rotated or size-capped; it's
+  a debugging aid, not a production log, so clear it by hand
+  (`> /var/log/pi-bluetooth-configuration.log`, or delete the file on
+  the boot partition) if it grows large.
 
 An **unclean** power loss (pulling power rather than the app's own
 controlled reboot) skips the commit entirely -- whatever changed since

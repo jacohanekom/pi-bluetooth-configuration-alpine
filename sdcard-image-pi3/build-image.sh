@@ -169,7 +169,7 @@ echo "==> Building the apkovl overlay"
 OVL=work/apkovl
 mkdir -p "$OVL"/etc/apk/keys "$OVL"/etc/apk/protected_paths.d \
 	"$OVL"/etc/runlevels/boot "$OVL"/etc/runlevels/default "$OVL"/etc/runlevels/shutdown \
-	"$OVL"/etc/init.d "$OVL"/etc/local.d "$OVL"/etc/doas.d "$OVL"/var/lib \
+	"$OVL"/etc/init.d "$OVL"/etc/local.d "$OVL"/etc/doas.d "$OVL"/var/lib "$OVL"/var/log \
 	"$OVL"/usr/local/bin
 
 cp "work/repo/$REPO_KEY" "$OVL/etc/apk/keys/"
@@ -421,6 +421,19 @@ chmod +x "$OVL/etc/local.d/aipicam-setup.start"
 # The target directory is pre-created on the boot partition below.
 ln -sf /media/mmcblk0p1/relay-state "$OVL/var/lib/relay_control"
 
+# Same reasoning, for the daemon's own log: OpenRC's supervise-daemon
+# writes it straight to /var/log/pi-bluetooth-configuration.log (see
+# openrc/pi-bluetooth-configuration.initd's output_log/error_log), which
+# diskless mode would otherwise silently wipe on every single reboot --
+# exactly the situation that made debugging a real live-join failure on
+# a Pi Zero W needlessly slow (the log the fix depended on was only
+# ever available for the current, not-yet-rebooted boot). The empty
+# file precreated on the boot partition below just gives supervise-
+# daemon something to open()/append to immediately; nothing here caps
+# its growth, so treat it as a debugging aid to `rm` occasionally by
+# hand, not a rotated production log.
+ln -sf /media/mmcblk0p1/pi-bluetooth-configuration.log "$OVL/var/log/pi-bluetooth-configuration.log"
+
 # COPYFILE_DISABLE=1 stops macOS's tar from polluting the archive with
 # a ._<name> AppleDouble sidecar file for every single entry (its way
 # of representing extended attributes in plain POSIX tar) -- harmless
@@ -452,6 +465,7 @@ cp "work/repo/$REPO_KEY" work/bootfs/apks/
 touch work/bootfs/apks/.boot_repository
 cp "work/$PI_HOSTNAME.apkovl.tar.gz" work/bootfs/
 mkdir -p work/bootfs/relay-state
+touch work/bootfs/pi-bluetooth-configuration.log
 
 # ── 5. Build the final single-partition .img ────────────────────────────────
 # Diskless mode needs only one FAT32 partition (kernel, apks/, apkovl --
