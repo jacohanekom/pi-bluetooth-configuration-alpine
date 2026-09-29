@@ -35,8 +35,8 @@
 #include <string>
 #include <thread>
 
-#include "dnsmasq_lock.hpp"
 #include "eth_control.hpp" // reuses network_prefix24/replace_marker_block
+#include "network_lock.hpp"
 #include "subprocess.hpp"
 
 namespace apctl {
@@ -55,6 +55,16 @@ public:
     // old BLE-advertised name used) so multiple units are distinguishable
     // in a phone's WiFi network list, same reasoning as before.
     bool start(const std::string& ssid, std::string& err) {
+        // See network_lock.hpp -- held for this entire function, not just
+        // the dnsmasq-touching lines: hostapd/dnsmasq both depend on
+        // dhcpcd via OpenRC's `need net`, and eth_control.hpp's
+        // set_static_ip() (the eth0/bridge gateway) restarts dhcpcd
+        // directly -- confirmed on real hardware that letting the two
+        // run concurrently can leave dhcpcd mid-restart exactly when
+        // this function's own hostapd/dnsmasq start attempts need it,
+        // failing both with "cannot start X as dhcpcd would not start".
+        std::lock_guard<std::mutex> lock(network_guard::mu);
+
         // wpa_supplicant and hostapd can't both hold the radio -- get the
         // former out of the way first. Harmless if it wasn't running
         // (e.g. a fresh boot with nothing configured at all, where it
@@ -113,20 +123,13 @@ public:
                       << "dhcp-range=" << prefix << "." << range_start_ << ","
                       << prefix << "." << range_end_ << ",255.255.255.0,1h\n"
                       << "dhcp-option=option:dns-server," << ip_ << "\n";
-        // See dnsmasq_lock.hpp -- eth_control.hpp's set_static_ip() (the
-        // eth0/bridge gateway) touches this same file and this same
-        // service, so this whole sequence has to be exclusive with that
-        // too, not just internally atomic.
-        {
-            std::lock_guard<std::mutex> lock(dnsmasq_guard::mu);
-            ethctl::replace_marker_block(DNSMASQ_CONF, dnsmasq_block.str(), BEGIN_MARKER, END_MARKER);
+        ethctl::replace_marker_block(DNSMASQ_CONF, dnsmasq_block.str(), BEGIN_MARKER, END_MARKER);
 
-            run_command({"rc-update", "add", "dnsmasq", "default"});
-            auto dnsmasq_restart = run_command({"rc-service", "dnsmasq", "restart"}, 20);
-            if (dnsmasq_restart.exit_code != 0) {
-                err = "dnsmasq failed to restart: " + dnsmasq_restart.output;
-                return false;
-            }
+        run_command({"rc-update", "add", "dnsmasq", "default"});
+        auto dnsmasq_restart = run_command({"rc-service", "dnsmasq", "restart"}, 20);
+        if (dnsmasq_restart.exit_code != 0) {
+            err = "dnsmasq failed to restart: " + dnsmasq_restart.output;
+            return false;
         }
 
         running_ = true;
@@ -136,21 +139,21 @@ public:
     // Tears the AP back down and hands wlan0 back to wpa_supplicant --
     // called right before attempting to join a newly-submitted network.
     bool stop(std::string& err) {
+        // See network_lock.hpp and start()'s own comment above -- same
+        // exclusivity requirement applies here, for this whole function.
+        std::lock_guard<std::mutex> lock(network_guard::mu);
+
         run_command({"rc-service", "hostapd", "stop"}, 15);
-        // See dnsmasq_lock.hpp and start()'s own comment above -- same
-        // exclusivity requirement applies here. Unlike start(), a failed
-        // restart here was previously left completely unchecked/
-        // unlogged -- worth surfacing now that it's a real, confirmed
-        // failure mode (this exact race, on real hardware with a USB
-        // Ethernet bridge attached), not just a theoretical one.
-        {
-            std::lock_guard<std::mutex> lock(dnsmasq_guard::mu);
-            ethctl::replace_marker_block(DNSMASQ_CONF, "", BEGIN_MARKER, END_MARKER);
-            auto dnsmasq_restart = run_command({"rc-service", "dnsmasq", "restart"}, 20);
-            if (dnsmasq_restart.exit_code != 0) {
-                std::cerr << "[AP] dnsmasq failed to restart while leaving AP mode: "
-                          << dnsmasq_restart.output << "\n";
-            }
+        // Unlike start(), a failed restart here was previously left
+        // completely unchecked/unlogged -- worth surfacing now that it's
+        // a real, confirmed failure mode (this exact race, on real
+        // hardware with a USB Ethernet bridge attached), not just a
+        // theoretical one.
+        ethctl::replace_marker_block(DNSMASQ_CONF, "", BEGIN_MARKER, END_MARKER);
+        auto dnsmasq_restart = run_command({"rc-service", "dnsmasq", "restart"}, 20);
+        if (dnsmasq_restart.exit_code != 0) {
+            std::cerr << "[AP] dnsmasq failed to restart while leaving AP mode: "
+                      << dnsmasq_restart.output << "\n";
         }
         run_command({"ip", "addr", "flush", "dev", iface_});
 

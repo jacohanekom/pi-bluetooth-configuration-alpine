@@ -28,6 +28,7 @@
 
 #include <openssl/evp.h>
 
+#include "network_lock.hpp"
 #include "subprocess.hpp"
 
 constexpr const char* WPA_SUPPLICANT_CONF = "/etc/wpa_supplicant/wpa_supplicant.conf";
@@ -256,6 +257,15 @@ public:
     // and updates get_status() as it progresses.
     bool connect(const std::string& ssid, const std::string& psk) {
         using namespace wifi_detail;
+
+        // See network_lock.hpp -- held for this entire function, not just
+        // the dhcpcd call below: this runs concurrently with (and was
+        // confirmed on real hardware to race against) ap_control.hpp's
+        // start()/stop() and eth_control.hpp's set_static_ip(), which all
+        // touch dhcpcd/dnsmasq/hostapd, the same shared, mutually-
+        // exclusive network-stack state this function's own `dhcpcd -q`
+        // call at the bottom depends on being settled.
+        std::lock_guard<std::mutex> lock(network_guard::mu);
 
         remove_all_networks();
 

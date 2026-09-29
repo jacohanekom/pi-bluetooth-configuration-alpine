@@ -88,7 +88,7 @@
 #include <string>
 #include <vector>
 
-#include "dnsmasq_lock.hpp"
+#include "network_lock.hpp"
 #include "subprocess.hpp"
 
 namespace ethctl {
@@ -263,6 +263,16 @@ public:
             return false;
         }
 
+        // See network_lock.hpp -- held for this entire function, not just
+        // the dnsmasq-touching lines below: this function also restarts
+        // dhcpcd directly, and ap_control.hpp's start()/stop() (the WiFi
+        // fallback AP) both depend on dhcpcd being in a settled state via
+        // OpenRC's `need net` and also touch this same dnsmasq.conf --
+        // confirmed on real hardware that letting the two race produces
+        // exactly "cannot start dnsmasq/hostapd as dhcpcd would not
+        // start".
+        std::lock_guard<std::mutex> lock(network_guard::mu);
+
         std::string prefix = network_prefix24(ip);
 
         {
@@ -352,21 +362,14 @@ public:
                        << "dhcp-range=" << prefix << "." << range_start << ","
                        << prefix << "." << range_end << ",255.255.255.0,12h\n"
                        << "dhcp-option=option:dns-server," << ip << "\n";
-        // See dnsmasq_lock.hpp -- ap_control.hpp's own start()/stop()
-        // touch this same file and this same service, so this whole
-        // read-modify-write-then-restart sequence has to be exclusive
-        // with those, not just internally atomic.
-        {
-            std::lock_guard<std::mutex> lock(dnsmasq_guard::mu);
-            replace_marker_block(DNSMASQ_CONF, dnsmasq_block.str());
+        replace_marker_block(DNSMASQ_CONF, dnsmasq_block.str());
 
-            run_command({"rc-update", "add", "dnsmasq", "default"});
-            run_command({"rc-service", "dnsmasq", "stop"});
-            auto start = run_command({"rc-service", "dnsmasq", "start"}, 20);
-            if (start.exit_code != 0) {
-                err = "dnsmasq failed to start: " + start.output;
-                return false;
-            }
+        run_command({"rc-update", "add", "dnsmasq", "default"});
+        run_command({"rc-service", "dnsmasq", "stop"});
+        auto start = run_command({"rc-service", "dnsmasq", "start"}, 20);
+        if (start.exit_code != 0) {
+            err = "dnsmasq failed to start: " + start.output;
+            return false;
         }
         return true;
     }

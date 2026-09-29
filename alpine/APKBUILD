@@ -37,7 +37,7 @@ prepare() {
 	cp "$startdir"/../src/config.hpp "$srcdir"/config.hpp
 	cp "$startdir"/../src/ap_control.hpp "$srcdir"/ap_control.hpp
 	cp "$startdir"/../src/eth_control.hpp "$srcdir"/eth_control.hpp
-	cp "$startdir"/../src/dnsmasq_lock.hpp "$srcdir"/dnsmasq_lock.hpp
+	cp "$startdir"/../src/network_lock.hpp "$srcdir"/network_lock.hpp
 	cp "$startdir"/../src/http_server.hpp "$srcdir"/http_server.hpp
 	cp "$startdir"/../src/mdns_responder.hpp "$srcdir"/mdns_responder.hpp
 	cp "$startdir"/../src/relay_control.hpp "$srcdir"/relay_control.hpp
