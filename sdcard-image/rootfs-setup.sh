@@ -21,7 +21,7 @@ apk add --no-cache \
 	linux-firmware-brcm wireless-regdb \
 	wpa_supplicant wpa_supplicant-openrc \
 	dhcpcd dhcpcd-openrc \
-	iproute2 dnsmasq dnsmasq-openrc iptables hostapd hostapd-openrc \
+	iproute2 dnsmasq dnsmasq-openrc iptables \
 	libcrypto3 \
 	e2fsprogs util-linux \
 	openssh-server openssh-server-common \
@@ -45,7 +45,8 @@ apk add --no-cache --allow-untrusted \
 
 # Root login: password-based SSH access, explicitly requested over a
 # pubkey-only or no-SSH setup -- see the README's Security note about why
-# this matters while the fallback AP is open. Written directly into
+# this matters given pi-bluetooth-configuration's own unauthenticated
+# HTTP API. Written directly into
 # /etc/shadow rather than `chpasswd` so no plaintext ever touches disk or
 # shell history, even transiently.
 awk -v h="$ROOT_HASH" 'BEGIN{FS=OFS=":"} $1=="root"{$2=h} {print}' /etc/shadow > /etc/shadow.new

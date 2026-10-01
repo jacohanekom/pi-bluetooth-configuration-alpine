@@ -18,8 +18,9 @@
  * itself browses or resolves *other* services on the network.
  *
  * Advertises (instance and hostname are both this Pi's own hardware
- * serial, same as the fallback AP's own SSID -- see ap_control.hpp --
- * so multiple aipicam units are distinguishable the same way):
+ * serial, same as its system hostname -- see main.cpp's
+ * set_hostname_from_serial -- so multiple aipicam units are
+ * distinguishable from each other):
  *   PTR   _aipicam._tcp.local.             -> <instance>._aipicam._tcp.local.
  *   SRV   <instance>._aipicam._tcp.local.  -> <instance>.local.:<port>
  *   TXT   <instance>._aipicam._tcp.local.  -> (empty)
@@ -31,8 +32,8 @@
  *
  * Answers queries for the above on demand and re-announces (unsolicited
  * responses) a few times after startup and whenever this Pi's own set of
- * IPv4 addresses changes (WiFi joining/leaving, AP mode starting/
- * stopping, Ethernet being plugged in), per RFC 6762 section 8.3, so a
+ * IPv4 addresses changes (WiFi joining/leaving, Ethernet being plugged
+ * in), per RFC 6762 section 8.3, so a
  * client already browsing notices without needing to re-query. No
  * probing (RFC 6762 section 8.1): the advertised name is always this
  * Pi's own unique hardware serial, so a same-name conflict on the
@@ -47,7 +48,7 @@
  *
  * Linux-only (IP_PKTINFO/ip_mreqn, both Linux-specific) -- consistent
  * with the rest of this codebase, which already assumes a Linux/Alpine
- * target throughout (ap_control.hpp's `ip`/`rc-service` calls,
+ * target throughout (eth_control.hpp's `ip`/`rc-service` calls,
  * subprocess.hpp's fork/exec model). The wire-format pieces (DnsWriter,
  * parse_name/parse_questions, build_full_response) have no such
  * dependency and were verified independently, on macOS, against Apple's
@@ -457,9 +458,9 @@ private:
         }
 
         // Thereafter, only re-announce when this Pi's own address set
-        // actually changes (WiFi joining/leaving, AP mode toggling,
-        // Ethernet appearing) -- not on every tick, which would just
-        // needlessly spam the network with identical, unchanged data.
+        // actually changes (WiFi joining/leaving, Ethernet appearing) --
+        // not on every tick, which would just needlessly spam the
+        // network with identical, unchanged data.
         while (running_) {
             for (int i = 0; i < 100 && running_; ++i) { // ~10s, in short slices so stop() isn't delayed
                 std::this_thread::sleep_for(std::chrono::milliseconds(100));

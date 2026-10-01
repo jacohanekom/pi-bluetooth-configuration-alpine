@@ -10,18 +10,19 @@ jobs:
     # Genuinely aarch64 hardware (no QEMU) -- matches the actual deploy
     # target and keeps the container build a native compile rather than
     # an emulated cross-build. Note this only proves the code compiles and
-    # links -- there's no real WiFi radio or hostapd/dnsmasq runtime on
-    # this runner, so the actual AP-fallback flow (ap_control.hpp) can
-    # only be exercised on an actual Pi.
+    # links -- there's no real WiFi radio or dnsmasq runtime on this
+    # runner, so the actual WiFi-join flow can only be exercised on an
+    # actual Pi.
     runs-on: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v4
 
       # openssl-dev is a normal Alpine package -- there's nothing to
       # fetch and build from source here. No dbus-dev: setup is done
-      # entirely over the Pi's own onboard WiFi (station mode, falling
-      # back to a hostapd-driven AP -- see ap_control.hpp) plus a plain
-      # HTTP API (http_server.hpp), not BLE/BlueZ.
+      # entirely from a browser-based web UI (web_ui.hpp) served over
+      # Ethernet, driving the Pi's own onboard WiFi in station mode via a
+      # plain HTTP API (http_server.hpp), not BLE/BlueZ, and no fallback
+      # access point (see main.cpp's own header comment).
       - name: Build in Alpine container
         run: |
           docker run --rm -v "$PWD":/work -w /work alpine:3.20 sh -c '

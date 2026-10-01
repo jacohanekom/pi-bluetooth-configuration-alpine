@@ -8,8 +8,8 @@
  * itself scrapped in favor of this -- a plain WiFi AP + HTTP API is a
  * far more standard, battle-tested pattern for headless device setup
  * (the same shape ESP8266/ESP32 WiFiManager-style devices use), and
- * reuses infrastructure (hostapd, dnsmasq) this project already needed
- * for other things.
+ * reuses infrastructure (dnsmasq) this project already needed for other
+ * things.
  *
  * Thread-per-connection: a slow request (e.g. one that ends up querying
  * pi-relay-control-alpine or victron-ve-direct-alpine, each with their
@@ -26,13 +26,16 @@
  * missed-notification or subscription-state bookkeeping anywhere.
  *
  * Deliberately not parsing anything beyond what this daemon's own
- * clients (this project's iOS/macOS apps, using plain URLSession) ever
- * send: no chunked transfer-encoding, no keep-alive (every response
- * closes the connection), no multipart. A minimal request line +
- * headers + optional Content-Length-delimited body is the entire
- * surface, matching the same "hand-roll only what's actually needed"
- * style already used throughout this project (relay_control.hpp,
- * victron_control.hpp, the old gatt_server.hpp).
+ * clients (a plain browser) ever send: no chunked transfer-encoding, no
+ * keep-alive (every response closes the connection), no multipart. A
+ * minimal request line + headers + optional Content-Length-delimited
+ * body is the entire surface, matching the same "hand-roll only what's
+ * actually needed" style already used throughout this project
+ * (relay_control.hpp, victron_control.hpp, the old gatt_server.hpp) --
+ * the one exception is the Authorization header, captured verbatim on
+ * Request so main.cpp's own auth.hpp can gate every route behind HTTP
+ * Basic Auth via set_auth_checker(), checked once here before routing
+ * rather than repeated in every single handler.
  */
 #include <atomic>
 #include <cstring>
@@ -53,28 +56,61 @@ struct Request {
     std::string method;
     std::string path;
     std::string body;
+    // Raw value of the "Authorization" header, or "" if none was sent --
+    // see auth.hpp's check_basic_auth(), the only current consumer.
+    std::string authorization;
+    // Set by the AuthChecker on success (e.g. "root") -- lets a route
+    // handler (or the AuthChecker itself, for a later request) know
+    // *who* is logged in, not just "someone valid did". Empty if auth
+    // isn't configured, or hasn't run yet.
+    std::string user;
 };
 
 struct Response {
     int status = 200;
     std::string body;
     std::string content_type = "application/json";
+    // Verbatim extra header lines (each ending in "\r\n"), spliced into
+    // the response right after Content-Length -- just enough to support
+    // WWW-Authenticate on a 401 (see unauthorized() below) without
+    // building out a general header-map API nothing else here needs yet.
+    std::string extra_headers;
 
     static Response json(const std::string& body, int status = 200) {
-        return Response{status, body, "application/json"};
+        return Response{status, body, "application/json", ""};
     }
     static Response error(int status, const std::string& message) {
-        return Response{status, "{\"error\":\"" + message + "\"}", "application/json"};
+        return Response{status, "{\"error\":\"" + message + "\"}", "application/json", ""};
+    }
+    static Response unauthorized() {
+        return Response{401, "{\"error\":\"unauthorized\"}", "application/json",
+                         "WWW-Authenticate: Basic realm=\"pi-bluetooth-configuration\"\r\n"};
     }
 };
 
 class HttpServer {
 public:
     using Handler = std::function<Response(const Request&)>;
+    // Checked against every request before it ever reaches a route
+    // handler -- see main.cpp's own set_auth_checker() call. Takes the
+    // Request by mutable reference so it can populate req.user as a
+    // side effect of a successful check (see that field's own comment).
+    // Returns 0 to let the request proceed; any other value is sent
+    // straight back as that HTTP status, short-circuiting routing
+    // entirely -- 401 for "not logged in at all" (see
+    // Response::unauthorized(), used automatically for that one case)
+    // and e.g. 403 for "logged in, but not allowed to do this yet" (see
+    // main.cpp's own root-must-change-password gate, the first user of
+    // that distinction). Unset (the default) means no auth is required
+    // at all, so existing callers/tests that never call
+    // set_auth_checker() keep working unchanged.
+    using AuthChecker = std::function<int(Request&)>;
 
     void route(const std::string& method, const std::string& path, Handler h) {
         routes_[method + " " + path] = std::move(h);
     }
+
+    void set_auth_checker(AuthChecker checker) { auth_checker_ = std::move(checker); }
 
     // Binds 0.0.0.0:port so requests are served regardless of which
     // network is currently live (the AP's own subnet while unconfigured,
@@ -188,12 +224,17 @@ private:
             if (colon == std::string::npos) continue;
             std::string name = header_line.substr(0, colon);
             for (auto& c : name) c = static_cast<char>(tolower(static_cast<unsigned char>(c)));
+            std::string value = header_line.substr(colon + 1);
+            auto not_ws = value.find_first_not_of(' ');
+            if (not_ws != std::string::npos) value = value.substr(not_ws);
             if (name == "content-length") {
                 try {
-                    content_length = static_cast<size_t>(std::stoul(header_line.substr(colon + 1)));
+                    content_length = static_cast<size_t>(std::stoul(value));
                 } catch (...) {
                     content_length = 0;
                 }
+            } else if (name == "authorization") {
+                req.authorization = value;
             }
         }
 
@@ -205,6 +246,24 @@ private:
         }
         req.body = body_so_far.substr(0, content_length);
 
+        // Checked before routing at all -- a request that fails this
+        // never reaches a handler, so no individual route needs its own
+        // auth/gating check (or can forget one). See AuthChecker's own
+        // comment for what a non-zero return means.
+        if (auth_checker_) {
+            int auth_status = auth_checker_(req);
+            if (auth_status == 401) {
+                send_raw(client_fd, Response::unauthorized());
+                close(client_fd);
+                return;
+            }
+            if (auth_status != 0) {
+                send_raw(client_fd, Response::error(auth_status, "forbidden"));
+                close(client_fd);
+                return;
+            }
+        }
+
         auto it = routes_.find(req.method + " " + req.path);
         Response resp = (it != routes_.end()) ? it->second(req) : Response::error(404, "not found");
         send_raw(client_fd, resp);
@@ -213,8 +272,8 @@ private:
 
     void send_raw(int fd, const Response& resp) {
         static const std::map<int, std::string> reasons = {
-            {200, "OK"}, {400, "Bad Request"}, {404, "Not Found"},
-            {405, "Method Not Allowed"}, {431, "Request Header Fields Too Large"},
+            {200, "OK"}, {400, "Bad Request"}, {401, "Unauthorized"}, {403, "Forbidden"},
+            {404, "Not Found"}, {405, "Method Not Allowed"}, {431, "Request Header Fields Too Large"},
             {500, "Internal Server Error"},
         };
         auto it = reasons.find(resp.status);
@@ -224,6 +283,7 @@ private:
         out << "HTTP/1.1 " << resp.status << " " << reason << "\r\n"
             << "Content-Type: " << resp.content_type << "\r\n"
             << "Content-Length: " << resp.body.size() << "\r\n"
+            << resp.extra_headers
             << "Connection: close\r\n\r\n"
             << resp.body;
         std::string s = out.str();
@@ -232,6 +292,7 @@ private:
     }
 
     std::map<std::string, Handler> routes_;
+    AuthChecker auth_checker_;
     int listen_fd_ = -1;
     std::atomic<bool> running_{false};
     std::thread accept_thread_;

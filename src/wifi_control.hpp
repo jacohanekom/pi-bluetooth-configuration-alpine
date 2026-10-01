@@ -258,25 +258,22 @@ public:
     bool connect(const std::string& ssid, const std::string& psk) {
         using namespace wifi_detail;
 
-        // See network_lock.hpp -- held for this ENTIRE function. This is
-        // the only caller of connect() that ever matters for this lock
-        // (unlike ap_control.hpp's start(), it never runs at boot), so
-        // there's no boot-time responsiveness to protect the way
-        // start()'s own deliberately narrow scope does. Confirmed on
+        // See network_lock.hpp -- held for this ENTIRE function, since it
+        // never runs at boot (only from main.cpp's POST /connect), so
+        // there's no boot-time responsiveness to protect. Confirmed on
         // real hardware that a narrower lock (just around the dhcpcd
         // call below) wasn't enough: main.cpp's POST /ethernet
-        // (do_set_ethernet) and main.cpp's do_finish() firing moments
-        // apart still interleaved their rc-service calls around each
-        // narrow critical section, producing OpenRC's own "dnsmasq
-        // stopped by something else"/"already starting" -- genuinely
-        // overlapping rc-service invocations at the OS level, not just a
-        // C++-side race. Holding this for the whole function (through
-        // ap_control.hpp's own stop(), which does the same for the same
-        // reason) means a concurrent Ethernet reconfiguration simply
-        // waits for the entire live-join attempt to finish first, rather
-        // than competing with it (and its own CPU/USB load, on hardware
-        // with a real USB Ethernet bridge attached) for the single core
-        // this whole association/lease sequence is racing the clock on.
+        // (do_set_ethernet) and this function firing moments apart still
+        // interleaved their rc-service calls around each narrow critical
+        // section, producing OpenRC's own "dnsmasq stopped by something
+        // else"/"already starting" -- genuinely overlapping rc-service
+        // invocations at the OS level, not just a C++-side race. Holding
+        // this for the whole function means a concurrent Ethernet
+        // reconfiguration simply waits for the entire live-join attempt
+        // to finish first, rather than competing with it (and its own
+        // CPU/USB load, on hardware with a real USB Ethernet bridge
+        // attached) for the single core this whole association/lease
+        // sequence is racing the clock on.
         std::lock_guard<std::mutex> lock(network_guard::mu);
 
         remove_all_networks();
@@ -337,8 +334,8 @@ public:
         // out here even though the credentials were entirely correct.
         // This lock now keeps that contention from happening DURING the
         // dhcpcd call below, but not during association itself (wpa_cli
-        // doesn't touch dhcpcd/dnsmasq/hostapd, so it isn't covered by
-        // this function's own lock scope) -- widening the timeout is the
+        // doesn't touch dhcpcd/dnsmasq, so it isn't covered by this
+        // function's own lock scope) -- widening the timeout is the
         // actual fix for that specific window.
         const int poll_attempts = 60; // ~30s
         bool associated = false;
@@ -377,86 +374,6 @@ public:
         // live config, silently undoing this reset.
         std::remove(WPA_SUPPLICANT_CONF_SAVED);
         set_status(WifiStatus{});
-    }
-
-    // Saves ssid/psk directly into wpa_supplicant.conf's own text,
-    // *without* needing wpa_supplicant itself to be running -- unlike
-    // connect() above (which drives a live wpa_supplicant process via
-    // wpa_cli), this only edits the config file. Needed specifically for
-    // staging credentials while the fallback AP is active: wpa_supplicant
-    // is stopped entirely in that state (see ap_control.hpp), so there's
-    // no live control socket for wpa_cli to talk to at all, yet the
-    // wizard still needs a way to save what the user just entered without
-    // disrupting the AP itself (see main.cpp's POST /connect for why that
-    // matters). This alone is only a durability measure (surviving this
-    // daemon crashing/restarting, or a genuine reboot, before /finish is
-    // ever called) -- it does NOT itself drive a join. main.cpp's
-    // do_finish() calls connect() above explicitly, live, with the same
-    // ssid/psk, once the radio is actually freed from AP mode; relying on
-    // wpa_supplicant to auto-associate from this staged file alone (the
-    // way a fresh boot's already-running wpa_supplicant does) turned out
-    // not to be reliable coming out of an active AP-mode session on real
-    // hardware -- confirmed the live join was silently never attempted at
-    // all that way, only ever succeeding on an actual reboot.
-    //
-    // Replaces every network{} block already in the file with exactly
-    // one new one (same "single active network" model as connect()
-    // above), using the same hex-encoding scheme wpa_cli itself accepts
-    // on the wire (see this file's own header comment) so there is
-    // nothing to escape regardless of what bytes the SSID/passphrase
-    // contain -- confirmed against wpa_supplicant.conf's own documented
-    // format (an unquoted `ssid=<hex>` line is a first-class alternative
-    // to a quoted string, not a hack).
-    bool stage(const std::string& ssid, const std::string& psk, std::string& err) {
-        using namespace wifi_detail;
-
-        std::ifstream in(WPA_SUPPLICANT_CONF);
-        if (!in.is_open()) {
-            err = "could not open " + std::string(WPA_SUPPLICANT_CONF);
-            return false;
-        }
-        std::ostringstream kept;
-        std::string line;
-        int depth = 0;
-        while (std::getline(in, line)) {
-            if (depth == 0) {
-                std::string t = trim(line);
-                if (t.rfind("network", 0) == 0 && t.find('{') != std::string::npos) {
-                    for (char c : line) {
-                        if (c == '{') ++depth;
-                        else if (c == '}') --depth;
-                    }
-                    continue; // entering a network{} block -- drop this line, and every
-                              // line until its matching close, replaced by our own below
-                }
-                kept << line << "\n";
-            } else {
-                for (char c : line) {
-                    if (c == '{') ++depth;
-                    else if (c == '}') --depth;
-                }
-            }
-        }
-        in.close();
-
-        std::ofstream out(WPA_SUPPLICANT_CONF, std::ios::trunc);
-        if (!out.is_open()) {
-            err = "could not write " + std::string(WPA_SUPPLICANT_CONF);
-            return false;
-        }
-        out << kept.str();
-        out << "network={\n"
-            << "\tssid=" << to_hex(ssid) << "\n";
-        if (!psk.empty()) {
-            out << "\tpsk=" << derive_psk_hex(ssid, psk) << "\n"
-                << "\tkey_mgmt=WPA-PSK\n";
-        } else {
-            out << "\tkey_mgmt=NONE\n";
-        }
-        out << "}\n";
-        out.close();
-        backup_wpa_conf();
-        return true;
     }
 
 private:

@@ -1,118 +1,129 @@
 /**
  * pi-bluetooth-configuration
  * ===========================
- * Lets a phone/app join this Pi to a WiFi network without SSH or a
- * keyboard, using the Pi's own onboard WiFi radio for both roles at
- * different times -- never BLE, never a second board. On startup this
- * daemon tries to join whatever's already configured (wpa_supplicant,
- * started by OpenRC before this daemon, attempts that entirely on its
- * own); if that doesn't succeed within a bounded time -- including the
- * common case of nothing being configured at all yet -- wlan0 switches
- * into its own access point (see ap_control.hpp) that a phone can join
- * directly, reaching this daemon's HTTP API (see http_server.hpp) to
- * submit real credentials -- found automatically via mDNS/Bonjour (see
- * mdns_responder.hpp) rather than requiring its address to be typed in,
- * on whichever network (the fallback AP, or a real one once joined) the
- * phone happens to be on.
+ * Lets you join this Pi to a WiFi network from a plain browser, over a
+ * wired Ethernet connection -- no phone app, no SSH, no keyboard, no
+ * second board, never BLE, and (as of this design) never a WiFi access
+ * point either. wlan0 stays in station mode at all times: on startup
+ * this daemon tries to join whatever's already configured
+ * (wpa_supplicant, started by OpenRC before this daemon, attempts that
+ * entirely on its own); whether or not that succeeds, eth0 (optionally
+ * bridged with a second wired interface -- see eth_control.hpp) is
+ * always up with a static IP and its own DHCP+DNS server, so a laptop
+ * plugged into either wired port can reach this daemon's web UI (GET /,
+ * see web_ui.hpp) at any time to scan for networks, join one, and watch
+ * the result -- found automatically via mDNS/Bonjour (see
+ * mdns_responder.hpp) rather than requiring its address to be typed in.
  *
  * This replaces two earlier designs entirely (see git history): a
  * direct BlueZ/D-Bus GATT peripheral, and -- after BlueZ's own built-in
  * GATT profiles proved to force a disconnect loop no userspace config
  * could fix -- offloading BLE to a Raspberry Pi Pico 2 W over USB
- * serial. Both were scrapped in favor of this: a plain WiFi AP + HTTP
- * API is a far more standard, battle-tested pattern for headless device
- * setup (the same shape ESP8266/ESP32 WiFiManager-style devices use),
- * and it reuses infrastructure (hostapd, dnsmasq) this project already
- * needed for other things.
+ * serial. A third design (a hostapd-driven fallback access point a
+ * phone joined directly, with the same HTTP API underneath) came next
+ * and worked, but made the WiFi-join flow strictly harder than it
+ * needed to be: this radio can't run AP and station mode at once, so
+ * submitting credentials while that AP was active could only ever stage
+ * them for a later join, never attempt one live, without severing the
+ * very connection the request arrived over. Configuring over Ethernet
+ * instead sidesteps that whole class of problem -- the wired link
+ * plugged into eth0/eth1 has nothing to do with wlan0's radio state, so
+ * a join can always be attempted immediately and its real outcome
+ * reported back on the same connection, no staging, no AP-vs-station
+ * tradeoff, no hostapd/dnsmasq-on-wlan0 configuration to maintain at
+ * all.
+ *
+ * WiFi, Ethernet, relay control, and login accounts are all entirely
+ * independent features, not sequenced steps in a wizard -- there is no
+ * "finished setup" state anymore, no marker file gating any of them, and
+ * no reboot anywhere in this daemon. Each can be configured any time, in
+ * any order, regardless of the others' state.
+ *
+ * Login accounts are plain, user-chosen Unix accounts (see "Logging in"
+ * below) -- there is no auto-generated admin account anymore. Nothing
+ * creates a login for you; you add one yourself, with a username and
+ * password you choose, from the web UI's "Users" section.
  *
  * HTTP API (JSON; see the route table in main() for the exact shapes):
- *   GET  /status    combined snapshot -- wifi state, whether AP mode is
- *                   currently active, eth0's config, DHCP leases, relay
- *                   states, Victron telemetry, and the last scan's
- *                   results. No server push (unlike the old BLE
- *                   notify): clients are expected to poll this
- *                   periodically instead -- simpler and more robust
- *                   than the notify-plus-cache machinery either earlier
- *                   design needed.
+ *   GET  /         the browser-based web UI itself (see web_ui.hpp) --
+ *                   a single static page that talks to the routes below.
+ *   GET  /status    combined snapshot -- wifi state, eth0's config, DHCP
+ *                   leases, relay states, Victron telemetry, and the
+ *                   last scan's results. No server push: clients are
+ *                   expected to poll this periodically instead.
  *   POST /scan      triggers a background WiFi scan; poll GET /status
  *                   for results once it finishes (a few seconds later).
- *   POST /connect   {"ssid":...,"password":...} -- see the route
- *                   registration's own comment for why this behaves
- *                   differently depending on whether AP mode is
- *                   currently active: while it's active, this only
- *                   stages the credentials (WifiControl::stage) rather
- *                   than attempting the join immediately, specifically
- *                   so it doesn't tear down the very AP connection this
- *                   request arrived over.
- *   POST /forget    forgets the configured network, reboots.
- *   POST /finish    concludes setup and reboots -- allowed either once
- *                   WiFi is actually connected (reconfiguring an
- *                   already-networked Pi), or once credentials have been
- *                   staged via POST /connect from AP mode (see
- *                   do_finish); the actual join in the latter case only
- *                   happens after this reboot.
+ *   POST /connect   {"ssid":...,"password":...} -- joins the given
+ *                   network directly and synchronously in the
+ *                   background; poll GET /status's wifi.state for the
+ *                   outcome.
+ *   POST /forget    forgets the configured network. wlan0 stays in
+ *                   station mode, simply idle, until POST /connect is
+ *                   called again.
+ *   GET  /accounts  lists the Unix accounts this daemon has created
+ *                   (see add_account/list_accounts).
+ *   POST /accounts  {"username":...,"password":...} -- creates a new
+ *                   Unix account with doas access to root; see
+ *                   add_account().
+ *   POST /accounts/remove  {"username":...} -- deletes an account this
+ *                   daemon created; see remove_account().
+ *   POST /change-password  {"username":...,"currentPassword":...,
+ *                   "newPassword":...} -- change your own password;
+ *                   see change_password(). The only way to clear
+ *                   root's forced-change gate -- see
+ *                   ROOT_PASSWORD_CHANGED_FILE's own comment.
+ *   POST /ssh       {"enabled":bool} -- starts/stops sshd and adds/
+ *                   removes it from the default runlevel, live.
  *   GET  /ethernet  current eth0 gateway IP + DHCP range.
- *   POST /ethernet  {"ip":...,"rangeStart":...,"rangeEnd":...} -- stage
- *                   eth0's local network config; see eth_control.hpp.
+ *   POST /ethernet  {"ip":...,"rangeStart":...,"rangeEnd":...} -- always
+ *                   editable; see eth_control.hpp.
  *   POST /relay     {"port":...,"state":"on"|"off"} -- see relay_control.hpp.
+ *   POST /relay-control  {"enabled":bool} -- master on/off switch for
+ *                   the whole relay integration, persisted to config.ini.
+ *   POST /relay-always-on  {"port":...,"alwaysOn":bool} -- edits
+ *                   pi-relay-control-alpine's own config file and
+ *                   restarts it; see relay_control.hpp.
  *   POST /user      {"name":...,"email":...} -- purely informational,
- *                   labels the device with whoever signed in via the
- *                   iOS app's Sign in with Apple; stored in
- *                   CAMERA_USER_FILE. Not used for access control
- *                   anywhere.
+ *                   labels the device; stored in CAMERA_USER_FILE. Not
+ *                   used for access control anywhere -- unrelated to the
+ *                   Unix accounts /accounts manages, despite the
+ *                   similar-looking name.
  *
  * eth0 is always a working gateway: its static IP + DHCP server are
  * (re)applied directly at every startup -- independent of dhcpcd,
  * carrier state, and whatever wlan0 is currently doing -- so a Pi is
  * reachable over Ethernet with no app interaction, cable plugged in or
- * not. POST /ethernet lets it be customized any time before "finish"
- * actually runs (marking the wizard done and rebooting); after that this
- * daemon rejects further changes and the app switches to a read-only
- * display instead (see eth_control.hpp and the README's "Ethernet
- * direct-connect" section). Applying it doesn't reboot: Ethernet doesn't
- * share the radio with wlan0, so there's no coexistence problem to route
- * around, and the change is visible immediately.
+ * not. POST /ethernet can be called any time, indefinitely -- there is
+ * no point at which this daemon starts rejecting it (see eth_control.hpp
+ * and the README's "Ethernet direct-connect" section). Applying it
+ * doesn't reboot: Ethernet doesn't share the radio with wlan0, so
+ * there's no coexistence problem to route around, and the change is
+ * visible immediately.
  *
- * No auth on this daemon's own HTTP API: requests are plain HTTP, not
- * encrypted or authenticated. The AP itself is open (no password) too --
- * seem this project's security model (see the README) already treats
- * the WiFi-configuration flow as suitable for a trusted home/lab
- * environment only, not a public one; this means WiFi credentials cross
- * both the AP's own air interface and this HTTP API in the clear.
+ * Every route requires HTTP Basic Auth (see auth.hpp), checked against
+ * this device's own real /etc/shadow -- the same root account and
+ * whatever POST /accounts has created, no separate credential store.
+ * Still plain, unencrypted HTTP otherwise: this project's security
+ * model (see the README) already treats the WiFi-configuration flow as
+ * suitable for a trusted home/lab environment only, not a public one;
+ * this means credentials (both the HTTP Basic Auth kind and WiFi's own)
+ * cross this API in the clear. Reachable only from whatever's physically
+ * wired into eth0/eth1 (or already joined WiFi), not broadcast over the
+ * air the way the old fallback-AP design was.
  *
  * Relay control is a separate, optional integration with
  * pi-relay-control-alpine: this daemon doesn't drive GPIO itself, it
  * just forwards on/off to whichever relay is listening on that TCP port
- * on 127.0.0.1, and reports live state back via GET /status. It's no
- * part of the setup wizard -- relay commands are rejected and
- * GET /status reports an empty relay list until MARKER_FILE exists,
- * i.e. only once setup has actually finished, the same point at which
- * the app switches to showing WiFi/network stats (relay controls belong
- * on that same screen, not the wizard). See relay_control.hpp and the
- * README's "Relay control" section for the "[relays]" config format
- * that maps ports to display labels.
+ * on 127.0.0.1, and reports live state back via GET /status. Always
+ * available (gated only by the relays_enabled runtime/config toggle --
+ * see POST /relay-control -- never by WiFi/Ethernet/setup state). See
+ * relay_control.hpp and the README's "Relay control" section for the
+ * "[relays]" config format that maps ports to display labels.
  *
  * Victron solar/battery telemetry is a similar optional integration,
  * this time with victron-ve-direct-alpine: queries its status control
- * port for the latest reading and republishes it as JSON. Unlike relay
- * control this is read-only (nothing to gate against acting on an
- * unprovisioned Pi) and isn't tied to MARKER_FILE at all -- it's always
- * live, the app just chooses to show it on the same post-setup screen as
- * WiFi/network stats and relays. See victron_control.hpp.
- *
- * The AP's own SSID is the board's hardware serial (from /proc/cpuinfo),
- * not a fixed name, so multiple aipicam units are distinguishable in a
- * phone's WiFi network list instead of all showing the same name.
- *
- * This is a one-shot provisioning flow, not a managed session: a
- * successful "finish" creates MARKER_FILE and reboots the Pi a few
- * seconds later; a "forget" removes MARKER_FILE and reboots the same
- * way. There
- * is deliberately no ongoing management interface beyond this same HTTP
- * API -- once WiFi is set up, the expectation is that the Pi reboots
- * into its normal role, and this daemon (and the API) stay available on
- * the joined network for the relay/Victron/status use described above,
- * not for repeating the wizard.
+ * port for the latest reading and republishes it as JSON. Read-only,
+ * always live. See victron_control.hpp.
  *
  * Build (Alpine Linux):
  *   make
@@ -137,55 +148,70 @@
 #include <thread>
 #include <vector>
 
+#include <dirent.h>
 #include <sys/time.h>
 
-#include <openssl/rand.h>
-
-#include "ap_control.hpp"
+#include "auth.hpp"
 #include "config.hpp"
 #include "eth_control.hpp"
 #include "http_server.hpp"
 #include "mdns_responder.hpp"
 #include "relay_control.hpp"
 #include "victron_control.hpp"
+#include "web_ui.hpp"
 #include "wifi_control.hpp"
 
 namespace {
 
-// Under /etc, not bare at the filesystem root -- diskless installs
-// (see sdcard-image-pi3) persist config via `apk audit --backup`
-// (what `lbu commit` actually uses under the hood), which reliably
-// tracks new/changed files *within* a protected directory like /etc
-// but -- confirmed directly, not assumed -- silently never picks up a
-// bare top-level file no matter how it's listed in
-// protected_paths.d/*.list. A marker under /etc survives a reboot
-// there; one at "/" silently wouldn't.
-constexpr const char* MARKER_FILE = "/etc/successfully-initialized";
 constexpr const char* HOSTNAME_FILE = "/etc/hostname";
-// Purely informational -- the iOS app's Sign in with Apple result
-// (name/email) gets POSTed here once and stored so the device's owner
-// is labeled somewhere, same /etc-not-bare-root reasoning as
-// MARKER_FILE above (diskless installs' lbu commit needs it there to
-// survive a reboot). Not used for access control -- nothing gates on
-// this file existing the way pi-relay-control gates on MARKER_FILE.
+// Purely informational -- whoever the device is labeled as gets POSTed
+// here once and stored. Under /etc, not bare at the filesystem root --
+// diskless installs (see sdcard-image-pi3) persist config via `apk
+// audit --backup` (what `lbu commit` actually uses under the hood),
+// which reliably tracks new/changed files *within* a protected
+// directory like /etc but -- confirmed directly, not assumed --
+// silently never picks up a bare top-level file no matter how it's
+// listed in protected_paths.d/*.list. Not used for access control --
+// nothing gates on this file existing.
 constexpr const char* CAMERA_USER_FILE = "/etc/camera_user";
 
-// This device's own randomly-generated non-root login -- see
-// create_admin_account() below. Plain username, not a secret; read by
-// ttyd.initd at service-start time (see that file's own comment) to
-// know which account to connect as now that ttyd may be reachable from
-// the internet via Cloudflare Tunnel and root SSH login is disabled
-// image-wide (build-image.sh's sshd_config now ships PermitRootLogin no
-// unconditionally, not just for ttyd specifically -- see that script's
-// own comment on why a ttyd-only restriction wouldn't actually be a
-// real security boundary).
-constexpr const char* ADMIN_USER_FILE = "/etc/admin-user";
-// Its own file under Alpine's doas.d override directory, not a
-// shared /etc/doas.conf edit -- confirmed directly against a real doas
+// Every account this daemon has created gets its own file here, named
+// "<PREFIX><username><SUFFIX>" -- e.g.
+// "/etc/doas.d/pi-bluetooth-configuration-user-alice.conf" -- rather
+// than a shared /etc/doas.conf edit or a single well-known admin-user
+// file (the old single-auto-generated-account design this replaced).
+// This directory listing itself (see list_accounts()) is the one and
+// only source of truth for "which accounts does this daemon manage" --
+// no separate index file to keep in sync, and no risk of ever touching
+// an account this daemon didn't create itself (root, nobody, any
+// package-created system account): remove_account() refuses anything
+// without a matching file here. Confirmed directly against a real doas
 // that /etc/doas.d/*.conf is genuinely additive to /etc/doas.conf
-// (Alpine-specific; not a bare upstream-OpenBSD-doas feature), so this
-// doesn't need to parse-and-rewrite a file it doesn't own.
-constexpr const char* DOAS_ADMIN_CONF = "/etc/doas.d/pi-bluetooth-configuration-admin.conf";
+// (Alpine-specific; not a bare upstream-OpenBSD-doas feature).
+constexpr const char* DOAS_USER_CONF_DIR    = "/etc/doas.d";
+constexpr const char* DOAS_USER_CONF_PREFIX = "pi-bluetooth-configuration-user-";
+constexpr const char* DOAS_USER_CONF_SUFFIX = ".conf";
+
+// The symlink OpenRC's `rc-update add sshd default` creates -- its mere
+// existence is exactly what `rc-update show default` itself checks, so
+// reading it directly here (rather than shelling out to parse that
+// command's output) is both simpler and exactly as authoritative.
+constexpr const char* SSHD_RUNLEVEL_LINK = "/etc/runlevels/default/sshd";
+
+// Marks that `root`'s password has been changed at least once via
+// POST /change-password since this device was imaged -- root starts out
+// with `ROOT_PASSWORD` (set once, at build time, often reused verbatim
+// across every device built from the same image), so unlike any account
+// POST /accounts creates (always a password someone chose fresh), root
+// genuinely has a "default" credential worth forcing a change away from
+// the first time it's used to log into the web UI. An empty marker file
+// under /etc/pi-bluetooth-configuration (that directory already exists
+// -- config.ini is installed there) rather than comparing shadow hashes
+// against a build-time snapshot: simpler, and consistent with this
+// project's existing "file exists = state is true" convention
+// elsewhere (DOAS_USER_CONF_DIR's own files, eth_control.hpp's
+// STATE_FILE).
+constexpr const char* ROOT_PASSWORD_CHANGED_FILE = "/etc/pi-bluetooth-configuration/root-password-changed";
 
 std::atomic<bool> g_running{true};
 std::atomic<int> g_inflight{0};
@@ -281,17 +307,29 @@ long json_get_int(const std::string& body, const std::string& key, long def) {
     try { return std::stol(body.substr(start, pos - start)); } catch (...) { return def; }
 }
 
-// "finished" reflects whether this device has already completed the
-// one-shot provisioning wizard (MARKER_FILE exists) -- the client uses
-// this, not just wifi state, to decide whether to show the wizard or
-// the final read-only details screen.
-std::string status_json(const WifiStatus& s, bool finished) {
+// Same bare-bones extraction as json_get_string/json_get_int above --
+// looks for an unquoted `true`/`false` token right after the key's
+// colon, matching the shape of this daemon's own JSON responses (see
+// e.g. POST /relay-control's own body).
+bool json_get_bool(const std::string& body, const std::string& key, bool def) {
+    std::string needle = "\"" + key + "\"";
+    auto pos = body.find(needle);
+    if (pos == std::string::npos) return def;
+    pos = body.find(':', pos + needle.size());
+    if (pos == std::string::npos) return def;
+    ++pos;
+    while (pos < body.size() && std::isspace(static_cast<unsigned char>(body[pos]))) ++pos;
+    if (body.compare(pos, 4, "true") == 0) return true;
+    if (body.compare(pos, 5, "false") == 0) return false;
+    return def;
+}
+
+std::string status_json(const WifiStatus& s) {
     std::ostringstream o;
     o << "{\"state\":\"" << s.state_name() << "\","
       << "\"ssid\":\"" << escape_json(s.ssid) << "\","
       << "\"ip\":\"" << escape_json(s.ip) << "\","
-      << "\"error\":\"" << escape_json(s.error) << "\","
-      << "\"finished\":" << (finished ? "true" : "false") << "}";
+      << "\"error\":\"" << escape_json(s.error) << "\"}";
     return o.str();
 }
 
@@ -322,11 +360,6 @@ std::string leases_json(const std::vector<ethctl::Lease>& leases) {
     return o.str();
 }
 
-bool marker_exists(const char* path) {
-    std::ifstream f(path);
-    return f.good();
-}
-
 // Queries each configured relay's live state (via relay_control.hpp,
 // one TCP round-trip per relay to pi-relay-control-alpine) every time
 // this is called -- simple, and there are only ever a handful of
@@ -335,14 +368,30 @@ bool marker_exists(const char* path) {
 // block (http_server.hpp is thread-per-connection -- a slow relay query
 // only ever delays its own request), so the caching layer that used to
 // exist here for exactly that reason is gone.
+//
+// `enabled` reflects the runtime on/off switch (see main()'s own
+// relays_enabled) -- when false, every relay is reported "disabled"
+// without a live query at all, both to avoid pointless TCP round-trips
+// to a feature the user just turned off and so the web UI can grey out
+// each relay row distinctly from a real "unknown" (not reachable). The
+// relay *list itself* (ports/labels) is still reported either way, so a
+// disabled toggle can be turned back on from the web UI without losing
+// sight of what it controls.
+//
+// `alwaysOn` is read fresh from pi-relay-control-alpine's own config
+// file on every call (relayctl::relay_always_on) -- cheap (a small local
+// file, not a network round-trip) and always correct even if something
+// other than this daemon edited it by hand.
 std::string relays_json(const std::vector<relayctl::RelayConfig>& relays,
-                         std::map<int, std::mutex>& port_mu) {
+                         std::map<int, std::mutex>& port_mu, bool enabled) {
     std::ostringstream o;
     o << "[";
     for (size_t i = 0; i < relays.size(); ++i) {
         if (i) o << ",";
         std::string state;
-        {
+        if (!enabled) {
+            state = "disabled";
+        } else {
             // Still locked per-port -- not to protect against a shared
             // dispatch thread anymore, just so a concurrent GET /status
             // and POST /relay for the *same* port (two separate HTTP
@@ -354,7 +403,8 @@ std::string relays_json(const std::vector<relayctl::RelayConfig>& relays,
         }
         o << "{\"port\":" << relays[i].port << ","
           << "\"label\":\"" << escape_json(relays[i].label) << "\","
-          << "\"state\":\"" << state << "\"}";
+          << "\"state\":\"" << state << "\","
+          << "\"alwaysOn\":" << (relayctl::relay_always_on(relays[i].port) ? "true" : "false") << "}";
     }
     o << "]";
     return o.str();
@@ -418,46 +468,73 @@ void write_camera_user(const std::string& name, const std::string& email) {
     f << "email=" << sanitize(email) << "\n";
 }
 
-// Cryptographically random (RAND_bytes, not std::rand()) -- this
-// becomes this device's own login credential material, generated once
-// at first successful setup (see create_admin_account()), so it needs
-// the same unguessability any freshly-minted password would. Returns
-// false without touching `out` if the underlying PRNG can't be read
-// (should never happen on a real Linux system, but a failure here must
-// never silently fall back to something predictable).
-bool random_string(size_t len, const char* alphabet, std::string& out) {
-    size_t alphabet_len = std::strlen(alphabet);
-    std::vector<unsigned char> buf(len);
-    if (RAND_bytes(buf.data(), static_cast<int>(len)) != 1) return false;
-    out.resize(len);
-    for (size_t i = 0; i < len; ++i) out[i] = alphabet[buf[i] % alphabet_len];
+std::string doas_user_conf_path(const std::string& user) {
+    return std::string(DOAS_USER_CONF_DIR) + "/" + DOAS_USER_CONF_PREFIX + user + DOAS_USER_CONF_SUFFIX;
+}
+
+// Conservative Unix username rules (lowercase letters/digits/"_"/"-",
+// starting with a letter or "_", capped well under every adduser
+// implementation's own limit) -- checked here mainly so a bad username
+// fails fast with a clear error instead of some more confusing failure
+// from adduser itself, and so it's always safe to embed directly into
+// doas_user_conf_path()'s filename with nothing to escape.
+bool valid_username(const std::string& u) {
+    if (u.empty() || u.size() > 32) return false;
+    if (!(std::islower(static_cast<unsigned char>(u[0])) || u[0] == '_')) return false;
+    for (char c : u) {
+        unsigned char uc = static_cast<unsigned char>(c);
+        if (!(std::islower(uc) || std::isdigit(uc) || c == '_' || c == '-')) return false;
+    }
     return true;
 }
 
-// Creates this Pi's one and only non-root login, the first time setup
-// ever actually finishes (see do_finish() below, which gates this on
-// ADMIN_USER_FILE not existing yet). Returns false, having created
-// nothing persistent, on any failure -- do_finish() refuses to finish
-// at all in that case, since build-image.sh's sshd_config now ships
-// PermitRootLogin no unconditionally, so a device that somehow
-// finished without ever getting a working admin account would have no
-// valid SSH/ttyd login whatsoever.
-bool create_admin_account(std::string& out_user, std::string& out_pass) {
-    std::string user, pass;
-    // Lowercase-only, prefixed with a letter -- conservative enough to
-    // satisfy every adduser implementation's own username rules without
-    // needing to know exactly which one this image ships.
-    if (!random_string(6, "abcdefghijklmnopqrstuvwxyz0123456789", user)) return false;
-    user = "aipi-" + user;
-    // 48 hex characters (24 bytes of real entropy) -- no special
-    // characters at all, so it's safe both as a plain argv element
-    // (execvp, no shell involved -- see subprocess.hpp) and embedded
-    // directly in a JSON response with no escaping needed.
-    if (!random_string(48, "0123456789abcdef", pass)) return false;
+// The one and only source of truth for "which accounts does this daemon
+// manage" -- see DOAS_USER_CONF_PREFIX's own comment for why this reads
+// the directory itself rather than a separate index file. Sorted so the
+// web UI's own list doesn't reorder itself between polls for no reason.
+std::vector<std::string> list_accounts() {
+    std::vector<std::string> accounts;
+    DIR* dir = opendir(DOAS_USER_CONF_DIR);
+    if (!dir) return accounts;
+    std::string prefix = DOAS_USER_CONF_PREFIX;
+    std::string suffix = DOAS_USER_CONF_SUFFIX;
+    struct dirent* entry;
+    while ((entry = readdir(dir)) != nullptr) {
+        std::string name = entry->d_name;
+        if (name.size() <= prefix.size() + suffix.size()) continue;
+        if (name.compare(0, prefix.size(), prefix) != 0) continue;
+        if (name.compare(name.size() - suffix.size(), suffix.size(), suffix) != 0) continue;
+        accounts.push_back(name.substr(prefix.size(), name.size() - prefix.size() - suffix.size()));
+    }
+    closedir(dir);
+    std::sort(accounts.begin(), accounts.end());
+    return accounts;
+}
+
+// Creates a plain Unix account with the given username/password (both
+// user-chosen -- unlike the single auto-generated admin account this
+// replaced, there's no credential-reveal step here at all: the caller
+// already knows the password, since they just typed it in) and permits
+// it to `doas` (Alpine's sudo-equivalent) to root. Refuses up front if
+// an account by this name already exists as far as this daemon's own
+// tracking is concerned (see list_accounts()'s own comment) -- a
+// same-named *system* account (root, nobody, ...) that this daemon
+// never created is instead caught naturally by `adduser` itself
+// refusing outright, surfaced below as a normal failure.
+bool add_account(const std::string& user, const std::string& pass, std::string& err) {
+    if (!valid_username(user)) {
+        err = "invalid username -- lowercase letters/digits/\"_\"/\"-\" only, starting with a letter or \"_\"";
+        return false;
+    }
+    std::string conf_path = doas_user_conf_path(user);
+    if (std::ifstream(conf_path).good()) {
+        err = "an account named \"" + user + "\" already exists";
+        return false;
+    }
 
     auto add = run_command({"adduser", "-D", "-h", "/home/" + user, user});
     if (add.exit_code != 0) {
-        std::cerr << "[Main] failed to create admin user \"" << user << "\": " << trim(add.output) << "\n";
+        err = "failed to create user: " + trim(add.output);
         return false;
     }
     // Same SHA-512 crypt mechanism build-image.sh's own ROOT_PASSWORD
@@ -469,7 +546,7 @@ bool create_admin_account(std::string& out_user, std::string& out_pass) {
     // during the sub-second window this runs.
     auto hashed = run_command({"openssl", "passwd", "-6", pass});
     if (hashed.exit_code != 0) {
-        std::cerr << "[Main] failed to hash admin password: " << trim(hashed.output) << "\n";
+        err = "failed to hash password: " + trim(hashed.output);
         run_command({"deluser", user});
         return false;
     }
@@ -480,32 +557,108 @@ bool create_admin_account(std::string& out_user, std::string& out_pass) {
     // doesn't wire up (see subprocess.hpp) -- this avoids needing to.
     auto set_pass = run_command({"usermod", "-p", trim(hashed.output), user});
     if (set_pass.exit_code != 0) {
-        std::cerr << "[Main] failed to set admin password: " << trim(set_pass.output) << "\n";
+        err = "failed to set password: " + trim(set_pass.output);
         run_command({"deluser", user});
         return false;
     }
 
-    // doas, not sudo -- Alpine doesn't package sudo by default, and
-    // this project already avoids adding packages beyond what's needed
-    // (see build-image.sh). "permit persist" mirrors what most sudo
-    // setups do (re-prompt periodically, not on literally every
-    // invocation) rather than plain "permit" (every time) or "permit
-    // nopass" (never -- which would make a stolen SSH session
-    // immediately root-equivalent with no further credential check).
+    // "permit persist" mirrors what most sudo setups do (re-prompt
+    // periodically, not on literally every invocation) rather than
+    // plain "permit" (every time) or "permit nopass" (never -- which
+    // would make a stolen SSH session immediately root-equivalent with
+    // no further credential check).
     {
-        std::ofstream f(DOAS_ADMIN_CONF);
+        std::ofstream f(conf_path);
         f << "permit persist " << user << "\n";
     }
     // doas refuses to honor a config file it doesn't own outright or
     // that's group/other-writable -- confirmed directly against a real
     // doas, not assumed from its docs.
-    run_command({"chown", "root:root", DOAS_ADMIN_CONF});
-    run_command({"chmod", "0600", DOAS_ADMIN_CONF});
+    run_command({"chown", "root:root", conf_path});
+    run_command({"chmod", "0600", conf_path});
+    return true;
+}
 
-    { std::ofstream f(ADMIN_USER_FILE); f << user << "\n"; }
+// Refuses anything without a matching doas.d file -- see
+// DOAS_USER_CONF_PREFIX's own comment on why that's the safe way to
+// guarantee this can never be pointed at an account this daemon didn't
+// create itself.
+bool remove_account(const std::string& user, std::string& err) {
+    std::string conf_path = doas_user_conf_path(user);
+    if (!std::ifstream(conf_path).good()) {
+        err = "no account named \"" + user + "\" is managed by this daemon";
+        return false;
+    }
+    run_command({"deluser", user});
+    std::remove(conf_path.c_str());
+    return true;
+}
 
-    out_user = user;
-    out_pass = pass;
+std::string accounts_json(const std::vector<std::string>& accounts) {
+    std::ostringstream o;
+    o << "[";
+    for (size_t i = 0; i < accounts.size(); ++i) {
+        if (i) o << ",";
+        o << "\"" << escape_json(accounts[i]) << "\"";
+    }
+    o << "]";
+    return o.str();
+}
+
+// Reflects whether `rc-update add sshd default` has been run -- see
+// SSHD_RUNLEVEL_LINK's own comment.
+bool sshd_enabled() {
+    return std::ifstream(SSHD_RUNLEVEL_LINK).good();
+}
+
+// See ROOT_PASSWORD_CHANGED_FILE's own comment.
+bool root_password_changed() {
+    return std::ifstream(ROOT_PASSWORD_CHANGED_FILE).good();
+}
+
+// Changes any account's own password -- the caller must already know
+// the *current* one (verified fresh here via authctl::verify_password,
+// independent of whatever Basic Auth credentials the HTTP request
+// itself carried) -- this is "change your own password", not an admin
+// reset of someone else's; main.cpp's own POST /change-password route
+// enforces that distinction by refusing to even call this unless the
+// Basic-Auth-authenticated user matches the account being changed. Sets
+// ROOT_PASSWORD_CHANGED_FILE the first time root's own password is
+// changed this way, satisfying the force-a-change-on-first-login gate
+// (see that file's own comment) -- never touched for any other account,
+// which has no such gate to satisfy.
+bool change_password(const std::string& user, const std::string& current_password,
+                      const std::string& new_password, std::string& err) {
+    if (!authctl::verify_password(user, current_password)) {
+        err = "current password is incorrect";
+        return false;
+    }
+    if (new_password.empty()) {
+        err = "new password is required";
+        return false;
+    }
+    if (new_password == current_password) {
+        err = "new password must be different from the current one";
+        return false;
+    }
+
+    // Same hash-then-usermod sequence as add_account() -- see that
+    // function's own comments for why each step is shaped this way
+    // (openssl over crypt(3), argv over stdin, etc.).
+    auto hashed = run_command({"openssl", "passwd", "-6", new_password});
+    if (hashed.exit_code != 0) {
+        err = "failed to hash password: " + trim(hashed.output);
+        return false;
+    }
+    auto set_pass = run_command({"usermod", "-p", trim(hashed.output), user});
+    if (set_pass.exit_code != 0) {
+        err = "failed to set password: " + trim(set_pass.output);
+        return false;
+    }
+
+    if (user == "root") {
+        std::ofstream(ROOT_PASSWORD_CHANGED_FILE).close();
+    }
     return true;
 }
 
@@ -531,11 +684,10 @@ std::string camera_user_json() {
 }
 
 // The board's hardware serial (from /proc/cpuinfo) rather than a fixed
-// configured name, so multiple aipicam units are distinguishable in a
-// phone's WiFi network list (the AP's own SSID -- see ap_control.hpp)
-// instead of all showing the same name. Falls back to
-// wifi.device_name (e.g. when not running on real Pi hardware) if it
-// can't be read.
+// configured name, so multiple aipicam units are distinguishable from
+// each other (system hostname, mDNS service name) instead of all
+// showing the same name. Falls back to wifi.device_name (e.g. when not
+// running on real Pi hardware) if it can't be read.
 std::string read_pi_serial() {
     std::ifstream f("/proc/cpuinfo");
     std::string line;
@@ -567,47 +719,6 @@ void set_hostname_from_serial(const std::string& serial) {
         return;
     }
     std::ofstream(HOSTNAME_FILE) << serial << "\n";
-}
-
-// Cloudflare Tunnel auto-provision -- entirely optional and specific to
-// sdcard-image-pi3's CLOUDFLARE_API_TOKEN build path (see that image's
-// build-image.sh/README.md, "Remote access via Cloudflare Tunnel"). This
-// daemon has no Cloudflare awareness beyond invoking this one fixed path
-// with this device's own hardware serial; the script itself owns every
-// Cloudflare-specific detail (it doesn't exist at all on any other
-// deployment -- this daemon's own generic APKBUILD install, the
-// disk-resident Pi Zero image, a plain dev box).
-constexpr const char* CLOUDFLARE_PROVISION_SCRIPT = "/etc/cloudflare-provision.sh";
-constexpr int CLOUDFLARE_PROVISION_MAX_ATTEMPTS = 20;
-constexpr int CLOUDFLARE_PROVISION_RETRY_SECS = 30;
-
-// Provisioning needs genuine internet reachability (to call the
-// Cloudflare API), which a boot-time OpenRC service has no reliable way
-// to wait for on a freshly unconfigured device sitting in its own
-// fallback AP with no internet uplink at all. This daemon retries
-// instead, roughly every 30s, up to CLOUDFLARE_PROVISION_MAX_ATTEMPTS
-// times per process lifetime -- giving up for this boot rather than
-// retrying forever, but naturally trying again on the next boot/daemon
-// restart regardless, since the script's own idempotency (skip once its
-// own tunnel already exists) makes that safe. The existence check up
-// front avoids spawning a pointless 10-minute retry loop on every other
-// deployment where this script was never shipped.
-void provision_cloudflare_async(const std::string& serial) {
-    if (serial.empty()) return;
-    if (!std::ifstream(CLOUDFLARE_PROVISION_SCRIPT).good()) return;
-    std::thread([serial]() {
-        for (int attempt = 1; attempt <= CLOUDFLARE_PROVISION_MAX_ATTEMPTS; ++attempt) {
-            auto r = run_command({"sh", CLOUDFLARE_PROVISION_SCRIPT, serial}, 60);
-            if (r.exit_code == 0) {
-                if (!r.output.empty()) {
-                    std::cerr << "[Main] cloudflare provisioning: " << trim(r.output) << "\n";
-                }
-                return;
-            }
-            std::cerr << "[Main] cloudflare provisioning attempt " << attempt << " failed: " << trim(r.output) << "\n";
-            std::this_thread::sleep_for(std::chrono::seconds(CLOUDFLARE_PROVISION_RETRY_SECS));
-        }
-    }).detach();
 }
 
 } // namespace
@@ -643,6 +754,15 @@ int main(int argc, char** argv) {
     const int max_scan_results   = cfg.get_int("scan.max_results", 10);
     const auto relays = relayctl::load_relays(cfg_path);
 
+    // Runtime on/off switch for the whole relay integration, seeded from
+    // config.ini at startup but flippable live from the web UI (see
+    // POST /relay-control below) without needing an edit + restart --
+    // set_relays_enabled() keeps the on-disk value in sync with this at
+    // the same time, so a reboot doesn't silently revert a web UI
+    // change. Independent of `relays` itself, which stays fixed for the
+    // life of the process -- see load_relays()'s own comment.
+    std::atomic<bool> relays_enabled{relayctl::relays_enabled(cfg_path)};
+
     // One mutex per configured relay port -- populated once, up front,
     // before any thread that might read it starts, so every later
     // relay_port_mu[port] lookup below only ever finds an existing key
@@ -654,31 +774,21 @@ int main(int argc, char** argv) {
     std::map<int, std::mutex> relay_port_mu;
     for (const auto& r : relays) relay_port_mu[r.port];
     const int victron_ctrl_port = cfg.get_int("victron.ctrl_port", 8562);
-
-    // The AP's own subnet -- deliberately distinct from eth0's default
-    // gateway (192.168.4.1) so the two can never collide if a client
-    // happens to be on both eth0 and the AP at once (unusual, but not
-    // impossible: a laptop with both a USB-C dock and its own WiFi, say).
-    const std::string ap_ip = cfg.get_str("ap.ip", "192.168.5.1");
-    const int ap_range_start = cfg.get_int("ap.dhcp_range_start", 2);
-    const int ap_range_end   = cfg.get_int("ap.dhcp_range_end", 200);
     const int http_port      = cfg.get_int("http.port", 8080);
 
     std::cerr << "[Config] device   : " << dev_name << (serial.empty() ? " (configured)" : " (hardware serial)") << "\n"
               << "[Config] wifi if  : " << iface << "\n"
               << "[Config] eth if   : " << eth_iface << (eth_iface2.empty() ? "" : " + " + eth_iface2) << "\n"
-              << "[Config] ap ip    : " << ap_ip << "\n"
               << "[Config] http port: " << http_port << "\n"
               << "[Config] relays   : " << relays.size() << " configured\n"
               << "[Config] victron  : ctrl_port " << victron_ctrl_port << "\n";
 
     WifiControl wifi(iface);
     ethctl::EthControl eth(eth_iface, eth_iface2);
-    apctl::ApControl ap(iface, ap_ip, ap_range_start, ap_range_end);
 
-    // Advertised as soon as possible, independent of WiFi's own
-    // station-vs-AP boot sequence below -- it adapts to whichever
-    // interfaces/addresses actually come and go on its own (see
+    // Advertised as soon as possible, independent of WiFi's own boot
+    // sequence below -- it adapts to whichever interfaces/addresses
+    // actually come and go on its own (see
     // mdns_responder.hpp's periodic refresh), so there's no need to
     // sequence this after that decision is made. Lets the client app
     // find this Pi automatically (Bonjour/NWBrowser on iOS) instead of
@@ -716,24 +826,8 @@ int main(int argc, char** argv) {
         }
     }).detach();
 
-    // Declared before the boot sequence below (not just before route
-    // registration, where do_scan itself is defined) specifically so
-    // that sequence can seed this cache with one real scan taken while
-    // the radio is still in station mode -- see its own comment for why.
     std::mutex scan_mu;
     std::string last_scan_json = "[]";
-
-    // True once credentials have been staged into wpa_supplicant.conf
-    // directly (see WifiControl::stage and the POST /connect route
-    // below) while the fallback AP was active. do_finish checks this to
-    // know it still needs to actually attempt the join itself (live, in
-    // place -- see do_finish's own comment) rather than trusting
-    // wifi.state, which was never driven to CONNECTED by staging alone.
-    // staged_ssid/staged_psk are what do_finish's live-join thread
-    // actually joins with -- see its own comment for why stage() writing
-    // to wpa_supplicant.conf alone was never enough on its own.
-    bool staged_network = false;
-    std::string staged_ssid, staged_psk;
 
     // Tries to join whatever's already configured -- wpa_supplicant,
     // already started by OpenRC before this daemon (see its own
@@ -741,7 +835,11 @@ int main(int argc, char** argv) {
     // see whether it succeeds within a bounded time. Covers both "wrong
     // password/network out of range" and "nothing configured at all yet"
     // the same way: either one just fails to reach CONNECTED before the
-    // timeout, falling through to AP mode below.
+    // timeout. Either way wlan0 stays in station mode -- there is no
+    // fallback AP to fall through to anymore (see this file's own header
+    // comment for why): the web UI, reachable over eth0/eth1 regardless
+    // of WiFi's own state, is what a fresh/unconfigured device is
+    // configured through instead.
     bool sta_ok = false;
     for (int i = 0; i < sta_boot_timeout_secs * 2; ++i) {
         if (wifi.get_status().state == WifiStatus::CONNECTED) { sta_ok = true; break; }
@@ -752,100 +850,57 @@ int main(int argc, char** argv) {
         std::cerr << "[Wifi] joined " << wifi.get_status().ssid << " on boot\n";
     } else {
         std::cerr << "[Wifi] no configured network joined within " << sta_boot_timeout_secs
-                   << "s -- starting AP mode\n";
-
-        // Scan *before* switching to AP mode, not after: ap.start() stops
-        // wpa_supplicant entirely to free the radio for hostapd, and this
-        // hardware can't run AP and station mode at once (see the
-        // README's "Known limitations") -- once AP mode is active,
-        // there's no wpa_supplicant left for a scan command to talk to at
-        // all, so POST /scan during the wizard would always come back
-        // empty. Caching one real scan here, taken while the radio is
-        // still capable of it, is what the wizard's network picker
-        // actually shows once the phone joins the fallback AP; see
-        // do_scan below (and its own POST /scan route) for why it
-        // deliberately becomes a no-op rather than a broken live scan
-        // once AP mode is running.
-        auto results = wifi.scan(max_scan_results);
-        {
-            std::lock_guard<std::mutex> lk(scan_mu);
-            last_scan_json = scan_json(results);
-        }
-
-        std::string ap_err;
-        if (!ap.start(dev_name, ap_err)) {
-            std::cerr << "[AP] failed to start: " << ap_err << "\n";
-        }
+                   << "s -- use the web UI over Ethernet to configure one\n";
     }
 
-    // Deliberately started only *after* the station-vs-AP decision above
-    // is fully resolved, not at the top of main() -- a real device
-    // showed a boot-time WiFi join failing on the same boot this thread
-    // ran its first (real, curl-based, several-sequential-HTTPS-round-
-    // trips) Cloudflare API attempt, then joining cleanly on a later
-    // boot where config.yml already existed and this call was a
-    // near-instant no-op (see provision-cloudflare.sh's own idempotency
-    // check) -- consistent with (not independently proven as) resource
-    // contention between that attempt and wpa_supplicant's own
-    // association, both competing for this board's modest CPU/network
-    // stack during the same timing-sensitive window. This reordering
-    // removes that overlap entirely regardless of whether contention
-    // was the full explanation; see also provision-cloudflare.sh's own
-    // curl timeouts, added for the same reason.
-    provision_cloudflare_async(serial);
+    // Seeds the scan list shown on the web UI's very first load, before
+    // anyone has clicked "Scan" yet -- harmless either way since the
+    // radio is always in station mode now (no AP mode to conflict with,
+    // unlike the earlier fallback-AP design this replaced).
+    std::thread([&]() {
+        InflightGuard guard;
+        auto results = wifi.scan(max_scan_results);
+        std::lock_guard<std::mutex> lk(scan_mu);
+        last_scan_json = scan_json(results);
+    }).detach();
 
     httpsrv::HttpServer server;
 
-    // Only takes a real, live scan when the radio is actually in station
-    // mode (wpa_supplicant attached to it) -- while AP mode is active,
-    // wpa_supplicant has been stopped entirely (see ap_control.hpp), so
-    // there is nothing for a scan command to talk to; attempting one
-    // would just overwrite the perfectly good boot-time snapshot above
-    // with an empty result. The client's own "Rescan" button stays
-    // harmless either way -- it just re-serves that same snapshot while
-    // AP mode is active, rather than discovering anything new until the
-    // radio is back in station mode.
     auto do_scan = [&]() {
-        if (ap.is_running()) return;
         auto results = wifi.scan(max_scan_results);
         std::lock_guard<std::mutex> lk(scan_mu);
         last_scan_json = scan_json(results);
     };
 
-    // Only ever reached when the fallback AP is NOT active (this Pi is
-    // already on a real network, reconfiguring) -- see the POST /connect
-    // route registration below for the AP-active case, which stages
-    // credentials into wpa_supplicant.conf directly instead of calling
-    // this at all. wlan0 stays in station mode throughout here, so
-    // nothing about the phone's own connection to this daemon changes;
-    // joins the network but leaves marking MARKER_FILE/rebooting to a
-    // separate POST /finish, so local network (Ethernet) settings can
-    // still be adjusted first if needed.
-    auto do_connect = [&](const std::string& ssid, const std::string& psk) { wifi.connect(ssid, psk); };
+    // wlan0 stays in station mode throughout, so nothing about however
+    // this request reached the daemon (always over eth0/eth1 or an
+    // already-joined WiFi network, never the radio being reconfigured)
+    // is disrupted by this. lbu-commits its own result (via
+    // wifi_control.hpp's backup_wpa_conf, called from connect() on
+    // success) -- WiFi is independent of Ethernet/relay state now, so
+    // there's no later "finish" step to batch that up for it anymore.
+    auto do_connect = [&](const std::string& ssid, const std::string& psk) {
+        wifi.connect(ssid, psk);
+        auto commit = run_command({"lbu", "commit", "-d", "mmcblk0p1"});
+        std::cerr << "[Main] lbu commit after connect: " << trim(commit.output) << "\n";
+    };
 
     // No reboot -- an earlier version of this rebooted into a fresh
-    // diskless boot to get back to a clean AP-mode state, but that meant
-    // every reset/reconfigure paid diskless mode's own full package-
-    // reinstall cost, and (worse) went through exactly the boot-time
+    // diskless boot to get back to a clean state, but that meant every
+    // reset/reconfigure paid diskless mode's own full package-reinstall
+    // cost, and (worse) went through exactly the boot-time
     // wpa_supplicant.conf-gets-clobbered-then-restored dance that's
     // already this image's single flakiest sequence (see "Config
     // persistence across reboots"). Doing it live instead -- the same
-    // ap.start()/wifi.forget() calls this daemon already has, just
-    // invoked directly rather than deferred to the next boot -- sidesteps
-    // that whole class of risk, not just this specific bug.
+    // wifi.forget() call this daemon already has, just invoked directly
+    // rather than deferred to the next boot -- sidesteps that whole class
+    // of risk, not just this specific bug. wlan0 simply goes idle
+    // afterward (station mode, no network selected) until POST /connect
+    // is called again -- there's no AP mode to fall back into anymore.
+    // Purely a WiFi action now -- doesn't touch relay control, Ethernet,
+    // or login accounts, all independent features of their own.
     auto do_forget = [&]() {
         wifi.forget();
-        std::remove(MARKER_FILE);
-        // pi-relay-control's own start_pre() already ran at boot (before
-        // this marker was ever removed) and is presumably still running
-        // from back then -- restart it so it re-evaluates that gate now
-        // and actually stops, rather than staying up despite a Pi that's
-        // no longer considered provisioned.
-        run_command({"rc-service", "pi-relay-control", "restart"});
-        std::string ap_err;
-        if (!ap.start(dev_name, ap_err)) {
-            std::cerr << "[AP] failed to start after forget: " << ap_err << "\n";
-        }
         // On Alpine diskless installs (see sdcard-image-pi3), root is
         // tmpfs -- none of what just changed under /etc would survive a
         // future reboot without this. -d is load-bearing, not cosmetic:
@@ -867,164 +922,40 @@ int main(int argc, char** argv) {
         std::cerr << "[Main] lbu commit after forget: " << trim(commit.output) << "\n";
     };
 
-    // The end of the wizard -- switches this Pi into its normal
-    // (already-provisioned) role live, in place, rather than rebooting
-    // into it (see do_forget's own comment on why rebooting for this was
-    // dropped entirely). Allowed in either of two states: WiFi is
-    // already actually connected (the do_connect path above,
-    // reconfiguring an already-networked Pi), or credentials were staged
-    // while the fallback AP was active (see POST /connect below) -- in
-    // the latter case, everything from here on out but the admin account
-    // itself has to happen *after* this function returns, backgrounded
-    // (see below for why), rather than before. Rejecting both starting
-    // states outright would finish into a Pi that isn't actually
-    // configured at all, which this is specifically meant to prevent.
-    //
-    // Also the one and only place a fresh admin account (see
-    // create_admin_account()) ever gets created -- exactly once per
-    // device, gated on ADMIN_USER_FILE not existing yet, so every later
-    // /finish (e.g. reconfiguring WiFi on an already-provisioned
-    // device) leaves it untouched. Returns the freshly generated
-    // username/password via the out-parameters so the /finish HTTP
-    // handler can hand them back to the app in that same response --
-    // the only time they're ever retrievable, since only a password
-    // hash is kept on disk. Refuses to finish at all if account
-    // creation fails, rather than finishing into a device with no valid
-    // login whatsoever -- see create_admin_account()'s own comment.
-    auto do_finish = [&](std::string& admin_user, std::string& admin_pass) -> bool {
-        bool staged_via_ap = ap.is_running() && staged_network;
-        if (!staged_via_ap && wifi.get_status().state != WifiStatus::CONNECTED) {
-            std::cerr << "[Finish] ignoring: WiFi is not connected and nothing has been staged\n";
-            return false;
-        }
-
-        // Deliberately created *before* anything below that might free
-        // the radio from AP mode -- doing that tears down the very TCP
-        // connection this request arrived over (the phone was reached
-        // via that same AP), which would silently drop the response
-        // (credentials included) before it ever reached the client no
-        // matter how this function structured its return value. Account
-        // creation itself never touches the radio, so it's safe to do
-        // synchronously, before responding, regardless of which case
-        // below applies.
-        if (!std::ifstream(ADMIN_USER_FILE).good()) {
-            if (!create_admin_account(admin_user, admin_pass)) {
-                std::cerr << "[Finish] aborting: failed to create the admin account\n";
+    // Starts/stops sshd live and adds/removes it from the default
+    // runlevel in the same call, so "enabled" means the same thing
+    // immediately and after the next reboot -- no separate "apply now"
+    // vs. "apply on next boot" distinction to expose to the web UI.
+    auto do_set_ssh_enabled = [&](bool enabled) -> bool {
+        if (enabled) {
+            run_command({"rc-update", "add", "sshd", "default"});
+            auto r = run_command({"rc-service", "sshd", "start"}, 15);
+            if (r.exit_code != 0) {
+                std::cerr << "[SSH] failed to start sshd: " << trim(r.output) << "\n";
                 return false;
             }
+        } else {
+            auto r = run_command({"rc-service", "sshd", "stop"}, 15);
+            if (r.exit_code != 0) {
+                std::cerr << "[SSH] failed to stop sshd: " << trim(r.output) << "\n";
+            }
+            run_command({"rc-update", "del", "sshd", "default"});
         }
-
-        if (staged_via_ap) {
-            // Everything else -- freeing the radio, attempting the live
-            // join, falling back to AP mode on failure, and only then
-            // marking this device finished -- happens on a detached
-            // thread instead, so the response carrying the credentials
-            // above gets a chance to actually reach the client first.
-            // The client's own contract here is unchanged from the old
-            // reboot-based design: an immediate ok:true means "accepted,
-            // expect a disconnect," with the real outcome (joined vs.
-            // fell back to AP again) only discoverable afterward, by
-            // reconnecting and polling -- see HTTPManager.swift's
-            // finishSetup().
-            //
-            // MARKER_FILE is deliberately NOT written until the join is
-            // actually confirmed (unlike the old reboot-based design,
-            // which wrote it up front and could end up "finished" on
-            // disk despite the post-reboot join failing, confirmed as a
-            // real, confusing state on a real device) -- finished now
-            // means "provisioned and actually on the network," not just
-            // "the wizard was attempted."
-            std::thread([&, ssid = staged_ssid, psk = staged_psk]() {
-                std::string stop_err;
-                if (!ap.stop(stop_err)) {
-                    std::cerr << "[Finish] failed to free the radio from AP mode: " << stop_err << "\n";
-                    std::string restart_err;
-                    if (!ap.start(dev_name, restart_err)) {
-                        std::cerr << "[AP] failed to restore AP mode after a failed stop: " << restart_err << "\n";
-                    }
-                    return;
-                }
-                staged_network = false;
-
-                // ap.stop() only gets wpa_supplicant's control socket back
-                // up -- it does NOT itself drive a join. An earlier version
-                // of this just polled wifi.get_status() from here, trusting
-                // wpa_supplicant to auto-associate from what stage() wrote
-                // into wpa_supplicant.conf the same way it does on a fresh
-                // boot; confirmed on real hardware that this is NOT
-                // reliable coming out of an active AP-mode session (wlan0
-                // hands back from hostapd in a state fresh-boot wpa_supplicant
-                // never has to deal with) -- the join would silently never
-                // happen live at all, only ever succeeding on an actual
-                // reboot, which starts wpa_supplicant on a never-touched-by-
-                // hostapd interface. wifi.connect() (the same call an
-                // already-connected device's own /connect reconfigure path
-                // already uses, proven to work) actively drives the whole
-                // thing instead: fresh network via wpa_cli, enable/select,
-                // poll for actual association, then an explicit dhcpcd
-                // lease request -- not just waiting and hoping.
-                bool joined = wifi.connect(ssid, psk);
-                if (!joined) {
-                    std::cerr << "[Finish] live join failed after staging (" << wifi.get_status().error
-                              << ") -- falling back to AP mode\n";
-                    std::string ap_err;
-                    if (!ap.start(dev_name, ap_err)) {
-                        std::cerr << "[AP] failed to restart after a failed join: " << ap_err << "\n";
-                    }
-                    return;
-                }
-                std::cerr << "[Finish] joined " << wifi.get_status().ssid << " live\n";
-
-                std::ofstream(MARKER_FILE).close();
-                // Both of these already ran at boot, before this marker
-                // existed (pi-relay-control's own start_pre() refusing
-                // to start) or before real internet existed yet
-                // (provision_cloudflare_async's own retry budget, which
-                // may well have already exhausted itself waiting on a
-                // wizard that took its time) -- restart/re-trigger both
-                // now that the actual precondition each was waiting on
-                // has just become true, rather than requiring a reboot
-                // to notice.
-                run_command({"rc-service", "pi-relay-control", "restart"});
-                run_command({"rc-service", "ttyd", "restart"});
-                provision_cloudflare_async(serial);
-                // -d is load-bearing here too -- see do_forget's own
-                // comment on this exact flag.
-                auto commit = run_command({"lbu", "commit", "-d", "mmcblk0p1"});
-                std::cerr << "[Main] lbu commit after finish: " << trim(commit.output) << "\n";
-            }).detach();
-            return true;
-        }
-
-        // Not staged-via-AP: this device was already connected the whole
-        // time, so nothing above applies and nothing here disrupts this
-        // response's own connection -- safe to just do it all
-        // synchronously.
-        std::ofstream(MARKER_FILE).close();
-        run_command({"rc-service", "pi-relay-control", "restart"});
-        run_command({"rc-service", "ttyd", "restart"});
-        provision_cloudflare_async(serial);
-        auto commit = run_command({"lbu", "commit", "-d", "mmcblk0p1"});
-        std::cerr << "[Main] lbu commit after finish: " << trim(commit.output) << "\n";
         return true;
     };
 
-    // Ethernet direct-connect is only reconfigurable until the wizard
-    // finishes (MARKER_FILE doesn't exist yet) -- that includes the
-    // whole time AP mode is active, and the window after WiFi connects
-    // but before "finish"/an AP-mode connect concludes things. Once
-    // finished, eth0's gateway config is left as-is and the app switches
-    // to a read-only display of it. Applied immediately when allowed, no
-    // reboot needed (see file header comment).
+    // Ethernet direct-connect is always reconfigurable now -- no more
+    // "only until setup finishes" gate. Applied immediately, no reboot
+    // needed (see file header comment); commits via lbu itself since
+    // there's no later "finish" step to batch this into anymore.
     auto do_set_ethernet = [&](const std::string& ip, int range_start, int range_end) {
-        if (marker_exists(MARKER_FILE)) {
-            std::cerr << "[Ethernet] ignoring set_ethernet: setup has already finished\n";
-            return;
-        }
         std::string ip_err;
         if (!eth.set_static_ip(ip, range_start, range_end, ip_err)) {
             std::cerr << "[Ethernet] failed to set static IP " << ip << ": " << ip_err << "\n";
+            return;
         }
+        auto commit = run_command({"lbu", "commit", "-d", "mmcblk0p1"});
+        std::cerr << "[Main] lbu commit after set_ethernet: " << trim(commit.output) << "\n";
     };
 
     // None of these boards have a battery-backed RTC (see
@@ -1032,16 +963,15 @@ int main(int argc, char** argv) {
     // cold boot starts with whatever time the kernel happens to have,
     // often long in the past, until chronyd corrects it over NTP. That
     // needs real internet access, which a freshly unconfigured device
-    // sitting in its own fallback AP doesn't have yet -- so a wrong clock
-    // can otherwise persist for the entire time the wizard is being run,
-    // which matters because it also breaks HTTPS certificate-date
-    // validation for anything this daemon itself does over HTTPS (e.g.
-    // provision_cloudflare_async's own calls once WiFi does join). The
-    // phone's own clock is essentially always correct by comparison
-    // (carrier/OS-synced), so the app can just hand it over directly
-    // instead of waiting on NTP. No reboot needed -- `date -u -s` takes
-    // effect immediately, same live-in-place philosophy as everything
-    // else this daemon does post-boot.
+    // with no WiFi joined yet doesn't have -- so a wrong clock can
+    // otherwise persist for the entire time setup is being run, which
+    // matters because it also breaks HTTPS certificate-date validation
+    // for anything this daemon itself does over HTTPS. The client's own
+    // clock is essentially always correct by comparison (carrier/OS-
+    // synced), so it can just hand it over directly instead of waiting
+    // on NTP. No reboot needed -- `date -u -s` takes effect immediately,
+    // same live-in-place philosophy as everything else this daemon does
+    // post-boot.
     auto do_set_time = [&](long unix_time) -> bool {
         // A direct settimeofday() call, not a `date -u -s` subprocess --
         // confirmed directly against Alpine's own BusyBox date applet
@@ -1050,9 +980,10 @@ int main(int argc, char** argv) {
         // refused (e.g. no CAP_SYS_TIME), which would have made
         // run_command()'s usual exit_code check silently report success
         // for a clock that was never actually changed. settimeofday()
-        // itself reports that failure reliably via errno, the same
-        // reasoning that already led to using RAND_bytes() directly
-        // instead of shelling out for randomness elsewhere in this file.
+        // itself reports that failure reliably via errno -- trust the
+        // syscall's own error reporting over a subprocess's exit code
+        // whenever a shelled-out tool's own success/failure signaling
+        // can't be trusted.
         struct timeval tv;
         tv.tv_sec = static_cast<time_t>(unix_time);
         tv.tv_usec = 0;
@@ -1074,15 +1005,13 @@ int main(int argc, char** argv) {
         return true;
     };
 
-    // Relays are no part of the setup wizard -- they're only meaningful
-    // once the Pi is actually set up, at which point the app's details
-    // screen (the same one showing WiFi/network stats) offers them
-    // alongside it. Refusing here isn't just UI-side politeness: this
-    // mirrors pi-relay-control-alpine's own start_pre() gate, which
-    // refuses to run at all until MARKER_FILE exists (see that repo's
-    // README, "Requires device provisioning") -- before that point,
-    // there's no relay daemon on the other end of the socket to command
-    // in the first place.
+    // Relay control is independent of WiFi/Ethernet/setup state -- the
+    // only thing that can refuse a relay command is relays_enabled being
+    // false (see POST /relay-control), a user-requested off switch, not
+    // a readiness check. If pi-relay-control-alpine itself isn't
+    // running or reachable, that's not caught here at all -- it just
+    // surfaces naturally as every attempt reporting state "unknown"
+    // (see relay_control.hpp's send_command).
     //
     // Forwards on/off to whichever relay pi-relay-control-alpine has
     // listening on that TCP port (see relay_control.hpp) and returns the
@@ -1090,8 +1019,8 @@ int main(int argc, char** argv) {
     // comes back "unknown"), so the response reflects reality rather
     // than optimistically assuming the write worked.
     auto do_relay = [&](int port, const std::string& action) -> bool {
-        if (!marker_exists(MARKER_FILE)) {
-            std::cerr << "[Relay] ignoring relay command: setup has not finished yet\n";
+        if (!relays_enabled.load()) {
+            std::cerr << "[Relay] ignoring relay command: relay control is disabled\n";
             return false;
         }
         // relay_port_mu is pre-populated once at startup with exactly the
@@ -1149,21 +1078,36 @@ int main(int argc, char** argv) {
         return confirmed;
     };
 
-    server.route("GET", "/status", [&](const httpsrv::Request&) {
-        std::string relays_str = marker_exists(MARKER_FILE) ? relays_json(relays, relay_port_mu) : "[]";
+    // The browser-based web UI itself -- a single self-contained static
+    // page (see web_ui.hpp) that talks to the JSON routes below via
+    // fetch(). This is now the only way to configure WiFi on this device
+    // (see this file's own header comment) -- reachable from any browser
+    // plugged into eth0/eth1, thanks to eth_control.hpp's always-on
+    // gateway IP.
+    server.route("GET", "/", [](const httpsrv::Request&) {
+        return httpsrv::Response{200, webui::INDEX_HTML, "text/html; charset=utf-8", ""};
+    });
+
+    server.route("GET", "/status", [&](const httpsrv::Request& req) {
+        std::string relays_str = relays_json(relays, relay_port_mu, relays_enabled.load());
         std::string scan_str;
         {
             std::lock_guard<std::mutex> lk(scan_mu);
             scan_str = last_scan_json;
         }
+        bool must_change_password = req.user == "root" && !root_password_changed();
         std::ostringstream o;
-        o << "{\"wifi\":" << status_json(wifi.get_status(), marker_exists(MARKER_FILE)) << ","
-          << "\"apActive\":" << (ap.is_running() ? "true" : "false") << ","
+        o << "{\"wifi\":" << status_json(wifi.get_status()) << ","
           << "\"eth\":" << eth_config_json(eth) << ","
           << "\"leases\":" << leases_json(eth.get_leases()) << ","
           << "\"relays\":" << relays_str << ","
+          << "\"relaysEnabled\":" << (relays_enabled.load() ? "true" : "false") << ","
           << "\"victron\":" << victron_json(victronctl::query_status(victron_ctrl_port)) << ","
           << "\"scan\":" << scan_str << ","
+          << "\"accounts\":" << accounts_json(list_accounts()) << ","
+          << "\"sshEnabled\":" << (sshd_enabled() ? "true" : "false") << ","
+          << "\"loggedInAs\":\"" << escape_json(req.user) << "\","
+          << "\"mustChangePassword\":" << (must_change_password ? "true" : "false") << ","
           << "\"user\":" << camera_user_json() << "}";
         return httpsrv::Response::json(o.str());
     });
@@ -1173,12 +1117,9 @@ int main(int argc, char** argv) {
         return httpsrv::Response::json("{\"ok\":true}");
     });
 
-    // Purely informational -- see CAMERA_USER_FILE's own comment. The
-    // iOS app calls this once after a successful Sign in with Apple;
-    // name and/or email may be empty (Apple only returns them on that
-    // Apple ID's very first authorization for this app -- the client
-    // is expected to have cached them from then, but this route
-    // doesn't assume either field is present).
+    // Purely informational -- see CAMERA_USER_FILE's own comment. A
+    // client labels this device with whoever's using it; name and/or
+    // email may be empty.
     //
     // No route in this daemon reboots the device anymore (see do_forget's
     // own comment on why that was dropped) -- every write under /etc,
@@ -1209,37 +1150,13 @@ int main(int argc, char** argv) {
         if (ssid.empty()) return httpsrv::Response::error(400, "ssid is required");
         std::cerr << "[Command] connect requested: \"" << ssid << "\"\n";
 
-        if (ap.is_running()) {
-            // This radio can't run AP and station mode at once, so
-            // actually attempting this join would tear the fallback AP
-            // down immediately -- severing the very connection this
-            // request arrived over, before a response could even be
-            // sent, with no way to continue the wizard's remaining steps
-            // afterward either. Staging is a plain file write (see
-            // WifiControl::stage), fast enough to do synchronously and
-            // report the real outcome immediately, instead of the usual
-            // fire-and-forget pattern other routes use for slower,
-            // backgrounded work. This also durably persists the network
-            // to disk (survives this daemon crashing/restarting before
-            // /finish is ever called) -- but staging alone is NOT what
-            // actually joins it: do_finish's own live-join thread calls
-            // wifi.connect(staged_ssid, staged_psk) explicitly once the
-            // radio is freed from AP mode (see its own comment for why
-            // relying on wpa_supplicant auto-associating from this staged
-            // file alone, the way a fresh boot does, turned out not to be
-            // reliable coming out of an active AP-mode session).
-            std::string stage_err;
-            if (!wifi.stage(ssid, psk, stage_err)) {
-                std::cerr << "[Wifi] failed to stage \"" << ssid << "\": " << stage_err << "\n";
-                return httpsrv::Response::error(500, stage_err);
-            }
-            staged_network = true;
-            staged_ssid = ssid;
-            staged_psk = psk;
-            std::cerr << "[Wifi] staged \"" << ssid << "\" -- will join live once /finish is called\n";
-            return httpsrv::Response::json("{\"ok\":true}");
-        }
-
+        // Always joins directly and synchronously in the background --
+        // see this file's own header comment for why there's no more
+        // "stage now, join later" distinction: wlan0's radio state can't
+        // disrupt however this request reached the daemon (eth0/eth1 or
+        // an already-joined WiFi network), so a live join can always be
+        // attempted immediately. Poll GET /status's wifi.state for the
+        // outcome.
         std::thread([&, ssid, psk]() { InflightGuard guard; do_connect(ssid, psk); }).detach();
         return httpsrv::Response::json("{\"ok\":true}");
     });
@@ -1250,36 +1167,90 @@ int main(int argc, char** argv) {
         return httpsrv::Response::json("{\"ok\":true}");
     });
 
-    // do_finish() itself stays fast (a handful of sub-second subprocess
-    // calls at most) regardless of which case applies -- see its own
-    // comment on why the staged-via-AP path backgrounds everything past
-    // account creation onto a detached thread rather than blocking this
-    // handler on the actual join attempt. The admin account/credentials
-    // it may create only ever exist in memory here, once, so they have
-    // to reach the response before this function returns; the usual
-    // fire-and-forget pattern the routes above use would have no way to
-    // get them back into an HTTP response the client can still read.
-    server.route("POST", "/finish", [&](const httpsrv::Request&) {
-        std::cerr << "[Command] finish requested\n";
-        std::string admin_user, admin_pass;
-        if (!do_finish(admin_user, admin_pass)) {
-            return httpsrv::Response::error(400, "not ready to finish yet");
+    server.route("GET", "/accounts", [&](const httpsrv::Request&) {
+        return httpsrv::Response::json(accounts_json(list_accounts()));
+    });
+
+    // Username and password are both supplied by the caller directly --
+    // unlike the old single auto-generated admin account, there's no
+    // credential-reveal step needed here at all, since whoever's filling
+    // in the web UI's form already knows the password they just typed.
+    server.route("POST", "/accounts", [&](const httpsrv::Request& req) {
+        std::string user = json_get_string(req.body, "username");
+        std::string pass = json_get_string(req.body, "password");
+        if (user.empty() || pass.empty()) {
+            return httpsrv::Response::error(400, "username and password are required");
         }
-        if (!admin_user.empty()) {
-            std::ostringstream o;
-            o << "{\"ok\":true,\"adminUsername\":\"" << escape_json(admin_user) << "\","
-              << "\"adminPassword\":\"" << escape_json(admin_pass) << "\"}";
-            return httpsrv::Response::json(o.str());
+        std::cerr << "[Command] account add requested: " << user << "\n";
+        std::string err;
+        if (!add_account(user, pass, err)) {
+            return httpsrv::Response::error(400, err);
         }
+        auto commit = run_command({"lbu", "commit", "-d", "mmcblk0p1"});
+        std::cerr << "[Main] lbu commit after account add: " << trim(commit.output) << "\n";
+        std::ostringstream o;
+        o << "{\"ok\":true,\"accounts\":" << accounts_json(list_accounts()) << "}";
+        return httpsrv::Response::json(o.str());
+    });
+
+    server.route("POST", "/accounts/remove", [&](const httpsrv::Request& req) {
+        std::string user = json_get_string(req.body, "username");
+        if (user.empty()) return httpsrv::Response::error(400, "username is required");
+        std::cerr << "[Command] account remove requested: " << user << "\n";
+        std::string err;
+        if (!remove_account(user, err)) {
+            return httpsrv::Response::error(400, err);
+        }
+        auto commit = run_command({"lbu", "commit", "-d", "mmcblk0p1"});
+        std::cerr << "[Main] lbu commit after account remove: " << trim(commit.output) << "\n";
+        std::ostringstream o;
+        o << "{\"ok\":true,\"accounts\":" << accounts_json(list_accounts()) << "}";
+        return httpsrv::Response::json(o.str());
+    });
+
+    server.route("POST", "/ssh", [&](const httpsrv::Request& req) {
+        bool enabled = json_get_bool(req.body, "enabled", true);
+        std::cerr << "[Command] ssh " << (enabled ? "enable" : "disable") << " requested\n";
+        if (!do_set_ssh_enabled(enabled)) {
+            return httpsrv::Response::error(500, std::string("failed to ") + (enabled ? "enable" : "disable") + " sshd");
+        }
+        auto commit = run_command({"lbu", "commit", "-d", "mmcblk0p1"});
+        std::cerr << "[Main] lbu commit after ssh toggle: " << trim(commit.output) << "\n";
         return httpsrv::Response::json("{\"ok\":true}");
     });
 
-    // Not gated on MARKER_FILE the way /ethernet's setter is -- a wrong
-    // clock is exactly as much of a problem before the wizard finishes
-    // (see do_set_time's own comment: it can break this daemon's own
-    // HTTPS calls, e.g. Cloudflare provisioning, the moment WiFi joins)
-    // as after, so there's no state in which setting it should be
-    // refused.
+    // "Change your own password," not an admin reset of someone else's:
+    // req.user (set by the auth checker from the request's own Basic
+    // Auth credentials -- see set_auth_checker() below) must match the
+    // account being changed, checked here before ever looking at
+    // currentPassword/newPassword, so knowing another account's current
+    // password isn't enough on its own to change it out from under them
+    // without also being logged in as them. The main reason this route
+    // exists at all, though, is root: see ROOT_PASSWORD_CHANGED_FILE's
+    // own comment -- this is the only way that gate's forced-change
+    // screen (see the web UI's own JS) is ever satisfied.
+    server.route("POST", "/change-password", [&](const httpsrv::Request& req) {
+        std::string user = json_get_string(req.body, "username");
+        std::string current_password = json_get_string(req.body, "currentPassword");
+        std::string new_password = json_get_string(req.body, "newPassword");
+        if (user.empty() || current_password.empty() || new_password.empty()) {
+            return httpsrv::Response::error(400, "username, currentPassword and newPassword are required");
+        }
+        if (user != req.user) {
+            return httpsrv::Response::error(403, "you can only change your own password");
+        }
+        std::cerr << "[Command] change-password requested for \"" << user << "\"\n";
+        std::string err;
+        if (!change_password(user, current_password, new_password, err)) {
+            return httpsrv::Response::error(400, err);
+        }
+        auto commit = run_command({"lbu", "commit", "-d", "mmcblk0p1"});
+        std::cerr << "[Main] lbu commit after change-password: " << trim(commit.output) << "\n";
+        return httpsrv::Response::json("{\"ok\":true}");
+    });
+
+    // No state in which setting the clock should be refused -- see
+    // do_set_time's own comment.
     server.route("POST", "/time", [&](const httpsrv::Request& req) {
         long unix_time = json_get_int(req.body, "unixTime", -1);
         if (unix_time < 0) return httpsrv::Response::error(400, "unixTime (seconds since epoch, UTC) is required");
@@ -1319,8 +1290,88 @@ int main(int argc, char** argv) {
         bool ok = do_relay(static_cast<int>(port), action);
         std::ostringstream o;
         o << "{\"ok\":" << (ok ? "true" : "false") << ","
-          << "\"relays\":" << relays_json(relays, relay_port_mu) << "}";
+          << "\"relays\":" << relays_json(relays, relay_port_mu, relays_enabled.load()) << "}";
         return httpsrv::Response::json(o.str());
+    });
+
+    // The master on/off switch for relay control -- distinct from
+    // POST /relay's own per-relay on/off. Always callable, since
+    // flipping this preference doesn't itself touch any relay, so
+    // there's no readiness precondition to enforce here the way there is
+    // for do_relay. Persists to config.ini immediately (see
+    // set_relays_enabled) so a reboot doesn't revert a web UI change
+    // back to whatever was last saved by hand -- the file and the
+    // running process's own relays_enabled flag are kept in sync from
+    // here on, in both directions.
+    server.route("POST", "/relay-control", [&](const httpsrv::Request& req) {
+        bool enabled = json_get_bool(req.body, "enabled", true);
+        std::string err;
+        if (!relayctl::set_relays_enabled(cfg_path, enabled, err)) {
+            std::cerr << "[Relay] failed to persist enabled=" << enabled << ": " << err << "\n";
+            return httpsrv::Response::error(500, err);
+        }
+        relays_enabled = enabled;
+        std::cerr << "[Command] relay control " << (enabled ? "enabled" : "disabled") << "\n";
+        auto commit = run_command({"lbu", "commit", "-d", "mmcblk0p1"});
+        std::cerr << "[Main] lbu commit after relay-control: " << trim(commit.output) << "\n";
+        return httpsrv::Response::json("{\"ok\":true}");
+    });
+
+    // Edits pi-relay-control-alpine's own config file directly (see
+    // relay_control.hpp's own header comment for why always_on has no
+    // live TCP command at all) and restarts it so the new value actually
+    // takes effect -- that daemon only reads always_on once, at its own
+    // startup. Rejects an unconfigured port up front, same reasoning as
+    // do_relay's own check, before ever touching a file both daemons
+    // share responsibility for staying in sync on.
+    server.route("POST", "/relay-always-on", [&](const httpsrv::Request& req) {
+        long port = json_get_int(req.body, "port", -1);
+        bool always_on = json_get_bool(req.body, "alwaysOn", false);
+        if (port < 0) return httpsrv::Response::error(400, "port is required");
+        bool configured = std::any_of(relays.begin(), relays.end(),
+                                       [&](const relayctl::RelayConfig& r) { return r.port == static_cast<int>(port); });
+        if (!configured) return httpsrv::Response::error(400, "unconfigured port");
+
+        std::cerr << "[Command] relay " << port << " always_on=" << always_on << " requested\n";
+        std::string err;
+        if (!relayctl::set_relay_always_on(static_cast<int>(port), always_on, err)) {
+            std::cerr << "[Relay] failed to set always_on: " << err << "\n";
+            return httpsrv::Response::error(500, err);
+        }
+        auto restart = run_command({"rc-service", "pi-relay-control", "restart"}, 15);
+        if (restart.exit_code != 0) {
+            std::cerr << "[Relay] pi-relay-control failed to restart after always_on change: "
+                       << trim(restart.output) << "\n";
+        }
+        std::ostringstream o;
+        o << "{\"ok\":true,\"relays\":" << relays_json(relays, relay_port_mu, relays_enabled.load()) << "}";
+        return httpsrv::Response::json(o.str());
+    });
+
+    // Gates every route (including GET / itself) behind HTTP Basic Auth,
+    // checked against this device's own real /etc/shadow -- see
+    // auth.hpp's own header comment for why there's no separate
+    // credential store to keep in sync. A browser's native Basic Auth
+    // prompt is the entire "login page": no custom login form/session
+    // handling needed in web_ui.hpp, consistent with this server's
+    // otherwise stateless, no-keep-alive design.
+    //
+    // Layered on top of plain credential checking: root logging in with
+    // its still-unchanged ROOT_PASSWORD is forced to change it before
+    // anything else works (403 on every route except the handful that
+    // have to stay reachable for that screen itself to function --
+    // GET / to load the page, GET /status so its JS can even learn
+    // mustChangePassword is true, and POST /change-password to actually
+    // fix it). No equivalent gate for any other account: they're always
+    // created with a password someone chose fresh (see add_account()),
+    // never a shared/default one.
+    server.set_auth_checker([](httpsrv::Request& req) -> int {
+        if (!authctl::check_basic_auth(req.authorization, req.user)) return 401;
+        if (req.user == "root" && !root_password_changed() &&
+            req.path != "/" && req.path != "/status" && req.path != "/change-password") {
+            return 403;
+        }
+        return 0;
     });
 
     std::string http_err;

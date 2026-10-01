@@ -46,16 +46,13 @@
  * ignore eth0/eth1/the bridge entirely (`denyinterfaces`) so it can't
  * fight over the address once carrier does appear.
  *
- * Unlike a WiFi network change, applying this doesn't need a reboot:
- * eth0/eth1/the bridge are entirely independent of whatever wlan0 is
- * doing (station mode, AP fallback, or mid-transition between the two --
- * see ap_control.hpp), so there's no coexistence problem to route around
- * -- the affected services (dhcpcd, dnsmasq) are just restarted directly
- * and the change takes effect immediately. WiFi's own connect/forget/
- * finish flows reboot by deliberate design choice (see main.cpp), not
- * because of any hardware necessity -- a working connection to reach
- * this daemon on again is only guaranteed after a full restart anyway,
- * once either flow concludes.
+ * Applying this doesn't need a reboot: eth0/eth1/the bridge are entirely
+ * independent of whatever wlan0 is doing (station mode is the only mode
+ * it ever runs in now -- see main.cpp's own header comment), so there's
+ * no coexistence problem to route around -- the affected services
+ * (dhcpcd, dnsmasq) are just restarted directly and the change takes
+ * effect immediately. Same for WiFi's own connect/forget/finish flows
+ * (see main.cpp) -- nothing here reboots the Pi at all anymore.
  *
  * The chosen IP and DHCP range are persisted in a plain state file so
  * they survive reboots (unlike `ip addr add`, which doesn't); the
@@ -153,10 +150,7 @@ inline int last_octet(const std::string& ip) {
 
 // Replaces (or removes entirely, if new_block is empty) a
 // marker-delimited block in a config file, leaving everything else in
-// the file untouched. begin/end default to this file's own eth0 markers;
-// ap_control.hpp reuses this same helper with its own distinct markers
-// so both can coexist in the same dnsmasq.conf, each managing only its
-// own interface's block.
+// the file untouched. begin/end default to this file's own eth0 markers.
 inline void replace_marker_block(const std::string& path, const std::string& new_block,
                                   const std::string& begin = BEGIN_MARKER, const std::string& end = END_MARKER) {
     std::ifstream in(path);
@@ -283,21 +277,19 @@ public:
         dhcpcd_block << " " << BRIDGE_NAME << "\n";
         replace_marker_block(DHCPCD_CONF, dhcpcd_block.str());
         // See network_lock.hpp -- held only for this restart, not the
-        // whole function: ap_control.hpp's start()/stop() (the WiFi
-        // fallback AP) and wifi_control.hpp's connect() all depend on
-        // dhcpcd being in a settled state via OpenRC's `need net`, or
-        // touch it directly -- confirmed on real hardware that letting
-        // those race with this exact restart produces "cannot start
-        // dnsmasq/hostapd as dhcpcd would not start" and a WiFi join
-        // that associates but never gets an IP. Scoped narrowly (not the
-        // whole function) after ALSO confirming on real hardware that a
-        // wider lock here creates a worse regression: the bridge
-        // creation/STP-disable/interface-enslavement steps below are
-        // slow and deliberately run on their own detached thread at boot
-        // specifically so they never block the WiFi AP from starting --
-        // holding this lock across them serializes this function behind
-        // ap_control.hpp's own start(), which can leave the fallback AP
-        // simply never starting while this thread is still running.
+        // whole function: wifi_control.hpp's connect() depends on dhcpcd
+        // being in a settled state via OpenRC's `need net`, or touches it
+        // directly -- confirmed on real hardware that letting that race
+        // with this exact restart produces "cannot start dnsmasq as
+        // dhcpcd would not start" and a WiFi join that associates but
+        // never gets an IP. Scoped narrowly (not the whole function)
+        // after ALSO confirming on real hardware that a wider lock here
+        // creates a worse regression: the bridge creation/STP-disable/
+        // interface-enslavement steps below are slow and deliberately
+        // run on their own detached thread at boot specifically so they
+        // never block anything else waiting on the network stack --
+        // holding this lock across them would serialize this function
+        // behind any concurrent wifi_control.hpp connect() for no reason.
         {
             std::lock_guard<std::mutex> lock(network_guard::mu);
             run_command({"rc-service", "dhcpcd", "restart"}, 20);

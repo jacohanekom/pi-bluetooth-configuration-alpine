@@ -17,10 +17,10 @@ README only covers what's actually **different** for the Zero.
 
 ## Why a separate image directory, not one script for both boards
 
-`arch=` (`armhf` vs `aarch64`), the official Alpine release tarball,
+`arch=` (`armhf` vs `aarch64`), the official Alpine release tarball, and
 the `--platform` Docker needs for a genuine (QEMU-emulated, on typical
-build machines) target binary, and the `cloudflared` binary/checksum
-all differ per board -- and unlike the disk-resident era this project
+build machines) target binary all differ per board -- and unlike the
+disk-resident era this project
 moved away from, there's no shared disk-resident base image build to
 factor these into instead. Keeping each board's image self-contained in
 its own directory (same convention as `sdcard-image-pi3`) means every
@@ -38,41 +38,42 @@ release server and Docker's own multi-arch `alpine` image manifest
 (which lists `linux/arm/v6` and `linux/arm/v7` as genuinely distinct
 platforms), not assumed. This is also exactly the distinction that made
 Wetty (Node.js/V8) a real risk on this specific board -- V8 hasn't
-properly supported ARMv6 in years -- which is why this project replaced
-it with [ttyd](https://github.com/tsl0922/ttyd) (a plain C binary via
-libwebsockets) project-wide before this image was built. Nothing
-shipped in this image is Node.js-based any more; see
-`../sdcard-image-pi3/README.md`'s "Web terminal (ttyd)" section for the
-full history.
+properly supported ARMv6 in years -- which is why this project dropped
+it entirely (first for ttyd, a plain C web terminal, later removed too
+-- see git history). Nothing shipped in this image is Node.js-based any
+more.
 
 ## Hardware differences from a Pi 3
 
 - **No onboard Ethernet at all** (not even a limited/USB-bridged one) --
   a Zero/Zero W has exactly one data-capable port (the micro-USB one
-  labeled "USB", not "PWR"). First internet access is therefore
-  necessarily over WiFi, via the same fallback-AP-then-real-network flow
-  the main [README](../README.md) already describes -- nothing about
-  that flow changes here, since a Pi 3 build already goes through WiFi
-  either way; it's just no longer optional the way it technically was
-  on a board with an Ethernet jack.
+  labeled "USB", not "PWR"), normally reserved for the Victron USB
+  cable (see below). The main [README](../README.md)'s WiFi setup flow
+  is now web-UI-over-Ethernet only (no fallback access point -- see its
+  own header comment for why). **This board has no Ethernet port to
+  reach that web UI over, so there is currently no headless way to
+  configure WiFi on a fresh Zero** -- a USB-to-Ethernet OTG adapter
+  (freeing up the port normally used for Victron) is the only known
+  workaround until this gets a proper fix.
 - **Single USB port, shared** -- a genuine Victron VE.Direct-to-USB
   cable (what `victron-ve-direct` expects at `/dev/ttyUSB0`) needs that
   same port, via a USB OTG adapter. If you also want a keyboard at the
-  physical console (see "Logging in: the admin account, not root" in
+  physical console (see "Logging in: user accounts, not root" in
   the pi3 README -- `ROOT_PASSWORD` is console-only, same here), you'll
   need a powered USB hub rather than relying on the Zero's single port
   for both at once.
 - **Single-core, no hardware floating-point-heavy workload here** --
   none of the three daemons or the packages this image installs
-  (`hostapd`, `dnsmasq`, `avahi`, `dbus`, `ttyd`, `cloudflared`) are
-  CPU-intensive; this is the same class of lightweight C-daemon
+  (`dnsmasq`, `avahi`, `dbus`) are CPU-intensive; this is the
+  same class of lightweight C-daemon
   workload Alpine's own diskless images are routinely run on Zero-class
   hardware for. No performance-driven changes were needed anywhere in
   this image relative to the pi3 build.
 - **No Bluetooth radio distinction that matters here** -- despite the
-  parent project's name, WiFi setup in this daemon has been HTTP+AP+mDNS
-  based (not BLE) since the pivot documented in the main README; a Zero
-  W's WiFi/BT combo chip is used the same way a Pi 3's is.
+  parent project's name, WiFi setup in this daemon is a web UI over
+  Ethernet + a plain HTTP API + mDNS (not BLE) since the pivots
+  documented in the main README; a Zero W's WiFi/BT combo chip is used
+  the same way a Pi 3's is.
 
 ## Prerequisites
 
@@ -116,27 +117,10 @@ ROOT_PASSWORD='something-you-choose' ./build-image.sh
 ```
 
 Optional: `PI_HOSTNAME=whatever` (defaults to `aipicam`). Output is
-`aipicam-pi-zero-diskless.img` (~768MB). Same `ROOT_PASSWORD`
-handling, web terminal (ttyd), admin-account/doas login model, and
-optional Cloudflare Tunnel setup as `sdcard-image-pi3` -- see that
-directory's README for "Web terminal (ttyd)", "Logging in: the admin
-account, not root", and "Remote access via Cloudflare Tunnel" in full;
-none of it differs here except which `cloudflared` binary gets fetched:
-
-```sh
-ROOT_PASSWORD='something-you-choose' \
-CLOUDFLARE_API_TOKEN='<a scoped Cloudflare API token>' \
-CLOUDFLARE_ACCOUNT_ID='<your Cloudflare account ID>' \
-CLOUDFLARE_ZONE_ID='<the zone ID owning CLOUDFLARE_DOMAIN>' \
-CLOUDFLARE_DOMAIN='devices.example.com' \
-./build-image.sh
-```
-
-`build-image.sh` fetches the `cloudflared-linux-armhf` GitHub release
-asset here (not `cloudflared-linux-arm64`, the pi3 build's asset, or
-`cloudflared-linux-arm`, which targets ARMv7+ and won't run on this
-SoC), verified against its own pinned checksum -- confirmed directly
-against the real release's asset list, not assumed.
+`aipicam-pi-zero-diskless.img` (~768MB). Same `ROOT_PASSWORD` handling
+and user-account/doas login model as `sdcard-image-pi3` -- see that
+directory's README's "Logging in: user accounts, not root" in full;
+none of it differs here.
 
 ## 3. Write it to an SD card
 
@@ -163,11 +147,9 @@ runner to build natively on, so this one always emulates (see
 "Prerequisites" above). Same `workflow_dispatch`-only trigger and repo
 secrets as `sdcard-image-pi3.yml`:
 
-- `SDCARD_ROOT_PASSWORD`, `CROSS_REPO_GH_TOKEN`,
-  `SDCARD_CLOUDFLARE_API_TOKEN`, `SDCARD_CLOUDFLARE_ACCOUNT_ID`,
-  `SDCARD_CLOUDFLARE_ZONE_ID`, `SDCARD_CLOUDFLARE_DOMAIN` -- same
-  meaning as `sdcard-image-pi3.yml`'s own (see that workflow/README),
-  shared across both images rather than duplicated per board.
+- `SDCARD_ROOT_PASSWORD`, `CROSS_REPO_GH_TOKEN` -- same meaning as
+  `sdcard-image-pi3.yml`'s own (see that workflow/README), shared across
+  both images rather than duplicated per board.
 
 Then trigger it from the Actions tab, or:
 
@@ -196,23 +178,22 @@ section; nothing about the security model differs by board.
 - A full real run of `build-image.sh` (using placeholder `.apk`
   artifacts standing in for the three real daemons, built via a
   throwaway `abuild` package under QEMU armhf emulation) was verified
-  end-to-end on this Mac, both without and with `CLOUDFLARE_API_TOKEN`
-  set: `fsck.fat` reports a clean filesystem, the correct
-  `bcm2835-rpi-zero*.dtb`/`bootcode.bin` boot files are present, the
-  resulting apkovl was extracted and inspected directly to confirm it
-  contains `ttyd` (not `wetty`/`nodejs` anywhere) with correct runlevel
-  wiring, and -- with Cloudflare enabled -- the embedded `cloudflared`
-  binary's SHA-256 matched the pinned `CLOUDFLARED_SHA256` exactly, byte
-  for byte. Not yet run with the real daemon artifacts or test-booted on
-  real Pi Zero/Zero W hardware -- please report back if you hit
-  anything on first boot.
+  end-to-end on this Mac: `fsck.fat` reports a clean filesystem, the
+  correct `bcm2835-rpi-zero*.dtb`/`bootcode.bin` boot files are present,
+  and the resulting apkovl was extracted and inspected directly to
+  confirm it contains no `wetty`/`nodejs`/`ttyd` anywhere, with correct
+  runlevel wiring. Not yet run with the real daemon artifacts or
+  test-booted on real Pi Zero/Zero W hardware -- please report back if
+  you hit anything on first boot.
 - Everything inherited unchanged from `sdcard-image-pi3` (the
-  `wpa_supplicant.conf`-clobber fix, the admin-account/doas flow, the
-  `provision-cloudflare.sh` control flow) carries the exact same
-  verification status documented in that directory's own "Known
-  limitations" section -- none of it is board-specific, so nothing
-  further was re-verified here beyond confirming the armhf build itself
-  produces the same correct output.
+  `wpa_supplicant.conf`-clobber fix, the user-account/doas flow) carries
+  the exact same verification status documented in that directory's own
+  "Known limitations" section -- none of it is board-specific, so
+  nothing further was re-verified here beyond confirming the armhf build
+  itself produces the same correct output.
+- **No headless WiFi setup path on a fresh Zero at all** (see "Hardware
+  differences from a Pi 3" above) -- this is a real, currently-unsolved
+  gap for this board specifically, not just unverified.
 - Only tested/intended for a genuine Pi Zero or Zero W (`bcm2835`
   SoC); the second-generation Pi Zero 2 W uses a different,
   aarch64-capable SoC and should use the `sdcard-image-pi3` build

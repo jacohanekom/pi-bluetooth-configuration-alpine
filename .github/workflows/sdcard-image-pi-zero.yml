@@ -65,14 +65,6 @@ jobs:
         env:
           ROOT_PASSWORD: ${{ secrets.SDCARD_ROOT_PASSWORD }}
           PI_HOSTNAME: ${{ inputs.hostname }}
-          # Same secrets as sdcard-image-pi3.yml, shared across both
-          # images rather than duplicated per board. Leave
-          # CLOUDFLARE_API_TOKEN unset to skip Cloudflare Tunnel
-          # entirely -- see sdcard-image-pi-zero/README.md.
-          CLOUDFLARE_API_TOKEN: ${{ secrets.SDCARD_CLOUDFLARE_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.SDCARD_CLOUDFLARE_ACCOUNT_ID }}
-          CLOUDFLARE_ZONE_ID: ${{ secrets.SDCARD_CLOUDFLARE_ZONE_ID }}
-          CLOUDFLARE_DOMAIN: ${{ secrets.SDCARD_CLOUDFLARE_DOMAIN }}
         run: |
           cd sdcard-image-pi-zero
           ./build-image.sh

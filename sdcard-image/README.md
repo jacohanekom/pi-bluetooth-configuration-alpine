@@ -78,10 +78,12 @@ write on macOS.)
 
 ## First boot
 
-- WiFi: nothing is configured yet, so `pi-bluetooth-configuration` opens
-  its fallback AP (SSID = the Pi's hardware serial) -- follow the normal
-  setup flow in the iOS app from there. See the main
-  [README](../README.md).
+- WiFi: nothing is configured yet -- `eth0` is already up as a working
+  gateway, so plug a laptop into it and open the web UI to scan for and
+  join a network. See the main [README](../README.md). (Note: this
+  particular image variant is unmaintained/no longer CI-built -- see
+  `sdcard-image-pi3`/`sdcard-image-pi-zero` for the current diskless
+  builds.)
 - SSH: `ssh root@<hostname>.local` (or its DHCP-assigned IP), password
   is whatever you set as `ROOT_PASSWORD` above. Each card gets its own
   freshly generated SSH host keys on first boot (not baked into the
@@ -98,10 +100,11 @@ write on macOS.)
 
 ## Security note
 
-This daemon's fallback AP is deliberately open (no password) so a phone
-can join it during setup -- see the main README's Security model
-section. That means, for however long the Pi is in fallback-AP mode,
-anyone in range can also reach its SSH port over that same open network.
+This daemon's web UI and HTTP API are plain, unauthenticated HTTP,
+reachable to anything wired into `eth0` (or already on whatever WiFi
+network the Pi joined) -- see the main README's Security model section.
+Unlike the diskless images, this variant still permits root SSH login,
+so anything that can reach the Pi's network can also reach its SSH port.
 Change `ROOT_PASSWORD` to something you're comfortable with before
 building, and consider switching to key-based auth
 (`PasswordAuthentication no` in `/etc/ssh/sshd_config`, plus your own

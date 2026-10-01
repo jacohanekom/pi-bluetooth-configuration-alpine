@@ -24,8 +24,7 @@
 # certificate dates fails outright while the clock is this wrong --
 # confirmed on real hardware against this image's previous Tailscale-
 # based remote-access feature ("x509: certificate has expired or is not
-# yet valid"), and just as applicable to cloudflared's own connection to
-# Cloudflare's edge now.
+# yet valid").
 #
 # Same clobbering problem as wpa_supplicant.conf (see
 # restore-wifi-config.initd/wifi_control.hpp's own comments) --
