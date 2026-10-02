@@ -52,10 +52,9 @@ fully different config-persistence model -- see below.
   (`apks/aarch64/` + a `.boot_repository` marker file) covering the
   base system and a handful of common daemons -- `build-image.sh`
   extends this same repository with everything our three daemons
-  additionally need (`hostapd`, `dnsmasq`, `iptables`, `avahi`, `dbus`,
-  WiFi firmware) plus the three daemons' own `.apk` files, then
-  re-signs the index with a throwaway key generated fresh for the
-  build.
+  additionally need (`dnsmasq`, `iptables`, `avahi`, `dbus`, WiFi
+  firmware) plus the three daemons' own `.apk` files, then re-signs the
+  index with a throwaway key generated fresh for the build.
 - `nlplug-findfs` (the initramfs's own boot-media scanner, confirmed by
   reading its actual source) finds this repository via the
   `.boot_repository` marker at boot and adds it to
@@ -84,19 +83,23 @@ for two different classes of state:
 
 - **Everything under `/etc`** -- WiFi credentials
   (`/etc/wpa_supplicant/wpa_supplicant.conf`), SSH host keys, user
-  account doas permits, the Ethernet gateway state file, and more -- is
-  committed back to the boot partition by `pi-bluetooth-configuration`
-  itself, calling `lbu commit -d mmcblk0p1` (Alpine's own diskless
-  config-persistence tool -- the same one `setup-alpine`'s interactive
-  wizard would normally wire up for you). WiFi, Ethernet, relay control,
-  and user accounts/SSH are independent features with no shared
-  "finish" step anymore (see the main README's "Independent
-  WiFi/Ethernet/relay configuration, no reboot needed"), so each of
-  their own routes (`POST /connect`, `POST /forget`, `POST /ethernet`,
-  `POST /relay-control`, `POST /accounts`, `POST /accounts/remove`,
-  `POST /ssh`, `POST /user`) commits on its own right after making its
-  change, rather than all being batched behind one single checkpoint the
-  way an earlier reboot-triggered design did.
+  account doas permits, and more -- is committed back to the boot
+  partition by `pi-bluetooth-configuration` itself, calling `lbu commit
+  -d mmcblk0p1` (Alpine's own diskless config-persistence tool -- the
+  same one `setup-alpine`'s interactive wizard would normally wire up
+  for you). WiFi and relay control are independent features with no
+  shared "finish" step anymore (see the main README's "Independent
+  WiFi/relay configuration, no reboot needed"), so each of their own
+  routes (`POST /connect`, `POST /forget`, `POST /relay-control`, `POST
+  /accounts`, `POST /accounts/remove`, `POST /ssh`, `POST /user`)
+  commits on its own right after making its change, rather than all
+  being batched behind one single checkpoint the way an earlier
+  reboot-triggered design did. `eth0`'s own networking (static IP, DHCP
+  server, NAT) is no longer committed via `lbu` at all -- it's
+  preconfigured statically by this image's own `/etc/dnsmasq.conf` and
+  `/etc/local.d/aipicam-setup.start` (see "How it works" above and
+  `build-image.sh`), reapplied fresh from the image itself on every
+  boot rather than persisted state.
   `-d` is load-bearing, not cosmetic: `lbu commit`'s own target filename
   is `$(hostname).apkovl.tar.gz`, computed from the *current* hostname
   at commit time (confirmed by reading `alpine-conf`'s own `lbu.in`) --
@@ -287,16 +290,16 @@ from the web UI's "Users" section:
   default runlevel in the same call, so the choice survives a reboot
   too.
 
-All of this is entirely independent of WiFi/Ethernet/relay state --
-reachable the moment the device boots, before WiFi is ever configured,
-over `eth0`/`eth1`. There's no recovery path if you lose every
-account's password short of a physical console login (`ROOT_PASSWORD`)
-to fix it by hand, or re-imaging the card.
+All of this is entirely independent of WiFi/relay state -- reachable
+the moment the device boots, before WiFi is ever configured, over
+`eth0`. There's no recovery path if you lose every account's password
+short of a physical console login (`ROOT_PASSWORD`) to fix it by hand,
+or re-imaging the card.
 
-Reachable only while you're on the same LAN (or plugged into
-`eth0`/`eth1`) -- there is no remote-access/tunneling feature in this
-image. If you need to reach a device remotely, set up your own solution
-(e.g. a VPN) independently of this build.
+Reachable only while you're on the same LAN (or plugged into `eth0`) --
+there is no remote-access/tunneling feature in this image. If you need
+to reach a device remotely, set up your own solution (e.g. a VPN)
+independently of this build.
 
 ## 3. Write it to an SD card
 
@@ -346,8 +349,9 @@ Grab the result from the run's Artifacts section
 ## First boot
 
 - WiFi: nothing is configured yet -- `eth0` is already up as a working
-  gateway (default `192.168.4.1:8080`), so plug a laptop into it and
-  open the web UI to scan for and join a network. See the main
+  gateway (default `192.168.4.1:8080`, preconfigured statically by this
+  image -- see "How it works" above), so plug a laptop into it and open
+  the web UI to scan for and join a network. See the main
   [README](../README.md).
 - SSH: root login is disabled entirely, and no user account exists until
   you add one from the web UI's "Users" section (see
@@ -367,10 +371,11 @@ Grab the result from the run's Artifacts section
 
 ## Security note
 
-This daemon's web UI and HTTP API are plain, unauthenticated HTTP,
-reachable to anything wired into `eth0`/`eth1` (or already on whatever
-WiFi network the Pi joined) -- see the main README's Security model
-section. That doesn't buy anything SSH access on its own, though: root
+This daemon's web UI and HTTP API require HTTP Basic Auth but no
+encryption (plain HTTP), reachable to anything wired into `eth0` (or
+already on whatever WiFi network the Pi joined) -- see the main
+README's Security model section. That doesn't buy anything SSH access
+on its own, though: root
 login is disabled outright, and no user account exists until someone
 deliberately adds one from the web UI's "Users" section --
 so there's genuinely nothing to log into over SSH until that point,

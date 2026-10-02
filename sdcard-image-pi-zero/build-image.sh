@@ -163,10 +163,17 @@ chmod +x "$OVL/etc/init.d/fix-chrony-makestep"
 ln -sf /etc/init.d/fix-chrony-makestep "$OVL/etc/runlevels/boot/fix-chrony-makestep"
 
 ln -sf /etc/init.d/local "$OVL/etc/runlevels/default/local"
-for svc in wpa_supplicant dhcpcd chronyd sshd dbus avahi-daemon \
+for svc in wpa_supplicant dhcpcd dnsmasq chronyd sshd dbus avahi-daemon \
 	pi-bluetooth-configuration pi-relay-control victron-ve-direct; do
 	ln -sf "/etc/init.d/$svc" "$OVL/etc/runlevels/default/$svc"
 done
+# dnsmasq starts here with its own stock (effectively inert) config --
+# aipicam-setup.start below rewrites it to the real eth0 gateway config
+# and restarts it, same "start with the package default, fix it up and
+# restart once local.d runs" pattern already used for sshd_config. Only
+# takes effect if a USB-Ethernet OTG adapter enumerates as eth0 -- see
+# this directory's own README for why a Zero has no onboard Ethernet at
+# all otherwise; harmless no-op if eth0 never exists.
 
 # Same root-lockdown/account-management handoff as the pi3 build -- see its
 # own comment for the full reasoning. --platform linux/arm/v6 here only
@@ -188,6 +195,34 @@ sed -i \\
 
 ssh-keygen -A
 rc-service sshd restart
+
+# Static Ethernet gateway (eth0) -- see the pi3 build's own comment for
+# the full reasoning (identical here). Only takes effect if a
+# USB-Ethernet OTG adapter enumerates as eth0; every command below is a
+# harmless no-op otherwise (this board has no onboard Ethernet at all --
+# see this directory's own README).
+cat >> /etc/dhcpcd.conf <<'DHCPCD_EOF'
+denyinterfaces eth0
+DHCPCD_EOF
+rc-service dhcpcd restart
+
+ip addr add 192.168.4.1/24 dev eth0 2>/dev/null
+ip link set eth0 up 2>/dev/null
+
+cat > /etc/dnsmasq.conf <<'DNSMASQ_EOF'
+interface=eth0
+bind-interfaces
+dhcp-authoritative
+dhcp-leasefile=/var/lib/misc/dnsmasq.leases
+dhcp-range=192.168.4.2,192.168.4.200,255.255.255.0,12h
+dhcp-option=option:dns-server,192.168.4.1
+DNSMASQ_EOF
+rc-service dnsmasq restart
+
+echo 1 > /proc/sys/net/ipv4/ip_forward
+iptables -t nat -C POSTROUTING -o wlan0 -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -o wlan0 -j MASQUERADE
+iptables -C FORWARD -i eth0 -o wlan0 -j ACCEPT 2>/dev/null || iptables -A FORWARD -i eth0 -o wlan0 -j ACCEPT
+iptables -C FORWARD -i wlan0 -o eth0 -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || iptables -A FORWARD -i wlan0 -o eth0 -m state --state RELATED,ESTABLISHED -j ACCEPT
 EOF
 chmod +x "$OVL/etc/local.d/aipicam-setup.start"
 

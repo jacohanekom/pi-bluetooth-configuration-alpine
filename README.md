@@ -1,16 +1,14 @@
 # pi-bluetooth-configuration-alpine
 
-Configure a Raspberry Pi's WiFi from a plain browser, over a wired
-Ethernet connection -- no phone app, no SSH, no keyboard, no display, no
-second board, no Bluetooth, and no WiFi access point to join either. The
-Pi's own onboard WiFi radio stays in station mode at all times; `eth0`
-(optionally bridged with a second wired port -- see "Ethernet
-direct-connect" below) is always up with a static IP and its own
-DHCP+DNS server, so a laptop plugged into either wired port can reach
-this daemon's web UI at any time to scan for networks, join one, and
-watch the result. For a Raspberry Pi running Alpine Linux, either a Pi 3
-or other 64-bit-capable board (`aarch64`) or an original Pi Zero/Zero W
-(`armhf`).
+Configure a Raspberry Pi's WiFi from a plain browser -- no phone app, no
+SSH, no keyboard, no display, no second board, no Bluetooth, and no WiFi
+access point to join either. The Pi's own onboard WiFi radio stays in
+station mode at all times; the web UI is reachable over whatever network
+connectivity the device already has -- `eth0`'s own addressing (static or
+DHCP) is entirely preconfigured by the SD-card image itself, not managed
+by this daemon at all -- to scan for networks, join one, and watch the
+result. For a Raspberry Pi running Alpine Linux, either a Pi 3 or other
+64-bit-capable board (`aarch64`) or an original Pi Zero/Zero W (`armhf`).
 
 WiFi station mode is driven through `wpa_cli` (wpa_supplicant's control
 interface) and `dhcpcd`. The web UI and its JSON API are served by a
@@ -23,11 +21,11 @@ No Bluetooth, no D-Bus, no BlueZ, no hostapd anywhere in this design --
 see git history if you're looking for the earlier BLE-based or
 fallback-access-point-based revisions this replaced.
 
-WiFi, Ethernet, and relay control are three entirely independent
-features, not sequenced steps in a wizard: each can be configured any
-time, in any order, regardless of the other two's state, and nothing in
-this daemon ever reboots the Pi. See "Independent WiFi/Ethernet/relay
-configuration, no reboot needed" below.
+WiFi and relay control are two entirely independent features, not
+sequenced steps in a wizard: each can be configured any time, in any
+order, regardless of the other's state, and nothing in this daemon ever
+reboots the Pi. See "Independent WiFi/relay configuration, no reboot
+needed" below.
 
 ## How it verifies
 
@@ -58,11 +56,12 @@ buys little over plain HTTP here.
 Practical implication: **only use this on a trusted home/lab network.**
 Unlike the earlier fallback-access-point design, this is no longer
 broadcast over the air to anything in WiFi range -- reaching the web UI
-requires being physically wired into `eth0`/`eth1` (or already on
-whatever WiFi network the Pi joined) *and* knowing a valid account's
-password, which is a meaningfully smaller exposure window than before.
-If you need real access control, don't leave a wired port open to an
-untrusted physical network.
+requires whatever network connectivity the device already has (`eth0`,
+preconfigured by the SD-card image, or already being on whatever WiFi
+network the Pi joined) *and* knowing a valid account's password, which
+is a meaningfully smaller exposure window than before. If you need real
+access control, don't leave a wired port open to an untrusted physical
+network.
 
 **Forced password change for root.** `root` starts out on `ROOT_PASSWORD`
 -- set once, at build time, and often reused verbatim across every
@@ -86,22 +85,23 @@ locally, a WiFi password containing bytes not valid as text isn't an
 issue -- but SSIDs are always sent as hex too, sidestepping wpa_supplicant's
 control-interface quoting rules entirely.
 
-## Independent WiFi/Ethernet/relay configuration, no reboot needed
+## Independent WiFi/relay configuration, no reboot needed
 
 There is no wizard, no "finished setup" state, and no marker file gating
 any feature on any other -- an earlier design sequenced everything
 behind a one-shot `/etc/successfully-initialized` marker (WiFi had to be
-joined before Ethernet could be locked in, relay control wouldn't work
-at all until that marker existed, pi-relay-control-alpine itself
-refused to start without it), but that's gone: WiFi, Ethernet, and
-relay control are each configured through their own always-available
-routes, and nothing in this daemon reboots the Pi. Unlike the earlier
-fallback-access-point design before that, wlan0's radio state can never
-disrupt whatever connection a request arrived over either -- the web UI
-is reached over `eth0`/`eth1` (or an already-joined WiFi network),
-entirely independent of the radio this daemon is about to reconfigure --
-so every WiFi action below can be attempted immediately and
-synchronously, with no "stage now, join later" step.
+joined before relay control would work at all, and
+pi-relay-control-alpine itself refused to start without it), but that's
+gone: WiFi and relay control are each configured through their own
+always-available routes, and nothing in this daemon reboots the Pi.
+Unlike the earlier fallback-access-point design before that, wlan0's
+radio state can never disrupt whatever connection a request arrived
+over either -- the web UI is reached over whatever network connectivity
+the device already has (`eth0`, preconfigured by the SD-card image, or
+an already-joined WiFi network), entirely independent of the radio this
+daemon is about to reconfigure -- so every WiFi action below can be
+attempted immediately and synchronously, with no "stage now, join
+later" step.
 
 - **`POST /connect`** `{"ssid":...,"password":...}`: joins the given
   network directly, in the background. Poll `GET /status`'s
@@ -110,39 +110,37 @@ synchronously, with no "stage now, join later" step.
 - **`POST /forget`**: forgets the saved WiFi config if present and
   commits via `lbu`. wlan0 simply goes idle (station mode, no network
   selected) until `POST /connect` is called again -- there's no access
-  point to fall back into anymore. Doesn't touch Ethernet, relay
-  control, or login accounts -- WiFi's own state only.
+  point to fall back into anymore. Doesn't touch relay control or login
+  accounts -- WiFi's own state only.
 - **`POST /accounts`** / **`POST /accounts/remove`** / **`POST /ssh`**:
   manage login accounts and SSH access -- see "Logging in: user
   accounts, not root" in `sdcard-image-pi3/README.md`. Completely
-  independent of WiFi/Ethernet/relay state, callable at any point,
-  including before WiFi has ever been configured. There's no
-  auto-generated account of any kind -- a fresh device has no working
-  login until you add one yourself.
+  independent of WiFi/relay state, callable at any point, including
+  before WiFi has ever been configured. There's no auto-generated
+  account of any kind -- a fresh device has no working login until you
+  add one yourself.
 
 ## Web UI
 
 `GET /` serves a single self-contained HTML page (`src/web_ui.hpp` --
-inline CSS/JS, no external requests, no build step) laid out as three
-independent sections -- WiFi, Ethernet, Relays -- plus two device-wide
-utility cards (users, system clock) that don't belong to
-any one of the three. Open `http://<gateway-ip>:8080/` (default
-`http://192.168.4.1:8080/`, or `http://<serial>.local:8080/` via mDNS --
-see "Discovery" below) from a laptop plugged into `eth0`/`eth1` -- your
-browser will prompt for a username/password (HTTP Basic Auth, see
-Security model above; `root`'s `ROOT_PASSWORD` always works, as does any
-account you add from "Users"). Logging in as `root` for the first time
-replaces the whole page with a single "change your password" form until
-you do -- see "Forced password change for root" in Security model --
-after which the normal page (and everything below) becomes available:
+inline CSS/JS, no external requests, no build step) laid out as two
+independent sections -- WiFi, Relays -- plus two device-wide utility
+cards (users, system clock) that don't belong to either. Open
+`http://<serial>.local:8080/` via mDNS (see "Discovery" below), or
+whatever address `eth0`/WiFi ended up with -- your browser will prompt
+for a username/password (HTTP Basic Auth, see Security model above;
+`root`'s `ROOT_PASSWORD` always works, as does any account you add from
+"Users"). Logging in as `root` for the first time replaces the whole
+page with a single "change your password" form until you do -- see
+"Forced password change for root" in Security model -- after which the
+normal page (and everything below) becomes available:
 
 - see live WiFi status (state, SSID, IP, any error), scan for nearby
   networks and join one, or forget the configured network (`POST
   /scan`, `POST /connect`, `POST /forget`);
 - add or remove login accounts and enable/disable SSH (`POST /accounts`,
   `POST /accounts/remove`, `POST /ssh`), any time, independent of
-  WiFi/Ethernet/relay state;
-- edit the Ethernet gateway IP/DHCP range, any time (`POST /ethernet`);
+  WiFi/relay state;
 - set the system clock from the browser's own time (`POST /time`);
 - toggle relay control on/off, flip individual relays, and mark a relay
   to always come on at boot (`POST /relay-control`, `POST /relay`,
@@ -150,155 +148,30 @@ after which the normal page (and everything below) becomes available:
 
 It's a thin wrapper over the JSON API documented below -- anything the
 page can do, a script can do too by calling the same routes directly.
+Ethernet (`eth0`) networking has no card here at all -- it's entirely
+preconfigured by the SD-card image at build time (see
+`sdcard-image-pi3`/`sdcard-image-pi-zero`), not something this daemon
+manages or exposes for editing.
 
 ## Ethernet direct-connect
 
-`eth0` is meant to always be a working gateway, not something you have
-to configure before it's useful: on every boot, the daemon assigns it a
-static IP directly (`ip addr add`) -- whatever was last chosen, or a
-default of `192.168.4.1` (overridable via `ethernet.ip` in
-`config.ini`) if nothing has been chosen yet -- and starts a combined
-DHCP+DNS server (`dnsmasq`) scoped strictly to `eth0`, so a laptop
-plugged directly into the Pi's ethernet port gets an address *and
-working DNS* automatically, no router, no manual configuration on the
-other end, no app interaction required.
-
-The address is assigned directly rather than through dhcpcd's own
-static-IP config, and deliberately so: dhcpcd only applies its config
-once it detects carrier on the interface, so a Pi sitting with nothing
-plugged into `eth0` would show no address at all (`ip addr show eth0`
-reporting `NO-CARRIER` with no `inet` line) and only pick one up some
-moments after a cable is inserted. A gateway address needs to be there
-*before* anything is plugged in, so a client is served the instant it
-connects -- so this daemon assigns it directly and tells dhcpcd to
-leave `eth0` alone entirely (`denyinterfaces`), removing the carrier
-dependency altogether.
-
-This is customizable at any time, indefinitely -- there is no point at
-which this daemon starts rejecting it: `POST /ethernet` with
-`{"ip":...,"rangeStart":...,"rangeEnd":...}` (e.g.
-`{"ip":"192.168.4.1","rangeStart":2,"rangeEnd":200}`) replaces the
-gateway IP and DHCP range with new ones, and commits via `lbu`
-immediately so the change survives a reboot. `GET /ethernet` (or the
-`eth` field of `GET /status`) at any time returns
-`{"ip":...,"rangeStart":...,"rangeEnd":...}` reflecting whatever's
-actually live on `eth0` right now.
-
-This exists because plugging a WiFi-configured Pi into the same LAN over
-Ethernet at the same time as testing WiFi can produce exactly the kind
-of dual-homed routing confusion (asymmetric routing / `rp_filter`
-silently dropping replies) that motivated this feature -- giving `eth0`
-its own dedicated, isolated subnet sidesteps that entirely, and doubles
-as a "plug in directly with a laptop" recovery path if WiFi is ever
-misconfigured.
-
-Applying/changing this doesn't reboot the Pi: eth0 is entirely
-independent of whatever wlan0 is doing, so there's no coexistence
-problem forcing a clean restart, and the change (`dhcpcd`/`dnsmasq`
-restarted directly) takes effect within a couple of seconds. Same for
-WiFi's own connect/forget flows -- see "Independent WiFi/Ethernet/relay
-configuration, no reboot needed" above -- nothing in this daemon reboots
-the Pi at all.
-
-The chosen IP and DHCP range persist in a plain state file
-(`/etc/pi-bluetooth-configuration/eth0-static-ip`, `"ip,rangeStart,rangeEnd"`)
-so they survive reboots (`ip addr add` on its own doesn't);
-`denyinterfaces` is persisted the same way as the rest of this
-feature's config, as a `# BEGIN pi-bluetooth-configuration eth0 static`
-/ `# END ...` delimited block inside `/etc/dhcpcd.conf`.
-
-**Allocated IPs**: the `leases` field of `GET /status` reports whatever's
-currently in dnsmasq's own leases file
-(`/var/lib/misc/dnsmasq.leases`) as JSON --
-`[{"ip":...,"mac":...,"hostname":...}, ...]` -- so the app can show
-which devices are actually plugged into `eth0` right now, read fresh on
-every poll.
-
-**DNS**: `dnsmasq` also answers DNS queries from `eth0` clients (not
-just DHCP), forwarding them upstream using whatever nameservers are in
-`/etc/resolv.conf` -- normally whatever WiFi's own DHCP handed
-`dhcpcd`. The DHCP lease explicitly points clients at this Pi
-(`dhcp-option=option:dns-server,<gateway ip>`) for DNS. Without this, a
-device on `eth0` gets an address and (via "Internet sharing" below) a
-route to the internet, but domain names don't resolve -- exactly the
-symptom this fixes.
-
-**Safety**: `dnsmasq` is configured with `interface=<bridge>` (see
-"Bridging a second wired interface" below for what that bridge is) and
-`bind-interfaces` specifically so it only ever answers DHCP *and DNS*
-requests there -- it must never be allowed to also serve WiFi/upstream
-LAN traffic, which would hand out conflicting addresses (DHCP) or
-expose an open resolver (DNS) on a network this daemon doesn't own. If
-you inspect or hand-edit `/etc/dnsmasq.conf`/`/etc/dhcpcd.conf`, the
-daemon's own config lives in a `# BEGIN pi-bluetooth-configuration eth0
-static` / `# END ...` delimited block that's rewritten idempotently on
-every `set_ethernet` call -- anything outside that block is left
-untouched.
-
-**Bridging a second wired interface**: if this Pi has a second wired
-port (e.g. a USB-Ethernet dongle, commonly showing up as `eth1`),
-setting `ethernet.interface2` in `config.ini` bridges it together with
-`eth0` into one local network, using a Linux bridge device
-(`br-lan`) rather than giving each interface its
-own address. This is the only correct way to put two physical ports on
-the same logical network: two interfaces can't share one IP address
-directly, and giving them separate addresses in the same subnet
-*without* a bridge would leave a device on one port with no actual path
-to a device on the other -- they'd be on the same numeric subnet but
-different physical/broadcast domains, which Linux doesn't automatically
-bridge just because the addresses happen to overlap. The gateway IP,
-DHCP scope, and DNS above are all applied to the bridge once a second
-interface is configured, not to either physical interface -- `GET
-/ethernet` and `GET /status`'s `eth` field reflect the bridge's address
-either way, with or without a second interface actually present. Safe
-to set even on a Pi that doesn't have the second interface at all
-(checked for real at startup, not just configured) -- the bridge still
-exists with `eth0` as its only member in that case, one code path
-either way. Leave `ethernet.interface2` blank (the default) if there's
-only one wired port.
-
-**Internet sharing**: a device plugged into `eth0` (or the second
-interface, once bridged) gets real internet access, not just a link to
-the Pi -- the daemon enables IPv4 forwarding and NATs
-(`iptables`/`MASQUERADE`) the bridge's traffic out through the WiFi
-interface, which is what actually holds the internet connection here.
-Applied once at startup, right after the bridge's static IP -- see
-"Internet sharing (eth0 -> WiFi)" below for details.
-
-## Internet sharing (eth0 -> WiFi)
-
-`eth0` (and the bridge it's part of, if a second wired interface is
-configured -- see "Bridging a second wired interface" above) is a
-dead-end network of its own otherwise, unless something routes its
-traffic somewhere with actual internet access -- which, on this Pi, is
-WiFi. At startup, right after applying the bridge's static IP, the
-daemon:
-
-1. Enables `net.ipv4.ip_forward` (both live, via `/proc/sys/...`, and
-   persisted for the next boot via a drop-in in `/etc/sysctl.d/`).
-2. Adds `iptables` rules NATing traffic from the bridge out through the
-   WiFi interface (`iptables -t nat -A POSTROUTING -o <wifi_iface> -j
-   MASQUERADE`) plus the matching `FORWARD` rules to actually let that
-   traffic across between the two interfaces.
-
-This isn't gated by WiFi's own connection state --
-the rules reference the WiFi interface by name and are harmless to have
-in place even before it's associated to anything; they simply have
-nothing to NAT through until it is. Idempotent: each rule is checked
-(`iptables -C`) before being added, so restarting the daemon (or
-rebooting) doesn't pile up duplicate rules.
-
-**Requires the `iptables` package** (a runtime dependency of the `.apk`
--- see below; install it yourself if building from source or the
-tarball) **and a kernel with netfilter NAT support** (`iptable_nat`,
-`nf_nat`, `nf_conntrack` -- built into Alpine's `linux-rpi` kernel).
-
-**Known limitation**: there's no way to disable this short of editing
-`eth_control.hpp` (`enable_internet_sharing`) -- like the rest of
-`eth0`'s "always a working gateway" behavior, it's unconditional. If you
-don't want `eth0` devices reaching the internet through this Pi, don't
-plug anything into it, or remove the resulting `iptables` rules
-yourself.
+`eth0`'s networking (static IP, DHCP+DNS server, NAT/internet sharing
+through WiFi) is no longer something this daemon manages at all -- an
+earlier design had it assign a static IP directly, run `dnsmasq` scoped
+to `eth0` (optionally bridged with a second wired interface), and NAT
+its traffic out through WiFi, all live, reconfigurable via `POST
+/ethernet`. That's been removed entirely: this daemon never touches
+`eth0`. Instead, that same end-user behavior (plug into Ethernet, get an
+address, reach the web UI, get real internet access through the Pi's
+WiFi uplink) is preconfigured once, statically, at SD-card image build
+time -- see `sdcard-image-pi3/build-image.sh` and
+`sdcard-image-pi-zero/build-image.sh` for exactly what gets written
+(`/etc/dnsmasq.conf`, the `dhcpcd.conf` `denyinterfaces` line, the
+`ip addr add`, and the `iptables`/NAT rules). There is no `GET`/`POST
+/ethernet` route, no `ethernet.*` section in `config.ini`, and no `eth`/
+`leases` field in `GET /status` anymore -- if you need to change the
+gateway IP or DHCP range, edit the image build script and rebuild, not
+the running device.
 
 ## System clock
 
@@ -325,9 +198,9 @@ A separate, optional integration with
 [pi-relay-control-alpine](https://github.com/jacohanekom/pi-relay-control-alpine),
 letting the same web UI that configures WiFi also flip relays on the
 Pi -- no separate app or protocol needed for something as simple as
-turning a light or a fan on and off. Entirely independent of WiFi and
-Ethernet state -- see "Independent WiFi/Ethernet/relay configuration, no
-reboot needed" above; pi-relay-control-alpine itself also no longer
+turning a light or a fan on and off. Entirely independent of WiFi
+state -- see "Independent WiFi/relay configuration, no reboot needed"
+above; pi-relay-control-alpine itself also no longer
 requires this device to have completed any kind of setup before it
 starts (an earlier version of both projects gated on that, together --
 see git history and that repo's own README if you're running an older
@@ -433,7 +306,7 @@ projects.
 Unlike relay control, this is read-only -- there's no action to gate at
 all, just a reading to show or not. Live from the moment this daemon
 starts, same as everything else in this daemon now (see "Independent
-WiFi/Ethernet/relay configuration, no reboot needed" above).
+WiFi/relay configuration, no reboot needed" above).
 
 **Setup**: install and configure
 [victron-ve-direct-alpine](https://github.com/jacohanekom/victron-ve-direct-alpine)
@@ -506,8 +379,8 @@ _services._dns-sd._udp local.` (the generic "what services exist here"
 meta-query) all round-tripped correctly. The socket layer itself (which
 interfaces to join on, `IP_PKTINFO`-based per-interface replies) is
 Linux-specific and, like the rest of this daemon's networking code
-(`eth_control.hpp`, `wifi_control.hpp`), can only be exercised at
-runtime on actual Pi hardware -- CI only proves it compiles.
+(`wifi_control.hpp`), can only be exercised at runtime on actual Pi
+hardware -- CI only proves it compiles.
 
 ## HTTP API
 
@@ -519,7 +392,7 @@ nesting, matching exactly what these routes need.
 | Route | Body | Response |
 |---|---|---|
 | `GET /` | -- | The web UI itself -- see "Web UI" above. |
-| `GET /status` | -- | Combined snapshot: `wifi`, `eth`, `leases`, `relays`, `relaysEnabled`, `victron`, `scan`, `accounts`, `sshEnabled`, `loggedInAs`, `mustChangePassword` -- see "Status JSON" below. No server push: poll this periodically instead. Always reachable even while `mustChangePassword` is true. |
+| `GET /status` | -- | Combined snapshot: `wifi`, `relays`, `relaysEnabled`, `victron`, `scan`, `accounts`, `sshEnabled`, `loggedInAs`, `mustChangePassword` -- see "Status JSON" below. No server push: poll this periodically instead. Always reachable even while `mustChangePassword` is true. |
 | `POST /scan` | -- | `{"ok":true}` immediately; triggers a background scan (~4s). Poll `GET /status`'s `scan` field for results. |
 | `POST /connect` | `{"ssid":...,"password":...}` (omit/empty password for an open network) | `{"ok":true}`; joins the network directly, in the background -- poll `GET /status`'s `wifi.state` for the outcome. |
 | `POST /forget` | -- | `{"ok":true}` immediately; forgets the configured network. wlan0 goes idle (station mode) until `POST /connect` is called again. |
@@ -528,8 +401,6 @@ nesting, matching exactly what these routes need.
 | `POST /accounts/remove` | `{"username":...}` | `{"ok":true,"accounts":[...]}`; deletes an account this daemon created. Rejects anything it didn't create itself. |
 | `POST /change-password` | `{"username":...,"currentPassword":...,"newPassword":...}` | `{"ok":true}`; changes your own password (`username` must match the Basic-Auth-authenticated account). The only way to clear root's forced-change gate -- see Security model. Always reachable even while `mustChangePassword` is true. |
 | `POST /ssh` | `{"enabled":bool}` | `{"ok":true}`; starts/stops `sshd` and adds/removes it from the default runlevel, live. |
-| `GET /ethernet` | -- | `{"ip":...,"rangeStart":...,"rangeEnd":...}` -- eth0's current gateway config. |
-| `POST /ethernet` | `{"ip":...,"rangeStart":...,"rangeEnd":...}` | `{"ok":true}`; see "Ethernet direct-connect" -- always allowed. |
 | `POST /time` | `{"unixTime":...}` (seconds since epoch, UTC) | `{"ok":true}`; sets the system clock immediately (`settimeofday`, no reboot). See "System clock" below. |
 | `POST /relay` | `{"port":...,"state":"on"\|"off"}` | `{"ok":bool,"relays":[...]}` -- see "Relay control" (rejected only while relay control is disabled). |
 | `POST /relay-control` | `{"enabled":bool}` | `{"ok":true}`; master on/off switch for relay control, live -- persists to `[relays]`'s `enabled` key in `config.ini` immediately. See "Relay control". |
@@ -538,18 +409,15 @@ nesting, matching exactly what these routes need.
 
 ### Protocol
 
-1. Reach the Pi over Ethernet (`http://192.168.4.1:8080/` by default, or
-   `http://<serial>.local:8080/` via mDNS) by plugging a laptop into
-   `eth0`/`eth1` -- or, if it's already on a real WiFi network, reach it
-   there instead.
+1. Reach the Pi (`http://<serial>.local:8080/` via mDNS, or whatever
+   address `eth0`/WiFi ended up with).
 2. Optionally `POST /scan`, wait ~5s, then check `GET /status`'s `scan`
    field for a picklist.
 3. `POST /connect` with the chosen `ssid`/`password` -- poll `GET
    /status` until `wifi.state` is `connected` or `failed`.
-4. Independently, whenever convenient: customize the local network with
-   `POST /ethernet`, add a login account and enable SSH with `POST
-   /accounts`/`POST /ssh`, and/or configure relays -- none of these
-   depend on WiFi being set up first, or on each other.
+4. Independently, whenever convenient: add a login account and enable
+   SSH with `POST /accounts`/`POST /ssh`, and/or configure relays --
+   none of these depend on WiFi being set up first, or on each other.
 
 ### Status JSON
 
@@ -558,8 +426,6 @@ nesting, matching exactly what these routes need.
 ```json
 {
   "wifi": {"state":"connected","ssid":"MyWifi","ip":"192.168.1.42","error":""},
-  "eth": {"ip":"192.168.4.1","rangeStart":2,"rangeEnd":200},
-  "leases": [{"ip":"192.168.4.55","mac":"...","hostname":"laptop"}],
   "relays": [{"port":7778,"label":"Camera","state":"on","alwaysOn":false}],
   "relaysEnabled": true,
   "victron": {"connected": false},
@@ -604,11 +470,10 @@ taken automatically at boot, then refreshed on every `POST /scan` --
 wlan0 stays in station mode at all times now, so a live scan always has
 something to talk to.
 
-`eth` and `leases` are documented in "Ethernet direct-connect" above,
-`relays`/`relaysEnabled` in "Relay control", `victron` in "Victron
-solar/battery telemetry" -- all computed fresh on every `GET /status`
-call (no server-side caching), since a slow query only ever delays this
-one request, not a shared dispatch thread (this server is
+`relays`/`relaysEnabled` are documented in "Relay control", `victron` in
+"Victron solar/battery telemetry" -- all computed fresh on every `GET
+/status` call (no server-side caching), since a slow query only ever
+delays this one request, not a shared dispatch thread (this server is
 thread-per-connection).
 
 ### Relays JSON
@@ -670,15 +535,16 @@ are built via `abuild` from the same [`alpine/APKBUILD`](alpine/APKBUILD)
 (`arch="aarch64 armhf"`) -- the armhf one is cross-built under QEMU in CI
 since GitHub Actions has no native ARMv6 runner. Grab whichever one
 matches your board. It installs cleanly with `apk`, pulling in
-`wpa_supplicant`, `dhcpcd`, `dnsmasq`, `iptables`, `openssl`, `shadow`,
-and `doas` (plus their OpenRC services, where applicable) automatically.
-`dnsmasq` is started automatically the first time the daemon applies
-`eth0`'s default gateway IP (see "Ethernet direct-connect") -- no need
-to enable it manually. `iptables` needs no service of its own; the
-daemon applies its NAT rules itself at startup (see "Internet sharing
-(eth0 -> WiFi)"). `openssl`/`shadow`/`doas` back both the HTTP Basic
+`wpa_supplicant`, `dhcpcd`, `openssl`, `shadow`, and `doas` (plus their
+OpenRC services, where applicable) automatically. `dhcpcd` is needed for
+wlan0's own lease once it joins a network -- `wifi_control.hpp` shells
+out to it directly. `openssl`/`shadow`/`doas` back both the HTTP Basic
 Auth login (see Security model) and the "Users" section --
 load-bearing on every authenticated request, not optional extras.
+`dnsmasq`/`iptables` are NOT pulled in by this package anymore --
+`eth0`'s static IP, DHCP server, and NAT are preconfigured by the
+SD-card image itself now (see "Ethernet direct-connect" above), not
+managed by this daemon.
 
 It's signed with a throwaway key generated fresh in CI each run (there's
 no distributed repo to establish trust for), so install with
@@ -706,7 +572,7 @@ Every push builds `pi-bluetooth-configuration-alpine-aarch64.tar.gz` and
 artifacts; tagged `v*` pushes also attach both to a GitHub Release).
 
 ```sh
-apk add wpa_supplicant wpa_supplicant-openrc dhcpcd dhcpcd-openrc iproute2 dnsmasq dnsmasq-openrc iptables openssl shadow doas
+apk add wpa_supplicant wpa_supplicant-openrc dhcpcd dhcpcd-openrc iproute2 openssl shadow doas
 
 # substitute -armhf for -aarch64 above on a Pi Zero / Zero W
 tar xzf pi-bluetooth-configuration-alpine-aarch64.tar.gz
@@ -723,15 +589,15 @@ rc-service pi-bluetooth-configuration start
 ## Build from source
 
 ```sh
-apk add build-base openssl-dev pkgconf iptables openssl shadow doas
+apk add build-base openssl-dev pkgconf openssl shadow doas
 
 make
 sudo make install               # installs to /usr/bin, /etc, /etc/init.d
 ```
 
-`iptables`/`openssl`/`shadow`/`doas` are runtime dependencies, not build
-ones -- listed here too since a from-source build doesn't otherwise pull
-them in automatically the way the `.apk` does.
+`openssl`/`shadow`/`doas` are runtime dependencies, not build ones --
+listed here too since a from-source build doesn't otherwise pull them
+in automatically the way the `.apk` does.
 
 ## Configuration
 
@@ -745,13 +611,6 @@ port             = 8080
 interface        = wlan0
 device_name      = pi-bluetooth-configuration
 connect_timeout_secs = 20
-
-[ethernet]
-interface        = eth0
-interface2       = ; optional -- e.g. eth1, bridged with `interface` -- see "Bridging a second wired interface"
-ip               = 192.168.4.1
-dhcp_range_start = 2
-dhcp_range_end   = 200
 
 [scan]
 max_results      = 10
@@ -775,8 +634,7 @@ on real Pi hardware; normally the serial is used instead, so multiple
 aipicam units are distinguishable from each other. `connect_timeout_secs`
 is how long to wait, on startup, for wpa_supplicant to join whatever's
 already configured before giving up -- wlan0 stays in station mode
-either way; use the web UI over Ethernet to join a network if this times
-out.
+either way; use the web UI to join a network if this times out.
 
 `wpa_supplicant` must already be running against the same interface with
 a control socket (`ctrl_interface=/var/run/wpa_supplicant` and
@@ -818,4 +676,4 @@ retries, via `supervise-daemon`), and logs to
 - **HTTP Basic Auth, but no encryption** -- see Security model above.
   Credentials (both the login itself and anything sent afterward, e.g.
   WiFi passwords) cross the wire in the clear to anything that can reach
-  `eth0`/`eth1` (or the joined WiFi network).
+  `eth0` (or the joined WiFi network).

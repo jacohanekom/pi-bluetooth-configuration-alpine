@@ -28,7 +28,6 @@
 
 #include <openssl/evp.h>
 
-#include "network_lock.hpp"
 #include "subprocess.hpp"
 
 constexpr const char* WPA_SUPPLICANT_CONF = "/etc/wpa_supplicant/wpa_supplicant.conf";
@@ -258,24 +257,6 @@ public:
     bool connect(const std::string& ssid, const std::string& psk) {
         using namespace wifi_detail;
 
-        // See network_lock.hpp -- held for this ENTIRE function, since it
-        // never runs at boot (only from main.cpp's POST /connect), so
-        // there's no boot-time responsiveness to protect. Confirmed on
-        // real hardware that a narrower lock (just around the dhcpcd
-        // call below) wasn't enough: main.cpp's POST /ethernet
-        // (do_set_ethernet) and this function firing moments apart still
-        // interleaved their rc-service calls around each narrow critical
-        // section, producing OpenRC's own "dnsmasq stopped by something
-        // else"/"already starting" -- genuinely overlapping rc-service
-        // invocations at the OS level, not just a C++-side race. Holding
-        // this for the whole function means a concurrent Ethernet
-        // reconfiguration simply waits for the entire live-join attempt
-        // to finish first, rather than competing with it (and its own
-        // CPU/USB load, on hardware with a real USB Ethernet bridge
-        // attached) for the single core this whole association/lease
-        // sequence is racing the clock on.
-        std::lock_guard<std::mutex> lock(network_guard::mu);
-
         remove_all_networks();
 
         auto add = run_command({"wpa_cli", "-i", iface_, "add_network"});
@@ -328,15 +309,9 @@ public:
         set_status(WifiStatus{WifiStatus::CONNECTING, ssid, "", ""});
 
         // 30s, not the original 10s -- confirmed on real hardware (a Pi
-        // Zero W, single ARMv6 core, with a USB Ethernet bridge attached)
-        // that association can genuinely take longer than 10s under real
-        // concurrent CPU/USB load from that bridge's own setup, timing
+        // Zero W, single ARMv6 core, under real concurrent CPU/USB load)
+        // that association can genuinely take longer than 10s, timing
         // out here even though the credentials were entirely correct.
-        // This lock now keeps that contention from happening DURING the
-        // dhcpcd call below, but not during association itself (wpa_cli
-        // doesn't touch dhcpcd/dnsmasq, so it isn't covered by this
-        // function's own lock scope) -- widening the timeout is the
-        // actual fix for that specific window.
         const int poll_attempts = 60; // ~30s
         bool associated = false;
         for (int i = 0; i < poll_attempts; ++i) {

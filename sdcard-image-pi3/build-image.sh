@@ -233,10 +233,14 @@ chmod +x "$OVL/etc/init.d/fix-chrony-makestep"
 ln -sf /etc/init.d/fix-chrony-makestep "$OVL/etc/runlevels/boot/fix-chrony-makestep"
 
 ln -sf /etc/init.d/local "$OVL/etc/runlevels/default/local"
-for svc in wpa_supplicant dhcpcd chronyd sshd dbus avahi-daemon \
+for svc in wpa_supplicant dhcpcd dnsmasq chronyd sshd dbus avahi-daemon \
 	pi-bluetooth-configuration pi-relay-control victron-ve-direct; do
 	ln -sf "/etc/init.d/$svc" "$OVL/etc/runlevels/default/$svc"
 done
+# dnsmasq starts here with its own stock (effectively inert) config --
+# aipicam-setup.start below rewrites it to the real eth0 gateway config
+# and restarts it, same "start with the package default, fix it up and
+# restart once local.d runs" pattern already used for sshd_config.
 
 # alpine-baselayout's default /etc/shadow and openssh's default
 # sshd_config don't exist yet when this overlay is unpacked (that
@@ -279,6 +283,47 @@ sed -i \\
 
 ssh-keygen -A
 rc-service sshd restart
+
+# Static Ethernet gateway (eth0): pi-bluetooth-configuration no longer
+# manages eth0's networking live (see its own README's "Ethernet
+# direct-connect" section) -- this is the same config it used to write
+# itself, just baked in once here instead. denyinterfaces keeps dhcpcd
+# from fighting over eth0 once carrier appears (dhcpcd only applies its
+# own static config after it sees carrier, too late for a gateway
+# address that needs to already be there before anything is plugged
+# in) -- the address itself is assigned directly with \`ip addr add\`.
+cat >> /etc/dhcpcd.conf <<'DHCPCD_EOF'
+denyinterfaces eth0
+DHCPCD_EOF
+rc-service dhcpcd restart
+
+ip addr add 192.168.4.1/24 dev eth0 2>/dev/null
+ip link set eth0 up 2>/dev/null
+
+# dnsmasq answers DHCP *and* DNS requests, scoped strictly to eth0
+# (interface=/bind-interfaces) so it never serves WiFi/upstream LAN
+# traffic. dnsmasq already started above with its own stock (inert, no
+# dhcp-range) config as part of the default runlevel; this rewrites it
+# and restarts it, same pattern as sshd_config above.
+cat > /etc/dnsmasq.conf <<'DNSMASQ_EOF'
+interface=eth0
+bind-interfaces
+dhcp-authoritative
+dhcp-leasefile=/var/lib/misc/dnsmasq.leases
+dhcp-range=192.168.4.2,192.168.4.200,255.255.255.0,12h
+dhcp-option=option:dns-server,192.168.4.1
+DNSMASQ_EOF
+rc-service dnsmasq restart
+
+# NATs eth0's traffic out through wlan0 (the interface with the actual
+# internet connection) so a laptop plugged into eth0 gets real internet
+# access too, not just a link to the Pi itself. Idempotent (-C checks
+# before -A adds) so re-running this script never piles up duplicate
+# rules.
+echo 1 > /proc/sys/net/ipv4/ip_forward
+iptables -t nat -C POSTROUTING -o wlan0 -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -o wlan0 -j MASQUERADE
+iptables -C FORWARD -i eth0 -o wlan0 -j ACCEPT 2>/dev/null || iptables -A FORWARD -i eth0 -o wlan0 -j ACCEPT
+iptables -C FORWARD -i wlan0 -o eth0 -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || iptables -A FORWARD -i wlan0 -o eth0 -m state --state RELATED,ESTABLISHED -j ACCEPT
 EOF
 chmod +x "$OVL/etc/local.d/aipicam-setup.start"
 

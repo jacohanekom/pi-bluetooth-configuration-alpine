@@ -41,15 +41,15 @@
  * startup delay/complexity probing exists to guard against.
  *
  * Multi-homed aware (this Pi normally has both wlan0 and eth0 up at
- * once -- see eth_control.hpp): joins the multicast group on every
- * active interface, and replies to a query on the same interface it
- * arrived on (via IP_PKTINFO), the same technique real multi-homed mDNS
- * responders (including Avahi) use.
+ * once): joins the multicast group on every active interface, and
+ * replies to a query on the same interface it arrived on (via
+ * IP_PKTINFO), the same technique real multi-homed mDNS responders
+ * (including Avahi) use.
  *
  * Linux-only (IP_PKTINFO/ip_mreqn, both Linux-specific) -- consistent
  * with the rest of this codebase, which already assumes a Linux/Alpine
- * target throughout (eth_control.hpp's `ip`/`rc-service` calls,
- * subprocess.hpp's fork/exec model). The wire-format pieces (DnsWriter,
+ * target throughout (subprocess.hpp's fork/exec model, `ip`/`rc-service`
+ * calls elsewhere). The wire-format pieces (DnsWriter,
  * parse_name/parse_questions, build_full_response) have no such
  * dependency and were verified independently, on macOS, against Apple's
  * own `dns-sd` command-line tool (the same underlying mDNS stack iOS's

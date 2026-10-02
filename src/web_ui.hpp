@@ -5,16 +5,19 @@
  * no external requests, no build step, no framework) that talks to this
  * daemon's own existing JSON routes (GET /status, POST /scan, POST
  * /connect, POST /forget, GET+POST /accounts, POST /accounts/remove,
- * POST /change-password, POST /ssh, GET+POST /ethernet, POST /time,
- * POST /relay, POST /relay-control, POST /relay-always-on) via fetch().
+ * POST /change-password, POST /ssh, POST /time, POST /relay, POST
+ * /relay-control, POST /relay-always-on) via fetch().
  *
- * Laid out as three independent sections -- WiFi, Ethernet, Relays --
- * matching main.cpp's own design: there is no wizard, no "finished
- * setup" state, and no sequencing between them. Each can be configured
- * any time, in any order; the users and system-clock cards above them
- * are device-wide utilities that don't belong to any one section. There
- * is no auto-generated login of any kind -- the "Users" card is the
- * only way a device ever gets a working SSH login at all.
+ * Laid out as two independent sections -- WiFi, Relays -- matching
+ * main.cpp's own design: there is no wizard, no "finished setup" state,
+ * and no sequencing between them. Each can be configured any time, in
+ * any order; the users and system-clock cards above them are
+ * device-wide utilities that don't belong to any one section. There is
+ * no auto-generated login of any kind -- the "Users" card is the only
+ * way a device ever gets a working SSH login at all. Ethernet (eth0)
+ * networking has no card here at all -- it's entirely preconfigured by
+ * the SD-card image at build time, not something this daemon manages or
+ * exposes for editing.
  *
  * GET /status's own mustChangePassword flag (true only for root, until
  * its first POST /change-password -- see main.cpp's
@@ -216,23 +219,6 @@ inline const std::string INDEX_HTML = R"WEBUI(<!DOCTYPE html>
       </div>
       <div id="connectMsg" class="msg"></div>
     </div>
-  </section>
-
-  <section class="card">
-    <h2>Ethernet</h2>
-    <div class="small muted" style="margin-bottom:0.5rem">
-      The address this page is reachable at from either wired port (eth0/eth1, bridged).
-    </div>
-    <label for="ethIp">Gateway IP</label>
-    <input type="text" id="ethIp">
-    <label for="ethStart">DHCP range start</label>
-    <input type="number" id="ethStart" min="1" max="254">
-    <label for="ethEnd">DHCP range end</label>
-    <input type="number" id="ethEnd" min="1" max="254">
-    <div class="btn-row">
-      <button id="ethSaveBtn" class="primary">Save</button>
-    </div>
-    <div id="ethMsg" class="msg"></div>
   </section>
 
   <section class="card">
@@ -482,10 +468,6 @@ inline const std::string INDEX_HTML = R"WEBUI(<!DOCTYPE html>
     renderNetworks(s.scan);
     renderRelays(s.relays, s.relaysEnabled);
     renderAccounts(s.accounts, s.sshEnabled);
-
-    if (document.activeElement.id !== "ethIp") $("ethIp").value = s.eth.ip || "";
-    if (document.activeElement.id !== "ethStart") $("ethStart").value = s.eth.rangeStart || "";
-    if (document.activeElement.id !== "ethEnd") $("ethEnd").value = s.eth.rangeEnd || "";
   }
 
   async function refreshStatus() {
@@ -603,23 +585,6 @@ inline const std::string INDEX_HTML = R"WEBUI(<!DOCTYPE html>
       $("accountMsg").className = "msg err";
     } finally {
       $("createAccountBtn").disabled = false;
-    }
-  });
-
-  $("ethSaveBtn").addEventListener("click", async () => {
-    const ip = $("ethIp").value.trim();
-    const rangeStart = parseInt($("ethStart").value, 10);
-    const rangeEnd = parseInt($("ethEnd").value, 10);
-    $("ethSaveBtn").disabled = true;
-    try {
-      await postJson("/ethernet", { ip: ip, rangeStart: rangeStart, rangeEnd: rangeEnd });
-      $("ethMsg").textContent = "Saved.";
-      $("ethMsg").className = "msg ok";
-    } catch (e) {
-      $("ethMsg").textContent = e.message;
-      $("ethMsg").className = "msg err";
-    } finally {
-      $("ethSaveBtn").disabled = false;
     }
   });
 

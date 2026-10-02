@@ -2,7 +2,7 @@
 pkgname=pi-bluetooth-configuration
 pkgver=1.0.0
 pkgrel=0
-pkgdesc="Configure WiFi from a browser over Ethernet (Alpine/OpenRC, Raspberry Pi 3/Zero)"
+pkgdesc="Configure WiFi from a browser (Alpine/OpenRC, Raspberry Pi 3/Zero)"
 url="https://github.com/jacohanekom/pi-bluetooth-configuration-alpine"
 # aarch64: Pi 3 and other 64-bit-capable boards. armhf: Pi Zero/Zero W
 # (original) -- ARMv6, 32-bit, no aarch64 support at all. Both verified
@@ -20,8 +20,13 @@ makedepends="openssl-dev pkgconf"
 # `usermod` (shadow) and writes to /etc/doas.d (doas). A bare standalone
 # `apk add` install needs all three present for the daemon to actually
 # function, not just the bundled sdcard images where they happened to
-# already be installed for other reasons.
-depends="libcrypto3 openssl shadow doas wpa_supplicant wpa_supplicant-openrc dhcpcd dhcpcd-openrc iproute2 dnsmasq dnsmasq-openrc iptables"
+# already be installed for other reasons. dhcpcd/iproute2 are needed too
+# -- wifi_control.hpp shells out to `dhcpcd`/`ip` directly to get and
+# report wlan0's own lease. dnsmasq/iptables are NOT listed here anymore
+# -- this daemon no longer manages eth0's static IP, DHCP server, or NAT
+# at all; that's entirely the SD-card image's own job now (see
+# sdcard-image-pi3/sdcard-image-pi-zero's build-image.sh).
+depends="libcrypto3 openssl shadow doas wpa_supplicant wpa_supplicant-openrc dhcpcd dhcpcd-openrc iproute2"
 options="!check"
 
 source=""
@@ -32,21 +37,22 @@ builddir="$srcdir"
 # they're part of this same repo rather than a separate upstream project.
 # openssl (libcrypto) is a normal Alpine package -- nothing to vendor or
 # build from source here. No dbus/bluez/BLE here at all: setup is done
-# entirely from a browser-based web UI (web_ui.hpp) served over
-# eth0/eth1, talking to a plain HTTP API (http_server.hpp) that drives
-# the Pi's own onboard WiFi radio in station mode only -- no hostapd, no
-# fallback access point (see git history for the earlier design that
-# had one) -- discoverable via a hand-rolled mDNS responder
-# (mdns_responder.hpp) rather than Avahi -- Avahi hard-depends on the
-# `dbus` package in Alpine, which would reintroduce exactly the
-# daemon/service-management surface removed above.
+# entirely from a browser-based web UI (web_ui.hpp) talking to a plain
+# HTTP API (http_server.hpp) that drives the Pi's own onboard WiFi radio
+# in station mode only -- no hostapd, no fallback access point (see git
+# history for the earlier design that had one) -- discoverable via a
+# hand-rolled mDNS responder (mdns_responder.hpp) rather than Avahi --
+# Avahi hard-depends on the `dbus` package in Alpine, which would
+# reintroduce exactly the daemon/service-management surface removed
+# above. eth0's own networking (static IP/DHCP server/NAT) is entirely
+# preconfigured by the SD-card image at build time (see
+# sdcard-image-pi3/sdcard-image-pi-zero) -- this daemon doesn't touch it
+# at all, so there's no eth_control.hpp/network_lock.hpp here anymore.
 prepare() {
 	default_prepare
 	cp "$startdir"/../src/main.cpp "$srcdir"/main.cpp
 	cp "$startdir"/../src/auth.hpp "$srcdir"/auth.hpp
 	cp "$startdir"/../src/config.hpp "$srcdir"/config.hpp
-	cp "$startdir"/../src/eth_control.hpp "$srcdir"/eth_control.hpp
-	cp "$startdir"/../src/network_lock.hpp "$srcdir"/network_lock.hpp
 	cp "$startdir"/../src/http_server.hpp "$srcdir"/http_server.hpp
 	cp "$startdir"/../src/mdns_responder.hpp "$srcdir"/mdns_responder.hpp
 	cp "$startdir"/../src/relay_control.hpp "$srcdir"/relay_control.hpp

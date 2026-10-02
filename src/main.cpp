@@ -1,42 +1,39 @@
 /**
  * pi-bluetooth-configuration
  * ===========================
- * Lets you join this Pi to a WiFi network from a plain browser, over a
- * wired Ethernet connection -- no phone app, no SSH, no keyboard, no
- * second board, never BLE, and (as of this design) never a WiFi access
- * point either. wlan0 stays in station mode at all times: on startup
- * this daemon tries to join whatever's already configured
- * (wpa_supplicant, started by OpenRC before this daemon, attempts that
- * entirely on its own); whether or not that succeeds, eth0 (optionally
- * bridged with a second wired interface -- see eth_control.hpp) is
- * always up with a static IP and its own DHCP+DNS server, so a laptop
- * plugged into either wired port can reach this daemon's web UI (GET /,
- * see web_ui.hpp) at any time to scan for networks, join one, and watch
- * the result -- found automatically via mDNS/Bonjour (see
- * mdns_responder.hpp) rather than requiring its address to be typed in.
+ * Lets you join this Pi to a WiFi network from a plain browser -- no
+ * phone app, no SSH, no keyboard, no second board, never BLE, and (as
+ * of this design) never a WiFi access point either. wlan0 stays in
+ * station mode at all times: on startup this daemon tries to join
+ * whatever's already configured (wpa_supplicant, started by OpenRC
+ * before this daemon, attempts that entirely on its own). The web UI
+ * (GET /, see web_ui.hpp) is served over whatever network connectivity
+ * the device already has -- eth0's own addressing (static or DHCP) is
+ * entirely preconfigured by the SD-card image itself (see
+ * sdcard-image-pi3/sdcard-image-pi-zero), not managed by this daemon at
+ * all -- so there is nothing here that brings up a gateway IP or a DHCP
+ * server. Found automatically via mDNS/Bonjour (see mdns_responder.hpp)
+ * rather than requiring its address to be typed in.
  *
- * This replaces two earlier designs entirely (see git history): a
- * direct BlueZ/D-Bus GATT peripheral, and -- after BlueZ's own built-in
- * GATT profiles proved to force a disconnect loop no userspace config
- * could fix -- offloading BLE to a Raspberry Pi Pico 2 W over USB
- * serial. A third design (a hostapd-driven fallback access point a
- * phone joined directly, with the same HTTP API underneath) came next
- * and worked, but made the WiFi-join flow strictly harder than it
- * needed to be: this radio can't run AP and station mode at once, so
- * submitting credentials while that AP was active could only ever stage
- * them for a later join, never attempt one live, without severing the
- * very connection the request arrived over. Configuring over Ethernet
- * instead sidesteps that whole class of problem -- the wired link
- * plugged into eth0/eth1 has nothing to do with wlan0's radio state, so
- * a join can always be attempted immediately and its real outcome
- * reported back on the same connection, no staging, no AP-vs-station
- * tradeoff, no hostapd/dnsmasq-on-wlan0 configuration to maintain at
- * all.
+ * This replaces three earlier designs entirely (see git history): a
+ * direct BlueZ/D-Bus GATT peripheral; offloading BLE to a Raspberry Pi
+ * Pico 2 W over USB serial after BlueZ's own built-in GATT profiles
+ * proved to force a disconnect loop no userspace config could fix; and
+ * a hostapd-driven fallback access point a phone joined directly, which
+ * worked but made the WiFi-join flow strictly harder than it needed to
+ * be (this radio can't run AP and station mode at once, so submitting
+ * credentials while that AP was active could only ever stage them for a
+ * later join, never attempt one live, without severing the very
+ * connection the request arrived over). This daemon used to also own
+ * eth0's static IP/DHCP server/NAT directly (bridging it with a second
+ * wired interface if configured) -- that was removed too: it's now the
+ * SD-card image's job to preconfigure networking once at build time,
+ * not this daemon's job to reconfigure it live.
  *
- * WiFi, Ethernet, relay control, and login accounts are all entirely
- * independent features, not sequenced steps in a wizard -- there is no
- * "finished setup" state anymore, no marker file gating any of them, and
- * no reboot anywhere in this daemon. Each can be configured any time, in
+ * WiFi, relay control, and login accounts are all entirely independent
+ * features, not sequenced steps in a wizard -- there is no "finished
+ * setup" state anymore, no marker file gating any of them, and no
+ * reboot anywhere in this daemon. Each can be configured any time, in
  * any order, regardless of the others' state.
  *
  * Login accounts are plain, user-chosen Unix accounts (see "Logging in"
@@ -47,10 +44,10 @@
  * HTTP API (JSON; see the route table in main() for the exact shapes):
  *   GET  /         the browser-based web UI itself (see web_ui.hpp) --
  *                   a single static page that talks to the routes below.
- *   GET  /status    combined snapshot -- wifi state, eth0's config, DHCP
- *                   leases, relay states, Victron telemetry, and the
- *                   last scan's results. No server push: clients are
- *                   expected to poll this periodically instead.
+ *   GET  /status    combined snapshot -- wifi state, relay states,
+ *                   Victron telemetry, and the last scan's results. No
+ *                   server push: clients are expected to poll this
+ *                   periodically instead.
  *   POST /scan      triggers a background WiFi scan; poll GET /status
  *                   for results once it finishes (a few seconds later).
  *   POST /connect   {"ssid":...,"password":...} -- joins the given
@@ -74,9 +71,6 @@
  *                   ROOT_PASSWORD_CHANGED_FILE's own comment.
  *   POST /ssh       {"enabled":bool} -- starts/stops sshd and adds/
  *                   removes it from the default runlevel, live.
- *   GET  /ethernet  current eth0 gateway IP + DHCP range.
- *   POST /ethernet  {"ip":...,"rangeStart":...,"rangeEnd":...} -- always
- *                   editable; see eth_control.hpp.
  *   POST /relay     {"port":...,"state":"on"|"off"} -- see relay_control.hpp.
  *   POST /relay-control  {"enabled":bool} -- master on/off switch for
  *                   the whole relay integration, persisted to config.ini.
@@ -89,17 +83,6 @@
  *                   Unix accounts /accounts manages, despite the
  *                   similar-looking name.
  *
- * eth0 is always a working gateway: its static IP + DHCP server are
- * (re)applied directly at every startup -- independent of dhcpcd,
- * carrier state, and whatever wlan0 is currently doing -- so a Pi is
- * reachable over Ethernet with no app interaction, cable plugged in or
- * not. POST /ethernet can be called any time, indefinitely -- there is
- * no point at which this daemon starts rejecting it (see eth_control.hpp
- * and the README's "Ethernet direct-connect" section). Applying it
- * doesn't reboot: Ethernet doesn't share the radio with wlan0, so
- * there's no coexistence problem to route around, and the change is
- * visible immediately.
- *
  * Every route requires HTTP Basic Auth (see auth.hpp), checked against
  * this device's own real /etc/shadow -- the same root account and
  * whatever POST /accounts has created, no separate credential store.
@@ -107,16 +90,17 @@
  * model (see the README) already treats the WiFi-configuration flow as
  * suitable for a trusted home/lab environment only, not a public one;
  * this means credentials (both the HTTP Basic Auth kind and WiFi's own)
- * cross this API in the clear. Reachable only from whatever's physically
- * wired into eth0/eth1 (or already joined WiFi), not broadcast over the
- * air the way the old fallback-AP design was.
+ * cross this API in the clear. Reachable only from whatever network
+ * connectivity the device already has (eth0, preconfigured by the
+ * SD-card image, or an already-joined WiFi network), not broadcast over
+ * the air the way the old fallback-AP design was.
  *
  * Relay control is a separate, optional integration with
  * pi-relay-control-alpine: this daemon doesn't drive GPIO itself, it
  * just forwards on/off to whichever relay is listening on that TCP port
  * on 127.0.0.1, and reports live state back via GET /status. Always
  * available (gated only by the relays_enabled runtime/config toggle --
- * see POST /relay-control -- never by WiFi/Ethernet/setup state). See
+ * see POST /relay-control -- never by WiFi/setup state). See
  * relay_control.hpp and the README's "Relay control" section for the
  * "[relays]" config format that maps ports to display labels.
  *
@@ -153,7 +137,6 @@
 
 #include "auth.hpp"
 #include "config.hpp"
-#include "eth_control.hpp"
 #include "http_server.hpp"
 #include "mdns_responder.hpp"
 #include "relay_control.hpp"
@@ -209,8 +192,7 @@ constexpr const char* SSHD_RUNLEVEL_LINK = "/etc/runlevels/default/sshd";
 // -- config.ini is installed there) rather than comparing shadow hashes
 // against a build-time snapshot: simpler, and consistent with this
 // project's existing "file exists = state is true" convention
-// elsewhere (DOAS_USER_CONF_DIR's own files, eth_control.hpp's
-// STATE_FILE).
+// elsewhere (DOAS_USER_CONF_DIR's own files).
 constexpr const char* ROOT_PASSWORD_CHANGED_FILE = "/etc/pi-bluetooth-configuration/root-password-changed";
 
 std::atomic<bool> g_running{true};
@@ -346,20 +328,6 @@ std::string scan_json(const std::vector<ScanResult>& results) {
     return o.str();
 }
 
-std::string leases_json(const std::vector<ethctl::Lease>& leases) {
-    std::ostringstream o;
-    o << "[";
-    for (size_t i = 0; i < leases.size(); ++i) {
-        if (i) o << ",";
-        std::string hostname = leases[i].hostname == "*" ? "" : leases[i].hostname;
-        o << "{\"ip\":\"" << escape_json(leases[i].ip) << "\","
-          << "\"mac\":\"" << escape_json(leases[i].mac) << "\","
-          << "\"hostname\":\"" << escape_json(hostname) << "\"}";
-    }
-    o << "]";
-    return o.str();
-}
-
 // Queries each configured relay's live state (via relay_control.hpp,
 // one TCP round-trip per relay to pi-relay-control-alpine) every time
 // this is called -- simple, and there are only ever a handful of
@@ -437,17 +405,6 @@ std::string victron_json(const victronctl::VictronStatus& s) {
           << "\"H20\":" << s.H20;
     }
     o << "}";
-    return o.str();
-}
-
-std::string eth_config_json(const ethctl::EthControl& eth) {
-    auto cfg = eth.get_config();
-    std::string ip = eth.get_ip();
-    if (ip.empty()) ip = cfg.ip;
-    std::ostringstream o;
-    o << "{\"ip\":\"" << escape_json(ip) << "\","
-      << "\"rangeStart\":" << cfg.range_start << ","
-      << "\"rangeEnd\":" << cfg.range_end << "}";
     return o.str();
 }
 
@@ -740,16 +697,6 @@ int main(int argc, char** argv) {
     const std::string dev_name   = serial.empty() ? configured_name : serial;
     set_hostname_from_serial(serial);
     const std::string iface      = cfg.get_str("wifi.interface", "wlan0");
-    const std::string eth_iface  = cfg.get_str("ethernet.interface", "eth0");
-    // Optional -- a second wired interface (e.g. a USB-Ethernet dongle)
-    // to bridge with eth_iface onto the same local network. Empty means
-    // there isn't one; if it's set but not actually present on this
-    // particular Pi, EthControl still bridges eth_iface alone -- see
-    // eth_control.hpp's own header comment.
-    const std::string eth_iface2 = cfg.get_str("ethernet.interface2", "");
-    const std::string eth_default_ip = cfg.get_str("ethernet.ip", "192.168.4.1");
-    const int eth_default_range_start = cfg.get_int("ethernet.dhcp_range_start", 2);
-    const int eth_default_range_end   = cfg.get_int("ethernet.dhcp_range_end", 200);
     const int sta_boot_timeout_secs = cfg.get_int("wifi.connect_timeout_secs", 20);
     const int max_scan_results   = cfg.get_int("scan.max_results", 10);
     const auto relays = relayctl::load_relays(cfg_path);
@@ -778,13 +725,11 @@ int main(int argc, char** argv) {
 
     std::cerr << "[Config] device   : " << dev_name << (serial.empty() ? " (configured)" : " (hardware serial)") << "\n"
               << "[Config] wifi if  : " << iface << "\n"
-              << "[Config] eth if   : " << eth_iface << (eth_iface2.empty() ? "" : " + " + eth_iface2) << "\n"
               << "[Config] http port: " << http_port << "\n"
               << "[Config] relays   : " << relays.size() << " configured\n"
               << "[Config] victron  : ctrl_port " << victron_ctrl_port << "\n";
 
     WifiControl wifi(iface);
-    ethctl::EthControl eth(eth_iface, eth_iface2);
 
     // Advertised as soon as possible, independent of WiFi's own boot
     // sequence below -- it adapts to whichever interfaces/addresses
@@ -803,29 +748,6 @@ int main(int argc, char** argv) {
         }
     }
 
-    // eth0 (bridged with eth_iface2 if configured and present -- see
-    // eth_control.hpp) is meant to always be a usable gateway, not
-    // something the app has to configure first -- reapply its static
-    // IP/range (whatever was last chosen, or the configured defaults on
-    // a fresh install) on every startup, since `ip addr add` doesn't
-    // survive a reboot. Once that's in place, NAT the bridge's traffic
-    // out through WiFi (see eth_control.hpp's enable_internet_sharing)
-    // so a device plugged into either wired port gets real internet
-    // access, not just a link to the Pi itself -- WiFi is what actually
-    // has the internet connection here.
-    std::thread([&eth, eth_default_ip, eth_default_range_start, eth_default_range_end, iface]() {
-        InflightGuard guard;
-        std::string ip_err;
-        if (!eth.ensure_static_ip(eth_default_ip, eth_default_range_start, eth_default_range_end, ip_err)) {
-            std::cerr << "[Ethernet] failed to apply gateway IP: " << ip_err << "\n";
-        }
-        std::string nat_err;
-        std::string lan_iface = ethctl::EthControl::lan_interface();
-        if (!ethctl::enable_internet_sharing(lan_iface, iface, nat_err)) {
-            std::cerr << "[Ethernet] failed to enable internet sharing (" << lan_iface << " -> " << iface << "): " << nat_err << "\n";
-        }
-    }).detach();
-
     std::mutex scan_mu;
     std::string last_scan_json = "[]";
 
@@ -837,9 +759,10 @@ int main(int argc, char** argv) {
     // the same way: either one just fails to reach CONNECTED before the
     // timeout. Either way wlan0 stays in station mode -- there is no
     // fallback AP to fall through to anymore (see this file's own header
-    // comment for why): the web UI, reachable over eth0/eth1 regardless
-    // of WiFi's own state, is what a fresh/unconfigured device is
-    // configured through instead.
+    // comment for why): the web UI, reachable over whatever network
+    // connectivity the device already has regardless of WiFi's own
+    // state, is what a fresh/unconfigured device is configured through
+    // instead.
     bool sta_ok = false;
     for (int i = 0; i < sta_boot_timeout_secs * 2; ++i) {
         if (wifi.get_status().state == WifiStatus::CONNECTED) { sta_ok = true; break; }
@@ -850,7 +773,7 @@ int main(int argc, char** argv) {
         std::cerr << "[Wifi] joined " << wifi.get_status().ssid << " on boot\n";
     } else {
         std::cerr << "[Wifi] no configured network joined within " << sta_boot_timeout_secs
-                   << "s -- use the web UI over Ethernet to configure one\n";
+                   << "s -- use the web UI to configure one\n";
     }
 
     // Seeds the scan list shown on the web UI's very first load, before
@@ -873,12 +796,11 @@ int main(int argc, char** argv) {
     };
 
     // wlan0 stays in station mode throughout, so nothing about however
-    // this request reached the daemon (always over eth0/eth1 or an
-    // already-joined WiFi network, never the radio being reconfigured)
-    // is disrupted by this. lbu-commits its own result (via
-    // wifi_control.hpp's backup_wpa_conf, called from connect() on
-    // success) -- WiFi is independent of Ethernet/relay state now, so
-    // there's no later "finish" step to batch that up for it anymore.
+    // this request reached the daemon (never the radio being
+    // reconfigured) is disrupted by this. lbu-commits its own result
+    // (via wifi_control.hpp's backup_wpa_conf, called from connect() on
+    // success) -- WiFi is independent of relay state now, so there's no
+    // later "finish" step to batch that up for it anymore.
     auto do_connect = [&](const std::string& ssid, const std::string& psk) {
         wifi.connect(ssid, psk);
         auto commit = run_command({"lbu", "commit", "-d", "mmcblk0p1"});
@@ -897,8 +819,8 @@ int main(int argc, char** argv) {
     // of risk, not just this specific bug. wlan0 simply goes idle
     // afterward (station mode, no network selected) until POST /connect
     // is called again -- there's no AP mode to fall back into anymore.
-    // Purely a WiFi action now -- doesn't touch relay control, Ethernet,
-    // or login accounts, all independent features of their own.
+    // Purely a WiFi action now -- doesn't touch relay control or login
+    // accounts, both independent features of their own.
     auto do_forget = [&]() {
         wifi.forget();
         // On Alpine diskless installs (see sdcard-image-pi3), root is
@@ -942,20 +864,6 @@ int main(int argc, char** argv) {
             run_command({"rc-update", "del", "sshd", "default"});
         }
         return true;
-    };
-
-    // Ethernet direct-connect is always reconfigurable now -- no more
-    // "only until setup finishes" gate. Applied immediately, no reboot
-    // needed (see file header comment); commits via lbu itself since
-    // there's no later "finish" step to batch this into anymore.
-    auto do_set_ethernet = [&](const std::string& ip, int range_start, int range_end) {
-        std::string ip_err;
-        if (!eth.set_static_ip(ip, range_start, range_end, ip_err)) {
-            std::cerr << "[Ethernet] failed to set static IP " << ip << ": " << ip_err << "\n";
-            return;
-        }
-        auto commit = run_command({"lbu", "commit", "-d", "mmcblk0p1"});
-        std::cerr << "[Main] lbu commit after set_ethernet: " << trim(commit.output) << "\n";
     };
 
     // None of these boards have a battery-backed RTC (see
@@ -1005,7 +913,7 @@ int main(int argc, char** argv) {
         return true;
     };
 
-    // Relay control is independent of WiFi/Ethernet/setup state -- the
+    // Relay control is independent of WiFi/setup state -- the
     // only thing that can refuse a relay command is relays_enabled being
     // false (see POST /relay-control), a user-requested off switch, not
     // a readiness check. If pi-relay-control-alpine itself isn't
@@ -1082,8 +990,9 @@ int main(int argc, char** argv) {
     // page (see web_ui.hpp) that talks to the JSON routes below via
     // fetch(). This is now the only way to configure WiFi on this device
     // (see this file's own header comment) -- reachable from any browser
-    // plugged into eth0/eth1, thanks to eth_control.hpp's always-on
-    // gateway IP.
+    // on whatever network connectivity the device already has (eth0,
+    // preconfigured by the SD-card image, or an already-joined WiFi
+    // network).
     server.route("GET", "/", [](const httpsrv::Request&) {
         return httpsrv::Response{200, webui::INDEX_HTML, "text/html; charset=utf-8", ""};
     });
@@ -1098,8 +1007,6 @@ int main(int argc, char** argv) {
         bool must_change_password = req.user == "root" && !root_password_changed();
         std::ostringstream o;
         o << "{\"wifi\":" << status_json(wifi.get_status()) << ","
-          << "\"eth\":" << eth_config_json(eth) << ","
-          << "\"leases\":" << leases_json(eth.get_leases()) << ","
           << "\"relays\":" << relays_str << ","
           << "\"relaysEnabled\":" << (relays_enabled.load() ? "true" : "false") << ","
           << "\"victron\":" << victron_json(victronctl::query_status(victron_ctrl_port)) << ","
@@ -1153,8 +1060,8 @@ int main(int argc, char** argv) {
         // Always joins directly and synchronously in the background --
         // see this file's own header comment for why there's no more
         // "stage now, join later" distinction: wlan0's radio state can't
-        // disrupt however this request reached the daemon (eth0/eth1 or
-        // an already-joined WiFi network), so a live join can always be
+        // disrupt however this request reached the daemon (eth0 or an
+        // already-joined WiFi network), so a live join can always be
         // attempted immediately. Poll GET /status's wifi.state for the
         // outcome.
         std::thread([&, ssid, psk]() { InflightGuard guard; do_connect(ssid, psk); }).detach();
@@ -1258,25 +1165,6 @@ int main(int argc, char** argv) {
         if (!do_set_time(unix_time)) {
             return httpsrv::Response::error(500, "failed to set system time");
         }
-        return httpsrv::Response::json("{\"ok\":true}");
-    });
-
-    server.route("GET", "/ethernet", [&](const httpsrv::Request&) {
-        return httpsrv::Response::json(eth_config_json(eth));
-    });
-
-    server.route("POST", "/ethernet", [&](const httpsrv::Request& req) {
-        std::string ip = json_get_string(req.body, "ip");
-        long range_start = json_get_int(req.body, "rangeStart", -1);
-        long range_end = json_get_int(req.body, "rangeEnd", -1);
-        if (ip.empty() || range_start < 0 || range_end < 0) {
-            return httpsrv::Response::error(400, "ip, rangeStart and rangeEnd are required");
-        }
-        std::cerr << "[Command] set_ethernet requested: " << ip << "," << range_start << "," << range_end << "\n";
-        std::thread([&, ip, range_start, range_end]() {
-            InflightGuard guard;
-            do_set_ethernet(ip, static_cast<int>(range_start), static_cast<int>(range_end));
-        }).detach();
         return httpsrv::Response::json("{\"ok\":true}");
     });
 

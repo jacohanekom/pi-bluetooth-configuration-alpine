@@ -23,10 +23,8 @@
  * (see pi-relay-control-alpine's own README/src/main.cpp). Toggling it
  * from here means editing that sibling package's config file directly
  * (matching by <port>, the one field both daemons' configs share) and
- * restarting it so the new value actually takes effect -- the same
- * "reach into a config file this daemon doesn't own" pattern
- * eth_control.hpp already uses for dhcpcd.conf/dnsmasq.conf, just for a
- * single existing key/line instead of a whole marker-delimited block.
+ * restarting it so the new value actually takes effect -- a single
+ * existing key/line edited in place, not a whole rewritten file.
  */
 #include <cerrno>
 #include <cstdint>
@@ -147,12 +145,9 @@ inline bool relays_enabled(const std::string& config_path) {
 
 // Rewrites (or inserts, if it wasn't already there) the "enabled" line
 // in "[relays]" so a web UI toggle survives a reboot, not just this
-// running process -- same "the file is the source of truth, the daemon
-// just edits it in place" approach eth_control.hpp's replace_marker_block
-// uses, but here editing a real key inside an existing user-owned
-// section (relay lines, comments, ordering) rather than a whole
-// marker-delimited block, since [relays] isn't a section this daemon
-// owns exclusively the way its own eth0/AP config blocks are.
+// running process -- the file is the source of truth, this just edits
+// it in place, preserving everything else in the section (relay lines,
+// comments, ordering) rather than rewriting the whole file.
 inline bool set_relays_enabled(const std::string& config_path, bool enabled, std::string& err) {
     std::ifstream in(config_path);
     if (!in.is_open()) {
